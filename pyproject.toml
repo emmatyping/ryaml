@@ -7,25 +7,23 @@ build-backend = "maturin"
 
 [project]
 name = "ryaml"
-version = "0.4.1"
+version = "0.5.0"
 description = "A simple yaml serializer and deserializer using Rust."
 readme = "README.md"
-requires-python = ">=3.7,<4"
+requires-python = ">=3.10,<4"
 license = {text = "MIT"}
-keywords = []
+keywords = ["yaml", "parsing"]
 authors = [
-    {name = "Ethan Smith", email = "ethan@ethanhs.me"},
-]
-maintainers = [
-    {name = "Ethan Smith", email = "ethan@ethanhs.me"},
+    { name = "Emma Harper Smith", email = "emma@emmatyping.dev" },
 ]
 classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Rust",
-    "Programming Language :: Python :: 3.7",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Development Status :: 3 - Alpha",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
@@ -34,5 +32,13 @@ classifiers = [
 ]
 
 [project.urls]
-homepage = "https://github.com/ethanhs/ryaml"
-repository = "https://github.com/ethanhs/ryaml"
+homepage = "https://github.com/emmatyping/ryaml"
+repository = "https://github.com/emmatyping/ryaml"
+
+[tool.maturin]
+python-source = "py-src"
+module-name = "ryaml._ryaml"
+include = [
+    { format = "sdist", path = "build.rs" },
+    { format = "sdist", path = "Cargo.lock" },
+]
