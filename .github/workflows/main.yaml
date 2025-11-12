@@ -34,23 +34,30 @@ jobs:
 
         - name: Build wheels - x86_64 - PyPy
           if: startsWith(matrix.python-version, 'pypy')
-          uses: messense/maturin-action@v1
+          uses: PyO3/maturin-action@v1
           with:
             target: x86_64
-            args: --release --out dist --no-sdist -m Cargo.toml
+            args: --release --out dist -m Cargo.toml
 
         - name: Build wheels - x86_64 - CPython
           if: "!startsWith(matrix.python-version, 'pypy')"
-          uses: messense/maturin-action@v1
+          uses: PyO3/maturin-action@v1
           with:
             target: x86_64
-            args: --release --out dist --no-sdist --cargo-extra-args="--features=abi3" -m Cargo.toml
+            args: --release --out dist --features=abi3 -m Cargo.toml
+
+        - name: Build wheels - aarch64 - CPython
+          if: startsWith(matrix.os, 'ubuntu')
+          uses: PyO3/maturin-action@v1
+          with:
+            target: aarch64
+            args: --release --out dist --features=abi3 -m Cargo.toml
 
         - name: Build wheels - universal2
           if: startsWith(matrix.os, 'macos')
-          uses: messense/maturin-action@v1
+          uses: PyO3/maturin-action@v1
           with:
-            args: --release --universal2 --out dist --cargo-extra-args="--features=abi3" --no-sdist -m Cargo.toml
+            args: --release --universal2 --out dist --features=abi3 -m Cargo.toml
 
         - name: Install dependencies for tox
           run: |
