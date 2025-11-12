@@ -14,11 +14,12 @@ crate-type = ["cdylib", "rlib"]
 abi3 = ["pyo3/abi3-py37"]
 
 [dependencies]
-serde_yaml = "0.8.21"
-serde = { version = "1.0.130", features = ["derive"] }
-pythonize = "0.15.0"
-pyo3-file = { git = "https://github.com/ethanhs/pyo3-file", branch = "textio" }
+serde-saphyr = "0.0.7"
+serde = { version = "1.0.228"}
+pythonize = "0.26.0"
+pyo3-file = "0.14.0"
+serde-transcode = "1.1.1"
 
 [dependencies.pyo3]
-version = "0.15.1"
+version = "0.26.0"
 features = ["extension-module"]
