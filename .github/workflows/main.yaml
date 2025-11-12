@@ -14,61 +14,22 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        python-version: ['3.7', 'pypy-3.7']
-        os: [ubuntu-latest, windows-latest, macos-latest]
-      fail-fast: false
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-15-intel, macos-latest]
     steps:
-        - name: checkout
-          uses: actions/checkout@v2
-        - name: setup python
-          uses: actions/setup-python@v2
-          with:
-            python-version: ${{ matrix.python-version }}
+      - uses: actions/checkout@v5
 
-        - name: Install Rust toolchain
-          uses: actions-rs/toolchain@v1
-          with:
-            toolchain: stable
-            profile: minimal
-            default: true
+      - uses: actions/setup-python@v5
 
-        - name: Build wheels - x86_64 - PyPy
-          if: startsWith(matrix.python-version, 'pypy')
-          uses: PyO3/maturin-action@v1
-          with:
-            target: x86_64
-            args: --release --out dist -m Cargo.toml
+      - name: Install cibuildwheel
+        run: python -m pip install cibuildwheel==3.2.1
 
-        - name: Build wheels - x86_64 - CPython
-          if: "!startsWith(matrix.python-version, 'pypy')"
-          uses: PyO3/maturin-action@v1
-          with:
-            target: x86_64
-            args: --release --out dist --features=abi3 -m Cargo.toml
+      - name: Build wheels
+        run: python -m cibuildwheel --output-dir wheelhouse
+        env:
+          CIBW_TEST_REQUIRES: pytest pytest-benchmark pyyaml
+          CIBW_TEST_COMMAND: pytest tests
 
-        - name: Build wheels - aarch64 - CPython
-          if: startsWith(matrix.os, 'ubuntu')
-          uses: PyO3/maturin-action@v1
-          with:
-            target: aarch64
-            args: --release --out dist --features=abi3 -m Cargo.toml
-
-        - name: Build wheels - universal2
-          if: startsWith(matrix.os, 'macos')
-          uses: PyO3/maturin-action@v1
-          with:
-            args: --release --universal2 --out dist --features=abi3 -m Cargo.toml
-
-        - name: Install dependencies for tox
-          run: |
-            python -m pip install --upgrade pip
-            pip install tox tox-gh-actions
-
-        - name: Test with tox
-          run: tox
-
-        - name: Upload wheels
-          uses: actions/upload-artifact@v2
-          with:
-            name: wheels
-            path: dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cibw-wheels-${{ matrix.os }}-${{ strategy.job-index }}
+          path: ./wheelhouse/*.whl
