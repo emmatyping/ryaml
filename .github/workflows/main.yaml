@@ -22,6 +22,9 @@ jobs:
         with:
           python-version: '3.14'
 
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install cibuildwheel
         run: python -m pip install cibuildwheel==3.2.1
 
@@ -30,6 +33,7 @@ jobs:
         env:
           CIBW_TEST_REQUIRES: pytest pytest-benchmark pyyaml
           CIBW_TEST_COMMAND: pytest {project}/tests
+          CIBW_ENVIRONMENT: MACOSX_DEPLOYMENT_TARGET=10.12
 
       - uses: actions/upload-artifact@v4
         with:
