@@ -7,7 +7,7 @@ if platform.python_implementation() == 'CPython':
     try:
         from yaml import CSafeLoader as Loader, CDumper as Dumper
     except ImportError:
-        pytest.skip()
+        pytest.skip(allow_module_level=True)
 else:
     from yaml import SafeLoader as Loader, Dumper as Dumper
 
