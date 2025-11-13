@@ -60,7 +60,6 @@ jobs:
         # https://github.com/PyO3/maturin/issues/2549
         uses: dtolnay/rust-toolchain@1.86.0
         with:
-          toolchain: nightly-2025-04-01
           targets: wasm32-unknown-emscripten
 
       - name: cache rust
