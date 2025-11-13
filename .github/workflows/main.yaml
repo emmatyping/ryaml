@@ -57,7 +57,6 @@ jobs:
             toolchain: nightly-2025-02-17
             targets: wasm32-unknown-emscripten
             components: rust-src
-            env: RUSTFLAGS="-Zbuild-std"
           - os: pyodide
             runs-on: ubuntu-latest
             platform: pyodide
@@ -65,7 +64,6 @@ jobs:
             toolchain: nightly
             targets: wasm32-unknown-emscripten
             components: rust-src
-            env: RUSTFLAGS="-Zbuild-std"
 
     steps:
       - uses: actions/checkout@v5
@@ -95,7 +93,7 @@ jobs:
           CIBW_BUILD: ${{ matrix.build }}
           CIBW_XBUILD_TOOLS: rustc cargo
           CIBW_BUILD_VERBOSITY: '1'
-          CIBW_ENVIRONMENT_PYODIDE: RUSTFLAGS="-C target-feature=-crt-static"
+          CIBW_ENVIRONMENT_PYODIDE: RUSTFLAGS="-Zbuild-std"
 
       - uses: actions/upload-artifact@v4
         with:
