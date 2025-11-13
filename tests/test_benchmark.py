@@ -1,11 +1,15 @@
 import ryaml
 import yaml
 import platform
+import pytest
+
 if platform.python_implementation() == 'CPython':
-    from yaml import CSafeLoader as Loader, CDumper as Dumper
+    try:
+        from yaml import CSafeLoader as Loader, CDumper as Dumper
+    except ImportError:
+        pytest.skip(allow_module_level=True)
 else:
     from yaml import SafeLoader as Loader, Dumper as Dumper
-import pytest
 
 DATA = [['college', -380608299.3165369, {'closely': 595052867, 'born': False, 'stomach': True, 'expression': True,
                                          'chosen': 34749965, 'somebody': False}, 'positive', True, False], 'price', 2018186817, 'average', 'young', -1447308110]

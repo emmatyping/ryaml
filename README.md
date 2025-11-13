@@ -26,7 +26,7 @@ The hope is this will be used as a safe and fast yaml parser in lieu of PyYAML.
 
 ## Installation
 
-We ship binary wheels for Windows, Linux, and macOS, so as long as you are using Python 3.7+,
+We ship binary wheels for Windows, Linux, and macOS, so as long as you are using Python 3.10+,
 you can run:
 
 ```
@@ -38,7 +38,7 @@ Otherwise, you will need to build from source. To do so, first install Rust 1.41
 Then you should be able to just
 
 ```shell
-$ git clone https://github.com/ethanhs/ryaml
+$ git clone https://github.com/emmatyping/ryaml
 $ cd ryaml
 $ python -m pip install .
 ```
@@ -46,11 +46,11 @@ $ python -m pip install .
 Or if you want to build a wheel:
 
 ```shell
-$ git clone https://github.com/ethanhs/ryaml
+$ git clone https://github.com/emmatyping/ryaml
 $ cd ryaml
 $ python -m pip install maturin
 $ maturin build --release --no-sdist
-# OR if you want an abi3 wheel (compatible with Python 3.7+)
+# OR if you want an abi3 wheel (compatible with Python 3.10+)
 $ maturin build --release --no-sdist --cargo-extra-args="--features=abi3"
 ```
 
