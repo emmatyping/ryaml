@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   build_wheels:
-    name: Build wheels for ${{ matrix.os }}
+    name: Build wheels for ${{ matrix.os }} ${{ matrix.build }}
     runs-on: ${{ matrix.runs-on }}
     strategy:
       fail-fast: false
@@ -57,6 +57,7 @@ jobs:
             toolchain: nightly-2025-02-17
             targets: wasm32-unknown-emscripten
             components: rust-src
+            env: RUSTFLAGS="-Zbuild-std"
           - os: pyodide
             runs-on: ubuntu-latest
             platform: pyodide
@@ -64,6 +65,7 @@ jobs:
             toolchain: nightly
             targets: wasm32-unknown-emscripten
             components: rust-src
+            env: RUSTFLAGS="-Zbuild-std"
 
     steps:
       - uses: actions/checkout@v5
@@ -88,7 +90,7 @@ jobs:
           CIBW_TEST_REQUIRES: pytest pytest-benchmark pyyaml
           # On pyodide, bare commands may not work, so use python -m pytest
           CIBW_TEST_COMMAND: python -m pytest {project}/tests
-          CIBW_ENVIRONMENT: MACOSX_DEPLOYMENT_TARGET=10.12
+          CIBW_ENVIRONMENT: MACOSX_DEPLOYMENT_TARGET=10.12 ${{ matrix.env }}
           CIBW_SKIP: '*-musllinux_* *-win32'
           CIBW_BUILD: ${{ matrix.build }}
           CIBW_XBUILD_TOOLS: rustc cargo
