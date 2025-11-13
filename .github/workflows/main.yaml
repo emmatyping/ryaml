@@ -61,6 +61,8 @@ jobs:
 
       - name: install rust nightly
         if: ${{ matrix.platform }} != pyodide
+        # Update once emscripten base for pyodide is >3.1.74
+        # https://github.com/PyO3/maturin/issues/2549
         uses: dtolnay/rust-toolchain@nightly-2025-04-01
         with:
           targets: wasm32-unknown-emscripten
