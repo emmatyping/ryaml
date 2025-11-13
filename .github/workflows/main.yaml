@@ -10,6 +10,11 @@ on:
     types:
       - published
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+
 jobs:
   build_wheels:
     name: Build wheels for ${{ matrix.os }}
@@ -57,6 +62,8 @@ jobs:
       - name: install rust nightly
         if: ${{ matrix.platform }} != pyodide
         uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: wasm32-unknown-emscripten
 
       - name: cache rust
         uses: Swatinem/rust-cache@v2
