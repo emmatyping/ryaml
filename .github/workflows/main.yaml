@@ -93,7 +93,6 @@ jobs:
           CIBW_BUILD: ${{ matrix.build }}
           CIBW_XBUILD_TOOLS: rustc cargo
           CIBW_BUILD_VERBOSITY: '1'
-          CIBW_ENVIRONMENT_PYODIDE: RUSTFLAGS="-Zbuild-std"
 
       - uses: actions/upload-artifact@v4
         with:
