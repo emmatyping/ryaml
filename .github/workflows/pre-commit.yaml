@@ -20,11 +20,14 @@ jobs:
       with:
         python-version: '3.14'
 
-
     - name: Install stable
       uses: dtolnay/rust-toolchain@stable
       with:
         components: rustfmt, clippy
+    - name: cache rust
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: pre-commit-v0
     - name: set PY
       run: echo "name=PY::$(python -c 'import hashlib, sys;print(hashlib.sha256(sys.version.encode()+sys.executable.encode()).hexdigest())')" >> $GITHUB_ENV
     - uses: actions/cache@v4
