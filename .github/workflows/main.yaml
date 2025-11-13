@@ -51,7 +51,9 @@ jobs:
           - os: pyodide
             runs-on: ubuntu-latest
             platform: pyodide
-            toolchain: nightly-2025-01-01
+            # Update when newer Emscripten is used for pyodide
+            # ref https://github.com/rust-lang/rust/issues/137315
+            toolchain: nightly-2025-02-17
             targets: wasm32-unknown-emscripten
 
     steps:
@@ -66,7 +68,7 @@ jobs:
       - name: cache rust
         uses: Swatinem/rust-cache@v2
         with:
-          key: wheel-build-${{ matrix.nightly }}
+          key: wheel-build-${{ matrix.toolchain || 'stable' }}-${{ matrix.targets }}
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.3.0
