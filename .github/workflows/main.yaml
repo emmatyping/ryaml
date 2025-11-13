@@ -51,21 +51,28 @@ jobs:
           - os: pyodide
             runs-on: ubuntu-latest
             platform: pyodide
+            nightly: true
 
     steps:
       - uses: actions/checkout@v5
 
       - name: install Rust stable
+        if: ${{ matrix.nightly }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: install Rust nightly
+        if: ${{ matrix.nightly }}
         # Update once emscripten base for pyodide is >3.1.74
         # https://github.com/PyO3/maturin/issues/2549
-        uses: dtolnay/rust-toolchain@1.86.0
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2025-04-01
           targets: wasm32-unknown-emscripten
 
       - name: cache rust
         uses: Swatinem/rust-cache@v2
         with:
-          key: wheel-build-v0
+          key: wheel-build-${{ matrix.nightly }}
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.3.0
