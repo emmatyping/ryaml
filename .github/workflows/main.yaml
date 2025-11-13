@@ -25,7 +25,6 @@ jobs:
         include:
           - os: linux-intel
             runs-on: ubuntu-latest
-            toolchain: nightly-2025-04-01
           - os: linux-arm
             runs-on: ubuntu-24.04-arm
           - os: windows-intel
@@ -52,7 +51,7 @@ jobs:
           - os: pyodide
             runs-on: ubuntu-latest
             platform: pyodide
-            toolchain: nightly-2025-04-01
+            toolchain: nightly-2025-01-01
             targets: wasm32-unknown-emscripten
 
     steps:
