@@ -57,13 +57,13 @@ jobs:
             toolchain: nightly-2025-02-17
             targets: wasm32-unknown-emscripten
             components: rust-src
-          - os: pyodide
-            runs-on: ubuntu-latest
-            platform: pyodide
-            build: 'cp313-pyodide_wasm32'
-            toolchain: nightly
-            targets: wasm32-unknown-emscripten
-            components: rust-src
+          #- os: pyodide
+          #  runs-on: ubuntu-latest
+          #  platform: pyodide
+          #  build: 'cp313-pyodide_wasm32'
+          #  toolchain: nightly
+          #  targets: wasm32-unknown-emscripten
+          #  components: rust-src
 
     steps:
       - uses: actions/checkout@v5
