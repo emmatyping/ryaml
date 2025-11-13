@@ -61,7 +61,7 @@ jobs:
 
       - name: install rust nightly
         if: ${{ matrix.platform }} != pyodide
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@nightly-2025-04-01
         with:
           targets: wasm32-unknown-emscripten
 
@@ -82,7 +82,6 @@ jobs:
           CIBW_SKIP: '*-musllinux_* *-win32'
           CIBW_XBUILD_TOOLS: rustc cargo
           CIBW_BUILD_VERBOSITY: '1'
-          CIBW_PYODIDE_VERSION: '0.28.0'
 
       - uses: actions/upload-artifact@v4
         with:
