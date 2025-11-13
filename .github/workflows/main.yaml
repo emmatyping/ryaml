@@ -51,9 +51,17 @@ jobs:
           - os: pyodide
             runs-on: ubuntu-latest
             platform: pyodide
+            build: 'cp312-*'
             # Update when newer Emscripten is used for pyodide
             # ref https://github.com/rust-lang/rust/issues/137315
             toolchain: nightly-2025-02-17
+            targets: wasm32-unknown-emscripten
+            components: rust-src
+          - os: pyodide
+            runs-on: ubuntu-latest
+            platform: pyodide
+            build: 'cp313-'
+            toolchain: nightly
             targets: wasm32-unknown-emscripten
             components: rust-src
 
@@ -82,6 +90,7 @@ jobs:
           CIBW_TEST_COMMAND: python -m pytest {project}/tests
           CIBW_ENVIRONMENT: MACOSX_DEPLOYMENT_TARGET=10.12
           CIBW_SKIP: '*-musllinux_* *-win32'
+          CIBW_BUILD: ${{ matrix.build }}
           CIBW_XBUILD_TOOLS: rustc cargo
           CIBW_BUILD_VERBOSITY: '1'
           CIBW_ENVIRONMENT_PYODIDE: RUSTFLAGS="-C target-feature=-crt-static"
