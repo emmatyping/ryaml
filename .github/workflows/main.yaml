@@ -55,6 +55,7 @@ jobs:
             # ref https://github.com/rust-lang/rust/issues/137315
             toolchain: nightly-2025-02-17
             targets: wasm32-unknown-emscripten
+            components: rust-src
 
     steps:
       - uses: actions/checkout@v5
@@ -64,6 +65,7 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain || 'stable' }}
           targets: ${{ matrix.targets }}
+          components: ${{ matrix.components }}
 
       - name: cache rust
         uses: Swatinem/rust-cache@v2
