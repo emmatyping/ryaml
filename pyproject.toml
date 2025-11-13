@@ -39,6 +39,9 @@ repository = "https://github.com/emmatyping/ryaml"
 python-source = "py-src"
 module-name = "ryaml._ryaml"
 include = [
-    { format = "sdist", path = "build.rs" },
+    { format = "sdist", path = "tox.ini" },
     { format = "sdist", path = "Cargo.lock" },
+    { format = "sdist", path = "examples/" },
 ]
+
+[tool.cibuildwheel]
