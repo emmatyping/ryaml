@@ -15,6 +15,7 @@ jobs:
     name: Build wheels for ${{ matrix.os }}
     runs-on: ${{ matrix.runs-on }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: linux-intel
@@ -29,18 +30,19 @@ jobs:
             runs-on: macos-15-intel
           - os: macos-arm
             runs-on: macos-latest
-          - os: android-intel
-            runs-on: ubuntu-latest
-            platform: android
-          - os: android-arm
-            # GitHub Actions doesn’t currently support the Android emulator on any ARM
-            # runner. So we build on a non-ARM runner, which will skip the tests.
-            runs-on: ubuntu-latest
-            platform: android
-            archs: arm64_v8a
-          - os: ios
-            runs-on: macos-latest
-            platform: ios
+          # TODO(emmatyping): re-enable mobile targets eventually
+          #- os: android-intel
+          #  runs-on: ubuntu-latest
+          #  platform: android
+          #- os: android-arm
+          #  # GitHub Actions doesn’t currently support the Android emulator on any ARM
+          #  # runner. So we build on a non-ARM runner, which will skip the tests.
+          #  runs-on: ubuntu-latest
+          #  platform: android
+          #  archs: arm64_v8a
+          #- os: ios
+          #  runs-on: macos-latest
+          #  platform: ios
           - os: pyodide
             runs-on: ubuntu-latest
             platform: pyodide
