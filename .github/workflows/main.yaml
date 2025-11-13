@@ -51,12 +51,17 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: install rust stable
+        if: ${{ matrix.platform }} != pyodide
         uses: dtolnay/rust-toolchain@stable
+
+      - name: install rust nightly
+        if: ${{ matrix.platform }} != pyodide
+        uses: dtolnay/rust-toolchain@nightly
 
       - name: cache rust
         uses: Swatinem/rust-cache@v2
         with:
-          key: wheel-build
+          key: wheel-build-${{ matrix.platform }}
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.3.0
