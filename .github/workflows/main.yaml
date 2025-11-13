@@ -53,7 +53,7 @@ jobs:
             platform: pyodide
             # Update when newer Emscripten is used for pyodide
             # ref https://github.com/rust-lang/rust/issues/137315
-            toolchain: nightly-2025-01-21
+            toolchain: 1.86.0
             targets: wasm32-unknown-emscripten
 
     steps:
@@ -82,6 +82,7 @@ jobs:
           CIBW_SKIP: '*-musllinux_* *-win32'
           CIBW_XBUILD_TOOLS: rustc cargo
           CIBW_BUILD_VERBOSITY: '1'
+          CIBW_ENVIRONMENT_PYODIDE: RUSTFLAGS="-C target-feature=-crt-static"
 
       - uses: actions/upload-artifact@v4
         with:
