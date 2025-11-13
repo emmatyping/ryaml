@@ -48,6 +48,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: install rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cache rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wheel-build
+
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.3.0
         env:
@@ -57,6 +65,8 @@ jobs:
           CIBW_TEST_COMMAND: pytest {project}/tests
           CIBW_ENVIRONMENT: MACOSX_DEPLOYMENT_TARGET=10.12
           CIBW_SKIP: "*-musllinux_*"
+          CIBW_XBUILD_TOOLS: rustc cargo
+          CIBW_BUILD_VERBOSITY: '1'
 
       - uses: actions/upload-artifact@v4
         with:
