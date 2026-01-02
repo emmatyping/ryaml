@@ -125,8 +125,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v5
         with:
-          # unpacks all CIBW artifacts into dist/
-          pattern: cibw-*
+          # unpacks all CIBW artifacts except pyodide into dist/
+          pattern: !cibw-wheels-pyodide-*
           path: dist
           merge-multiple: true
 
