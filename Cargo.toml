@@ -15,7 +15,6 @@ abi3 = ["pyo3/abi3-py310"]
 serde_yaml = "0.9.34"
 serde = { version = "1.0.228", features = ["derive"] }
 pythonize = "0.26.0"
-pyo3-file = "0.14.0"
 
 [dependencies.pyo3]
 version = "0.26.0"

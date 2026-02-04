@@ -28,3 +28,8 @@ def test_load_key_sequence(yaml_file):
     ''')
     yaml_file.seek(0)
     ryaml.load(yaml_file) == { 'key': [4, 5] }
+
+def test_load_non_ascii(yaml_file):
+    yaml_file.write('key: 你好')
+    yaml_file.seek(0)
+    ryaml.load(yaml_file) == { 'key': '你好' }
