@@ -319,7 +319,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "ryaml"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "pyo3",
  "pyo3-file",
