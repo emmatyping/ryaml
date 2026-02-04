@@ -7,22 +7,10 @@ ryaml
 
 ryaml is a Python library that wraps a Rust yaml parser, [serde-yaml](https://github.com/dtolnay/serde-yaml), to quickly and safely parse and dump yaml to and from Python objects.
 
-It is *not* compatible with PyYAML, and it has a similar design to the `json` module. Furthermore PyYAML implements version 1.1 of the yaml spec whereas ryaml implements version 1.2 of the spec.
-
-Notable differences between version 1.1 and 1.2 are
-
-- YAML 1.2 dropped support for several features unquoted `Yes`,
-  `No`, `On`, `Off`
-- YAML 1.2 no longer accepts strings that start with a `0` and solely
-  consist of number characters as octal, you need to specify such strings with
-  `0o[0-7]+` (zero + lower-case o for octal + one or more octal characters).
-- YAML 1.2 no longer supports `sexagesimals
-  <https://en.wikipedia.org/wiki/Sexagesimal>`_, so the string scalar
-  `12:34:56` doesn't need quoting.
-- `\/` escape for JSON compatibility
-- correct parsing of floating point scalars with exponentials
-
+It is *not* fully compatible with PyYAML, and it has a similar design to the `json` module.
 The hope is this will be used as a safe and fast yaml parser in lieu of PyYAML.
+
+Like PyYAML, this library implements the YAML 1.1 specification.
 
 ## Installation
 
@@ -117,7 +105,5 @@ This project is standing on the shoulders of giants, and would not be possible w
 [serde-yaml](https://github.com/dtolnay/serde-yaml)
 
 [yaml-rust](https://github.com/chyh1990/yaml-rust)
-
-[pyo3-file](https://github.com/omerbenamram/pyo3-file)
 
 [pythonize](https://github.com/davidhewitt/pythonize)
