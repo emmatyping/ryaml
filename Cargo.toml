@@ -1,6 +1,6 @@
 [package]
 name = "ryaml"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 authors = ["Emma Harper Smith <emma@emmatyping.dev"]
 
@@ -12,9 +12,7 @@ crate-type = ["cdylib", "rlib"]
 abi3 = ["pyo3/abi3-py310"]
 
 [dependencies]
-serde_yaml = "0.9.34"
-serde = { version = "1.0.228", features = ["derive"] }
-pythonize = "0.26.0"
+libyaml-safer = "0.3.0"
 
 [dependencies.pyo3]
 version = "0.26.0"
