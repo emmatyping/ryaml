@@ -1,6 +1,6 @@
 """Compatibilty layer with pyyaml to load YAML documents with Rust code."""
 
-from typing import Protocol, Self, TypeAlias, TypeVar
+from typing import Protocol, TypeAlias, TypeVar
 
 from ryaml._ryaml import _RSafeLoader
 
@@ -18,7 +18,7 @@ class SupportsRead(Protocol[_T_co]):
 Readable: TypeAlias = SupportsRead[str | bytes]
 
 class RSafeLoader(_RSafeLoader, BaseLoader):
-    def __new__(cls, stream: str | bytes | Readable) -> Self:
+    def __new__(cls, stream: str | bytes | Readable) -> "RSafeLoader":
         try:
             data = stream.read() # type: ignore
         except AttributeError:
