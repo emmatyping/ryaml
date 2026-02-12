@@ -48,15 +48,15 @@ jobs:
           #- os: ios
           #  runs-on: macos-latest
           #  platform: ios
-          - os: pyodide
-            runs-on: ubuntu-latest
-            platform: pyodide
-            build: 'cp312-pyodide_wasm32'
-            # Update when newer Emscripten is used for pyodide
-            # ref https://github.com/rust-lang/rust/issues/137315
-            toolchain: nightly-2025-02-17
-            targets: wasm32-unknown-emscripten
-            components: rust-src
+          #- os: pyodide
+          #  runs-on: ubuntu-latest
+          #  platform: pyodide
+          #  build: 'cp312-pyodide_wasm32'
+          #  # Update when newer Emscripten is used for pyodide
+          #  # ref https://github.com/rust-lang/rust/issues/137315
+          #  toolchain: nightly-2025-02-17
+          #  targets: wasm32-unknown-emscripten
+          #  components: rust-src
           # TODO(emmatyping): re-enable this eventually, once the linking issue
           # is sorted out. It might be that we need to build Rust std
           #- os: pyodide
