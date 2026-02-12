@@ -2,6 +2,11 @@ import math
 from pathlib import Path
 from typing import Any
 
+try:
+    from yaml import CSafeLoader as SafeLoader
+except ImportError:
+    from yaml import SafeLoader
+
 import yaml
 
 # https://github.com/yaml/yaml-test-suite
@@ -107,7 +112,7 @@ def _get_yamls():
     skipped = []
 
     for yaml_file in YAML_FILES:
-        docs = yaml.load(yaml_file.read_text(encoding="utf-8"), Loader=yaml.CSafeLoader)
+        docs = yaml.load(yaml_file.read_text(encoding="utf-8"), Loader=SafeLoader)
         docs = [docs] if isinstance(docs, dict) else docs
 
         has_fail = any(doc.get("fail", False) for doc in docs)
