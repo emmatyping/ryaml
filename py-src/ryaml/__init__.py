@@ -1,4 +1,5 @@
 from ._ryaml import InvalidYamlError, loads, loads_all, dumps
+from .compat import RSafeDumper
 
 from typing import IO, AnyStr, Any
 import io

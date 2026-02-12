@@ -1,0 +1,3 @@
+[submodule "libyaml-safer"]
+	path = libyaml-safer
+	url = ./libyaml-safer/

@@ -2,11 +2,11 @@
 
 from typing import Protocol, TypeAlias, TypeVar
 
-from ryaml._ryaml import _RSafeLoader
+from ryaml._ryaml import _RSafeLoader, _RSafeDumper
 
 from yaml import BaseLoader
 
-__all__ = ["RSafeLoader"]
+__all__ = ["RSafeLoader", "RSafeDumper"]
 
 # SupportsRead Protocol from the definition in typeshed
 _T_co = TypeVar("_T_co", covariant=True)
@@ -26,3 +26,7 @@ class RSafeLoader(_RSafeLoader, BaseLoader):
         if isinstance(data, bytes):
             data = data.decode('utf8')
         return super().__new__(cls, data) # type: ignore
+
+class RSafeDumper(_RSafeDumper):
+    """pyyaml-compatible safe YAML dumper backed by Rust."""
+    pass

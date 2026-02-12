@@ -1,7 +1,9 @@
+mod dumper;
 mod exception;
 mod loader;
 mod mark;
 mod nodes;
+mod resolver;
 
 #[pyo3::pymodule(gil_used = false)]
 mod _ryaml {
@@ -10,6 +12,7 @@ mod _ryaml {
     use pyo3::prelude::*;
     use pyo3::types::PyList;
 
+    use crate::dumper::register_dumper;
     use crate::loader::register_loader;
     use crate::mark::register_mark;
     use crate::nodes::register_nodes;
@@ -19,6 +22,9 @@ mod _ryaml {
 
     #[pymodule_export]
     use crate::loader::RSafeLoader;
+
+    #[pymodule_export]
+    use crate::dumper::RSafeDumper;
 
     #[pymodule_export]
     use crate::mark::PyMark;
@@ -52,8 +58,8 @@ mod _ryaml {
     }
 
     #[pyfunction]
-    fn dumps(_py: Python, _obj: Py<PyAny>) -> PyResult<String> {
-        unimplemented!()
+    fn dumps(py: Python, obj: Py<PyAny>) -> PyResult<String> {
+        crate::dumper::dumps_to_string(py, obj.bind(py))
     }
 
     #[pymodule_init]
@@ -61,6 +67,7 @@ mod _ryaml {
         register_nodes(m)?;
         register_loader(m)?;
         register_mark(m)?;
+        register_dumper(m)?;
         Ok(())
     }
 }

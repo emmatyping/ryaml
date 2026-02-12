@@ -1,46 +1,17 @@
 //! Module implement pyyaml compatibility layer for ryaml via libyaml
-//! Implements RLoader and RDumper which can load and dump YAML 1.1
+//! Implements RLoader, which can load YAML 1.1
 
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::LazyLock;
 
 use libyaml_safer::{Event, EventData, MappingStyle, Parser, ScalarStyle, SequenceStyle};
 use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
-use regex::Regex;
 
 use crate::exception::InvalidYamlError;
 use crate::nodes::{PyMappingNode, PyNode, PyScalarNode, PySequenceNode};
-
-// Regex patterns for implicit tag resolution (matching PyYAML's Resolver)
-static BOOL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:yes|Yes|YES|no|No|NO|true|True|TRUE|false|False|FALSE|on|On|ON|off|Off|OFF)$")
-        .unwrap()
-});
-
-static INT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:[-+]?0b[0-1_]+|[-+]?0[0-7_]+|[-+]?(?:0|[1-9][0-9_]*)|[-+]?0x[0-9a-fA-F_]+|[-+]?[1-9][0-9_]*(?::[0-5]?[0-9])+)$")
-        .unwrap()
-});
-
-static FLOAT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:[-+]?(?:[0-9][0-9_]*)\.[0-9_]*(?:[eE][-+][0-9]+)?|\.[0-9][0-9_]*(?:[eE][-+][0-9]+)?|[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN))$")
-        .unwrap()
-});
-
-static NULL_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(?:~|null|Null|NULL|)$").unwrap());
-
-static TIMESTAMP_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]|[0-9][0-9][0-9][0-9]-[0-9][0-9]?-[0-9][0-9]?(?:[Tt]|[ \t]+)[0-9][0-9]?:[0-9][0-9]:[0-9][0-9](?:\.[0-9]*)?(?:[ \t]*(?:Z|[-+][0-9][0-9]?(?::[0-9][0-9])?))?)$")
-        .unwrap()
-});
-
-static MERGE_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^<<$").unwrap());
-
-static VALUE_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^=$").unwrap());
+use crate::resolver;
 
 #[allow(dead_code)]
 #[pyclass(name = "_RSafeLoader", subclass)]
@@ -466,40 +437,7 @@ impl RSafeLoader {
         plain_implicit: bool,
         _quoted_implicit: bool,
     ) -> String {
-        if !plain_implicit {
-            return "tag:yaml.org,2002:str".to_string();
-        }
-
-        // Try each pattern in order (matching PyYAML's Resolver)
-        if value.is_empty() || NULL_PATTERN.is_match(value) {
-            return "tag:yaml.org,2002:null".to_string();
-        }
-
-        if BOOL_PATTERN.is_match(value) {
-            return "tag:yaml.org,2002:bool".to_string();
-        }
-
-        if INT_PATTERN.is_match(value) {
-            return "tag:yaml.org,2002:int".to_string();
-        }
-
-        if FLOAT_PATTERN.is_match(value) {
-            return "tag:yaml.org,2002:float".to_string();
-        }
-
-        if TIMESTAMP_PATTERN.is_match(value) {
-            return "tag:yaml.org,2002:timestamp".to_string();
-        }
-
-        if MERGE_PATTERN.is_match(value) {
-            return "tag:yaml.org,2002:merge".to_string();
-        }
-
-        if VALUE_PATTERN.is_match(value) {
-            return "tag:yaml.org,2002:value".to_string();
-        }
-
-        "tag:yaml.org,2002:str".to_string()
+        resolver::resolve_scalar_tag(value, plain_implicit).to_string()
     }
 
     /// Construct a document from a node

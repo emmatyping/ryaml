@@ -12,8 +12,9 @@ crate-type = ["cdylib", "rlib"]
 abi3 = ["pyo3/abi3-py310"]
 
 [dependencies]
-libyaml-safer = "0.3.0"
+libyaml-safer = { path = "./libyaml-safer"}
 regex = "1"
+base64 = "0.22"
 
 [dependencies.pyo3]
 version = "0.26.0"

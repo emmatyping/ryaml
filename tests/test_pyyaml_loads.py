@@ -35,7 +35,7 @@ def test_loads_key_sequence():
     ''', Loader=RSafeLoader) == { 'key': [4, 5] }
 
 @pytest.mark.parametrize("input", VALID_YAMLS, ids=lambda val: f"{val.name[:-5]}")
-def test_valid_yamls_from_test_suite(input: Path) -> None:
+def test_valid_yamls_from_test_suite_pyyaml(input: Path) -> None:
     load_from_str = yaml.load(input.read_text(encoding="utf-8"), Loader=yaml.CSafeLoader)
 
     docs = [load_from_str] if isinstance(load_from_str, dict) else load_from_str
@@ -75,7 +75,7 @@ def test_valid_yamls_from_test_suite(input: Path) -> None:
 
 
 @pytest.mark.parametrize("input", INVALID_YAMLS, ids=lambda val: f"{val.name[:-5]}")
-def test_invalid_yamls_from_test_suite(input: Path) -> None:
+def test_invalid_yamls_from_test_suite_pyyaml(input: Path) -> None:
     docs = list(yaml.load_all(input.read_text(encoding="utf-8"), Loader=RSafeLoader))
     if len(docs) == 1:
         docs = docs[0]
