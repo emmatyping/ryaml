@@ -4,7 +4,15 @@ from pathlib import Path
 import ryaml
 
 import pytest
+
+import ryaml
+try:
+    from yaml import CSafeLoader as SafeLoader, CSafeDumper as SafeDumper
+except ImportError:
+    from yaml import SafeLoader, SafeDumper
+
 import yaml
+
 
 from ryaml.compat import RSafeLoader
 
@@ -36,7 +44,7 @@ def test_loads_key_sequence():
 
 @pytest.mark.parametrize("input", VALID_YAMLS, ids=lambda val: f"{val.name[:-5]}")
 def test_valid_yamls_from_test_suite_pyyaml(input: Path) -> None:
-    load_from_str = yaml.load(input.read_text(encoding="utf-8"), Loader=yaml.CSafeLoader)
+    load_from_str = yaml.load(input.read_text(encoding="utf-8"), Loader=SafeLoader)
 
     docs = [load_from_str] if isinstance(load_from_str, dict) else load_from_str
 
