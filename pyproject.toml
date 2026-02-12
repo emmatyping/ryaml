@@ -1,7 +1,6 @@
 [build-system]
 requires = [
     "maturin>=1,<2",
-    "wheel",
 ]
 build-backend = "maturin"
 
@@ -24,7 +23,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
