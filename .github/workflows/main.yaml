@@ -69,6 +69,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: true
 
       - name: install Rust
         uses: dtolnay/rust-toolchain@master
