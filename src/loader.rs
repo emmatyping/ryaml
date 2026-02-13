@@ -1,6 +1,7 @@
 //! Module implement pyyaml compatibility layer for ryaml via libyaml
 //! Implements RLoader, which can load YAML 1.1
 
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::HashMap;
 use std::io::Cursor;
 
@@ -23,15 +24,15 @@ pub struct RSafeLoader {
     /// Event used by internal parser
     parsed_event: Option<Event>,
     /// Anchors for node composition (maps anchor name to node)
-    anchors: HashMap<String, PyNode>,
+    anchors: FxHashMap<String, PyNode>,
     /// Constructed objects (maps node id to Python object)
-    constructed_objects: HashMap<usize, Py<PyAny>>,
+    constructed_objects: FxHashMap<usize, Py<PyAny>>,
     /// Recursive objects being constructed
-    recursive_objects: HashMap<usize, bool>,
+    recursive_objects: FxHashMap<usize, bool>,
     /// Node ID counter
     next_node_id: usize,
     /// Map nodes to IDs
-    node_ids: HashMap<usize, usize>,
+    node_ids: FxHashMap<usize, usize>,
 }
 
 #[pymethods]
@@ -44,11 +45,11 @@ impl RSafeLoader {
             parser,
             current_event: None,
             parsed_event: None,
-            anchors: HashMap::new(),
-            constructed_objects: HashMap::new(),
-            recursive_objects: HashMap::new(),
+            anchors: HashMap::with_hasher(FxBuildHasher),
+            constructed_objects: HashMap::with_hasher(FxBuildHasher),
+            recursive_objects: HashMap::with_hasher(FxBuildHasher),
             next_node_id: 0,
-            node_ids: HashMap::new(),
+            node_ids: HashMap::with_hasher(FxBuildHasher),
         }
     }
 
