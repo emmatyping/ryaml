@@ -1,0 +1,13 @@
+app:
+  local: true
+  logging:
+    level: INFO
+  version: 1.7
+  release-date: 2015-07-09
+
+  mysql:
+    user: "user"
+    password: "password"
+    host: "127.0.0.1"
+    port: 3306
+    db_name: "database"
