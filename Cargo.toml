@@ -20,3 +20,8 @@ rustc-hash = "2.1.1"
 [dependencies.pyo3]
 version = "0.26.0"
 features = ["extension-module", "py-clone"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = true
