@@ -2,13 +2,14 @@
 //! Implements RLoader, which can load YAML 1.1
 
 use libyaml_safer::{
-    Event, EventData, MappingStyle, OwnedStrInput, Parser, ScalarStyle, SequenceStyle,
+    Event, EventData, MappingStyle, Parser, ScalarStyle, SequenceStyle,
 };
 use pyo3::exceptions::PyNotImplementedError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::HashMap;
+use std::io::Cursor;
 
 use crate::exception;
 use crate::nodes::{PyMappingNode, PyNode, PyScalarNode, PySequenceNode};
@@ -18,7 +19,7 @@ use crate::resolver;
 #[pyclass(name = "_RSafeLoader", subclass)]
 pub struct RSafeLoader {
     /// Parser over an in-memory string passed by Python
-    parser: Parser<OwnedStrInput>,
+    parser: Parser<Cursor<String>>,
     /// Event requested by Python functions
     current_event: Option<Event>,
     /// Event used by internal parser
@@ -39,7 +40,8 @@ pub struct RSafeLoader {
 impl RSafeLoader {
     #[new]
     pub fn new(source: String) -> Self {
-        let parser = Parser::new(OwnedStrInput::new(source));
+        let mut parser = Parser::new();
+        parser.set_input(Cursor::new(source));
         Self {
             parser,
             current_event: None,
@@ -569,9 +571,7 @@ impl RSafeLoader {
         Ok(PyBool::new(py, bool_val).as_any().clone().unbind())
     }
 
-    /// Construct integer value
-    fn construct_yaml_int(&self, py: Python, node: &PyNode) -> PyResult<Py<PyAny>> {
-        let mut value = self.construct_scalar(py, node)?.extract::<String>(py)?;
+    fn construct_yaml_int_fallback(&self, py: Python, mut value: String) -> PyResult<i64> {
         value = value.replace('_', "");
 
         let mut sign = 1i64;
@@ -614,13 +614,20 @@ impl RSafeLoader {
                 .parse::<i64>()
                 .map_err(|e| exception::constructor_error(py, format!("invalid integer: {}", e)))?
         };
-
-        Ok(PyInt::new(py, sign * result).into_any().unbind())
+        Ok(sign * result)
     }
 
-    /// Construct float value
-    fn construct_yaml_float(&self, py: Python, node: &PyNode) -> PyResult<Py<PyAny>> {
+    /// Construct integer value
+    fn construct_yaml_int(&self, py: Python, node: &PyNode) -> PyResult<Py<PyAny>> {
         let mut value = self.construct_scalar(py, node)?.extract::<String>(py)?;
+        let i = match value.parse::<i64>() {
+            Ok(v) => v,
+            Err(_) => self.construct_yaml_int_fallback(py, value)?,
+        };
+        Ok(PyInt::new(py, i).into_any().unbind())
+    }
+
+    fn construct_yaml_float_fallback(&self, py: Python, mut value: String) -> PyResult<f64> {
         value = value.replace('_', "").to_lowercase();
 
         let mut sign = 1.0f64;
@@ -653,8 +660,18 @@ impl RSafeLoader {
                 .parse::<f64>()
                 .map_err(|e| exception::constructor_error(py, format!("invalid float: {}", e)))?
         };
+        Ok(sign * result)
+    }
 
-        Ok(PyFloat::new(py, sign * result).into_any().unbind())
+    /// Construct float value
+    fn construct_yaml_float(&self, py: Python, node: &PyNode) -> PyResult<Py<PyAny>> {
+        let value = self.construct_scalar(py, node)?.extract::<String>(py)?;
+        let f = match value.parse::<f64>() {
+            Ok(v) => v,
+            Err(_) => self.construct_yaml_float_fallback(py, value)?
+        };
+
+        Ok(PyFloat::new(py, f).into_any().unbind())
     }
 
     /// Construct string value
