@@ -1,3 +1,3 @@
 [submodule "libyaml-safer"]
 	path = libyaml-safer
-	url = git@github.com:emmatyping/libyaml-safer.git
+	url = https://github.com/emmatyping/libyaml-safer.git
