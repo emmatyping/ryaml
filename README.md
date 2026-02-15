@@ -104,6 +104,12 @@ This project is standing on the shoulders of giants, and would not be possible w
 
 [libyaml-safer](https://github.com/simonask/libyaml-safer)
 
+[saphyr-parser-bw](https://github.com/bourumir-wyngs/saphyr/tree/dev/saphyr-parser)
+
+[pyyaml](https://github.com/yaml/pyyaml/)
+
+[yaml-test-suite](https://github.com/yaml/yaml-test-suite)
+
 Earlier versions of this library were based on the following projects:
 
 [serde-yaml](https://github.com/dtolnay/serde-yaml)
