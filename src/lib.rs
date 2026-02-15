@@ -50,7 +50,7 @@ mod _ryaml {
         } else {
             let mut loader = RSafeLoader::new(str);
             let mut docs = Vec::new();
-            while loader.check_data()? {
+            while loader.check_data(py)? {
                 docs.push(loader.get_data(py)?)
             }
             Ok(Some(PyList::new(py, docs)?.into()))

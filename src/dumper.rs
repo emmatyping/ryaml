@@ -6,12 +6,12 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use libyaml_safer::{Emitter, Encoding, Event, MappingStyle, ScalarStyle, SequenceStyle};
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{
     PyBool, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PySet, PyString, PyTuple,
 };
 
+use crate::exception;
 use crate::resolver;
 
 /// Internal representation node used by the representer/serializer.
@@ -155,7 +155,10 @@ impl RSafeDumper {
             Some("utf-16-le") | Some("utf-16le") => Encoding::Utf16Le,
             Some("utf-16-be") | Some("utf-16be") => Encoding::Utf16Be,
             Some(other) => {
-                return Err(PyValueError::new_err(format!("unknown encoding: {other}")));
+                return Err(exception::emitter_error(
+                    py,
+                    format!("unknown encoding: {other}"),
+                ));
             }
         };
         ew.configure(enc);
@@ -204,24 +207,28 @@ impl RSafeDumper {
         })
     }
 
-    fn open(&mut self) -> PyResult<()> {
+    fn open(&mut self, py: Python) -> PyResult<()> {
         if self.closed != -1 {
-            return Err(PyValueError::new_err(if self.closed == 1 {
-                "serializer is closed"
-            } else {
-                "serializer is already opened"
-            }));
+            return Err(exception::serializer_error(
+                py,
+                if self.closed == 1 {
+                    "serializer is closed"
+                } else {
+                    "serializer is already opened"
+                }
+                .to_string(),
+            ));
         }
         self.emitter
             .emit(Event::stream_start(Encoding::Utf8))
-            .map_err(PyValueError::new_err)?;
+            .map_err(|e| exception::emitter_error(py, e))?;
         self.closed = 0;
         Ok(())
     }
 
     fn represent(&mut self, py: Python, data: Py<PyAny>) -> PyResult<()> {
         let node = self.represent_data(py, data.bind(py))?;
-        self.serialize(&node)?;
+        self.serialize(py, &node)?;
         self.represented_objects.clear();
         self.object_keeper.clear();
         Ok(())
@@ -229,14 +236,17 @@ impl RSafeDumper {
 
     fn close(&mut self, py: Python) -> PyResult<()> {
         if self.closed == -1 {
-            return Err(PyValueError::new_err("serializer is not opened"));
+            return Err(exception::serializer_error(
+                py,
+                "serializer is not opened".to_string(),
+            ));
         }
         if self.closed == 1 {
             return Ok(());
         }
         self.emitter
             .emit(Event::stream_end())
-            .map_err(PyValueError::new_err)?;
+            .map_err(|e| exception::emitter_error(py, e))?;
         self.closed = 1;
 
         // Flush output to stream
@@ -244,7 +254,7 @@ impl RSafeDumper {
         let stream = self.stream.bind(py);
         if self.dump_unicode {
             let s = String::from_utf8(output)
-                .map_err(|e| PyValueError::new_err(format!("invalid utf8 output: {e}")))?;
+                .map_err(|e| exception::emitter_error(py, format!("invalid utf8 output: {e}")))?;
             stream.call_method1("write", (s,))?;
         } else {
             stream.call_method1("write", (PyBytes::new(py, &output),))?;
@@ -307,10 +317,10 @@ impl RSafeDumper {
         } else if data.is_instance_of::<PySet>() || data.is_instance_of::<PyFrozenSet>() {
             self.represent_set(py, data)?
         } else {
-            return Err(PyValueError::new_err(format!(
-                "cannot represent an object: {:?}",
-                data.get_type().name()?
-            )));
+            return Err(exception::representer_error(
+                py,
+                format!("cannot represent an object: {:?}", data.get_type().name()?),
+            ));
         };
 
         if let Some(key) = alias_key {
@@ -485,21 +495,21 @@ impl RSafeDumper {
 // ── Serializer ───────────────────────────────────────────────────────────────
 
 impl RSafeDumper {
-    fn serialize(&mut self, node: &Arc<RepNode>) -> PyResult<()> {
+    fn serialize(&mut self, py: Python, node: &Arc<RepNode>) -> PyResult<()> {
         self.emitter
             .emit(Event::document_start(
                 None,
                 &[],
                 self.document_start_implicit,
             ))
-            .map_err(PyValueError::new_err)?;
+            .map_err(|e| exception::emitter_error(py, e))?;
 
         self.anchor_node(node);
-        self.serialize_node(node)?;
+        self.serialize_node(py, node)?;
 
         self.emitter
             .emit(Event::document_end(self.document_end_implicit))
-            .map_err(PyValueError::new_err)?;
+            .map_err(|e| exception::emitter_error(py, e))?;
 
         // Reset serializer state
         self.serialized_nodes.clear();
@@ -535,7 +545,7 @@ impl RSafeDumper {
         }
     }
 
-    fn serialize_node(&mut self, node: &Arc<RepNode>) -> PyResult<()> {
+    fn serialize_node(&mut self, py: Python, node: &Arc<RepNode>) -> PyResult<()> {
         let key = Arc::as_ptr(node) as usize;
         let anchor = self.anchors.get(&key).cloned().flatten();
 
@@ -544,7 +554,7 @@ impl RSafeDumper {
             let anchor_str = anchor.as_deref().unwrap_or("");
             self.emitter
                 .emit(Event::alias(anchor_str))
-                .map_err(PyValueError::new_err)?;
+                .map_err(|e| exception::emitter_error(py, e))?;
             return Ok(());
         }
         self.serialized_nodes.insert(key);
@@ -568,7 +578,7 @@ impl RSafeDumper {
                         quoted_implicit,
                         scalar_style,
                     ))
-                    .map_err(PyValueError::new_err)?;
+                    .map_err(|e| exception::emitter_error(py, e))?;
             }
             RepNode::Sequence {
                 tag,
@@ -588,13 +598,13 @@ impl RSafeDumper {
                         implicit,
                         style,
                     ))
-                    .map_err(PyValueError::new_err)?;
+                    .map_err(|e| exception::emitter_error(py, e))?;
                 for item in value {
-                    self.serialize_node(item)?;
+                    self.serialize_node(py, item)?;
                 }
                 self.emitter
                     .emit(Event::sequence_end())
-                    .map_err(PyValueError::new_err)?;
+                    .map_err(|e| exception::emitter_error(py, e))?;
             }
             RepNode::Mapping {
                 tag,
@@ -609,14 +619,14 @@ impl RSafeDumper {
                 };
                 self.emitter
                     .emit(Event::mapping_start(anchor_ref, Some(tag), implicit, style))
-                    .map_err(PyValueError::new_err)?;
+                    .map_err(|e| exception::emitter_error(py, e))?;
                 for (k, v) in value {
-                    self.serialize_node(k)?;
-                    self.serialize_node(v)?;
+                    self.serialize_node(py, k)?;
+                    self.serialize_node(py, v)?;
                 }
                 self.emitter
                     .emit(Event::mapping_end())
-                    .map_err(PyValueError::new_err)?;
+                    .map_err(|e| exception::emitter_error(py, e))?;
             }
         }
         Ok(())
@@ -722,19 +732,19 @@ pub fn dumps_to_string(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<String> {
     dumper
         .emitter
         .emit(Event::stream_start(Encoding::Utf8))
-        .map_err(PyValueError::new_err)?;
+        .map_err(|e| exception::emitter_error(py, e))?;
 
     let node = dumper.represent_data(py, obj)?;
-    dumper.serialize(&node)?;
+    dumper.serialize(py, &node)?;
 
     dumper
         .emitter
         .emit(Event::stream_end())
-        .map_err(PyValueError::new_err)?;
+        .map_err(|e| exception::emitter_error(py, e))?;
 
     let output = dumper.emitter.take_output();
     String::from_utf8(output)
-        .map_err(|e| PyValueError::new_err(format!("invalid utf8 output: {e}")))
+        .map_err(|e| exception::emitter_error(py, format!("invalid utf8 output: {e}")))
 }
 
 pub fn register_dumper(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {

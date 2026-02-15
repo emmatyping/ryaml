@@ -4,13 +4,13 @@
 use libyaml_safer::{
     Event, EventData, MappingStyle, OwnedStrInput, Parser, ScalarStyle, SequenceStyle,
 };
-use pyo3::exceptions::{PyNotImplementedError, PyValueError};
+use pyo3::exceptions::PyNotImplementedError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::HashMap;
 
-use crate::exception::InvalidYamlError;
+use crate::exception;
 use crate::nodes::{PyMappingNode, PyNode, PyScalarNode, PySequenceNode};
 use crate::resolver;
 
@@ -71,13 +71,13 @@ impl RSafeLoader {
     }
 
     /// Check if there's data available
-    pub fn check_data(&mut self) -> PyResult<bool> {
-        self.check_node()
+    pub fn check_data(&mut self, py: Python) -> PyResult<bool> {
+        self.check_node(py)
     }
 
     /// Get the next document as a Python object
     pub fn get_data(&mut self, py: Python) -> PyResult<Option<Py<PyAny>>> {
-        if self.check_node()?
+        if self.check_node(py)?
             && let Some(node) = self.get_node(py)?
         {
             return Ok(Some(self.construct_document(py, node)?));
@@ -97,8 +97,8 @@ impl RSafeLoader {
 }
 
 impl RSafeLoader {
-    fn check_node(&mut self) -> PyResult<bool> {
-        self._parse_next_event()?;
+    fn check_node(&mut self, py: Python) -> PyResult<bool> {
+        self._parse_next_event(py)?;
         if matches!(
             &self.parsed_event,
             Some(Event {
@@ -107,7 +107,7 @@ impl RSafeLoader {
             })
         ) {
             self.parsed_event = None;
-            self._parse_next_event()?;
+            self._parse_next_event(py)?;
         }
         if matches!(
             &self.parsed_event,
@@ -122,7 +122,7 @@ impl RSafeLoader {
     }
 
     fn get_node(&mut self, py: Python) -> PyResult<Option<PyNode>> {
-        self._parse_next_event()?;
+        self._parse_next_event(py)?;
         if matches!(
             &self.parsed_event,
             Some(Event {
@@ -137,11 +137,11 @@ impl RSafeLoader {
 
     fn get_single_node(&mut self, py: Python) -> PyResult<Option<PyNode>> {
         // Eat stream start event
-        self._parse_next_event()?;
+        self._parse_next_event(py)?;
         self.parsed_event = None;
 
         // Get document
-        self._parse_next_event()?;
+        self._parse_next_event(py)?;
         let document = if !matches!(
             &self.parsed_event,
             Some(Event {
@@ -155,7 +155,7 @@ impl RSafeLoader {
         };
 
         // Make sure there are no more documents
-        self._parse_next_event()?;
+        self._parse_next_event(py)?;
         if !matches!(
             &self.parsed_event,
             Some(Event {
@@ -163,8 +163,9 @@ impl RSafeLoader {
                 ..
             })
         ) {
-            return Err(PyValueError::new_err(
-                "expected a single document in the stream, but found another document",
+            return Err(exception::composer_error(
+                py,
+                "expected a single document in the stream, but found another document".to_string(),
             ));
         }
 
@@ -172,13 +173,13 @@ impl RSafeLoader {
     }
 
     /// Parse the next event if needed
-    fn _parse_next_event(&mut self) -> PyResult<()> {
+    fn _parse_next_event(&mut self, py: Python) -> PyResult<()> {
         if self.parsed_event.is_none() {
             match self.parser.parse() {
                 Ok(event) => {
                     self.parsed_event = Some(event);
                 }
-                Err(e) => return Err(InvalidYamlError::new_err(format!("{}", e))),
+                Err(e) => return Err(exception::scanner_error(py, format!("{}", e))),
             }
         }
         Ok(())
@@ -193,7 +194,7 @@ impl RSafeLoader {
         let node = self._compose_node(py)?;
 
         // Eat document end event
-        self._parse_next_event()?;
+        self._parse_next_event(py)?;
         self.parsed_event = None;
 
         // Clear anchors for next document
@@ -204,7 +205,7 @@ impl RSafeLoader {
 
     /// Compose a node from events
     fn _compose_node(&mut self, py: Python) -> PyResult<PyNode> {
-        self._parse_next_event()?;
+        self._parse_next_event(py)?;
         let event = self.parsed_event.as_ref().unwrap();
 
         match &event.data {
@@ -214,10 +215,10 @@ impl RSafeLoader {
                     self.parsed_event = None;
                     Ok(node.clone())
                 } else {
-                    Err(PyValueError::new_err(format!(
-                        "found undefined alias '{}'",
-                        anchor_str
-                    )))
+                    Err(exception::composer_error(
+                        py,
+                        format!("found undefined alias '{}'", anchor_str),
+                    ))
                 }
             }
             EventData::Scalar { .. } => {
@@ -232,10 +233,10 @@ impl RSafeLoader {
                 let node = self._compose_mapping_node(py)?;
                 Ok(node)
             }
-            _ => Err(PyValueError::new_err(format!(
-                "unexpected event: {:?}",
-                event.data
-            ))),
+            _ => Err(exception::composer_error(
+                py,
+                format!("unexpected event: {:?}", event.data),
+            )),
         }
     }
 
@@ -334,7 +335,7 @@ impl RSafeLoader {
             // Compose child nodes
             let mut children = vec![];
             loop {
-                self._parse_next_event()?;
+                self._parse_next_event(py)?;
                 if matches!(
                     &self.parsed_event,
                     Some(Event {
@@ -403,7 +404,7 @@ impl RSafeLoader {
             // Compose key-value pairs
             let mut pairs = vec![];
             loop {
-                self._parse_next_event()?;
+                self._parse_next_event(py)?;
                 if matches!(
                     &self.parsed_event,
                     Some(Event {
@@ -477,8 +478,9 @@ impl RSafeLoader {
 
         // Check for recursive construction
         if self.recursive_objects.contains_key(&node_id) {
-            return Err(PyValueError::new_err(
-                "found unconstructable recursive node",
+            return Err(exception::constructor_error(
+                py,
+                "found unconstructable recursive node".to_string(),
             ));
         }
 
@@ -534,12 +536,14 @@ impl RSafeLoader {
                         return self.construct_scalar(py, value_node);
                     }
                 }
-                Err(PyValueError::new_err(
-                    "expected a scalar node, but found mapping",
+                Err(exception::constructor_error(
+                    py,
+                    "expected a scalar node, but found mapping".to_string(),
                 ))
             }
-            _ => Err(PyValueError::new_err(
-                "expected a scalar node, but found sequence",
+            _ => Err(exception::constructor_error(
+                py,
+                "expected a scalar node, but found sequence".to_string(),
             )),
         }
     }
@@ -556,10 +560,10 @@ impl RSafeLoader {
             "yes" | "true" | "on" => true,
             "no" | "false" | "off" => false,
             _ => {
-                return Err(PyValueError::new_err(format!(
-                    "invalid boolean value: {}",
-                    value
-                )));
+                return Err(exception::constructor_error(
+                    py,
+                    format!("invalid boolean value: {}", value),
+                ));
             }
         };
         Ok(PyBool::new(py, bool_val).as_any().clone().unbind())
@@ -581,23 +585,26 @@ impl RSafeLoader {
         let result = if value == "0" {
             0
         } else if let Some(bin) = value.strip_prefix("0b") {
-            i64::from_str_radix(bin, 2)
-                .map_err(|e| PyValueError::new_err(format!("invalid binary integer: {}", e)))?
+            i64::from_str_radix(bin, 2).map_err(|e| {
+                exception::constructor_error(py, format!("invalid binary integer: {}", e))
+            })?
         } else if let Some(hex) = value.strip_prefix("0x") {
-            i64::from_str_radix(hex, 16)
-                .map_err(|e| PyValueError::new_err(format!("invalid hex integer: {}", e)))?
+            i64::from_str_radix(hex, 16).map_err(|e| {
+                exception::constructor_error(py, format!("invalid hex integer: {}", e))
+            })?
         } else if value.starts_with('0') && !value.contains(':') {
-            i64::from_str_radix(&value, 8)
-                .map_err(|e| PyValueError::new_err(format!("invalid octal integer: {}", e)))?
+            i64::from_str_radix(&value, 8).map_err(|e| {
+                exception::constructor_error(py, format!("invalid octal integer: {}", e))
+            })?
         } else if value.contains(':') {
             // Sexagesimal (base 60)
             let parts: Vec<&str> = value.split(':').collect();
             let mut result = 0i64;
             let mut base = 1i64;
             for part in parts.iter().rev() {
-                let digit = part
-                    .parse::<i64>()
-                    .map_err(|e| PyValueError::new_err(format!("invalid sexagesimal: {}", e)))?;
+                let digit = part.parse::<i64>().map_err(|e| {
+                    exception::constructor_error(py, format!("invalid sexagesimal: {}", e))
+                })?;
                 result += digit * base;
                 base *= 60;
             }
@@ -605,7 +612,7 @@ impl RSafeLoader {
         } else {
             value
                 .parse::<i64>()
-                .map_err(|e| PyValueError::new_err(format!("invalid integer: {}", e)))?
+                .map_err(|e| exception::constructor_error(py, format!("invalid integer: {}", e)))?
         };
 
         Ok(PyInt::new(py, sign * result).into_any().unbind())
@@ -635,7 +642,7 @@ impl RSafeLoader {
             let mut base = 1.0f64;
             for part in parts.iter().rev() {
                 let digit = part.parse::<f64>().map_err(|e| {
-                    PyValueError::new_err(format!("invalid sexagesimal float: {}", e))
+                    exception::constructor_error(py, format!("invalid sexagesimal float: {}", e))
                 })?;
                 result += digit * base;
                 base *= 60.0;
@@ -644,7 +651,7 @@ impl RSafeLoader {
         } else {
             value
                 .parse::<f64>()
-                .map_err(|e| PyValueError::new_err(format!("invalid float: {}", e)))?
+                .map_err(|e| exception::constructor_error(py, format!("invalid float: {}", e)))?
         };
 
         Ok(PyFloat::new(py, sign * result).into_any().unbind())
@@ -672,8 +679,9 @@ impl RSafeLoader {
                 }
                 Ok(list.unbind().into_any())
             }
-            _ => Err(PyValueError::new_err(
-                "expected a sequence node, but found mapping or scalar",
+            _ => Err(exception::constructor_error(
+                py,
+                "expected a sequence node, but found mapping or scalar".to_string(),
             )),
         }
     }
@@ -714,8 +722,9 @@ impl RSafeLoader {
                 }
                 Ok(dict.unbind().into_any())
             }
-            _ => Err(PyValueError::new_err(
-                "expected a mapping node, but found sequence or scalar",
+            _ => Err(exception::constructor_error(
+                py,
+                "expected a mapping node, but found sequence or scalar".to_string(),
             )),
         }
     }
@@ -733,7 +742,10 @@ impl RSafeLoader {
                 }
                 Ok(dict.unbind().into_any())
             }
-            _ => Err(PyValueError::new_err("expected a mapping node for set")),
+            _ => Err(exception::constructor_error(
+                py,
+                "expected a mapping node for set".to_string(),
+            )),
         }
     }
 
