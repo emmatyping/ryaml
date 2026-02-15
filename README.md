@@ -5,10 +5,10 @@ ryaml
 
 ### What is ryaml?
 
-ryaml is a Python library that wraps a Rust yaml parser, [serde-yaml](https://github.com/dtolnay/serde-yaml), to quickly and safely parse and dump yaml to and from Python objects.
+ryaml is a Python library that wraps a Rust yaml parser, [libyaml-safer](https://github.com/simonask/libyaml-safer),
+to quickly and safely parse and dump yaml to and from Python objects.
 
-It is *not* fully compatible with PyYAML, and it has a similar design to the `json` module.
-The hope is this will be used as a safe and fast yaml parser in lieu of PyYAML.
+The project is *drop-in compatible* with PyYAML, meaning that any behavior differences are a bug and should be reported against this project.
 
 Like PyYAML, this library implements the YAML 1.1 specification.
 
@@ -101,6 +101,16 @@ assert docs[0]['a']['key'] is None
 This project is standing on the shoulders of giants, and would not be possible without:
 
 [pyo3](https://pyo3.rs/)
+
+[libyaml-safer](https://github.com/simonask/libyaml-safer)
+
+[saphyr-parser-bw](https://github.com/bourumir-wyngs/saphyr/tree/dev/saphyr-parser)
+
+[pyyaml](https://github.com/yaml/pyyaml/)
+
+[yaml-test-suite](https://github.com/yaml/yaml-test-suite)
+
+Earlier versions of this library were based on the following projects:
 
 [serde-yaml](https://github.com/dtolnay/serde-yaml)
 

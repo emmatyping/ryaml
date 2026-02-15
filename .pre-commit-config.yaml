@@ -12,6 +12,7 @@ repos:
             args: ['--maxkb=8192']
         -   id: fix-byte-order-marker
         -   id: check-yaml
+            args: ['--allow-multiple-documents']
         -   id: fix-encoding-pragma
             args: ['--remove']
     -   repo: https://github.com/doublify/pre-commit-rust

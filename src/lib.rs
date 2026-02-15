@@ -1,85 +1,73 @@
-pyo3::create_exception!(_ryaml, InvalidYamlError, pyo3::exceptions::PyValueError);
+mod dumper;
+mod exception;
+mod loader;
+mod mark;
+mod nodes;
+mod resolver;
 
 #[pyo3::pymodule(gil_used = false)]
 mod _ryaml {
 
     use pyo3::Python;
+    use pyo3::prelude::*;
     use pyo3::types::PyList;
-    use pyo3::{exceptions::PyValueError, prelude::*};
 
-    use pythonize::{depythonize, pythonize};
-    use serde::Deserialize;
-    use serde_yaml::Value;
+    use crate::dumper::register_dumper;
+    use crate::loader::register_loader;
+    use crate::mark::register_mark;
+    use crate::nodes::register_nodes;
 
     #[pymodule_export]
-    use super::InvalidYamlError;
+    use crate::exception::InvalidYamlError;
 
-    fn deserialize_yaml(str: String) -> PyResult<Value> {
-        match serde_yaml::from_str(&str) {
-            Ok(val) => Ok(val),
-            Err(err) => Err(InvalidYamlError::new_err(err.to_string())),
-        }
-    }
+    #[pymodule_export]
+    use crate::loader::RSafeLoader;
 
-    fn deserialize_all_yaml(str: String) -> PyResult<Vec<Value>> {
-        let mut documents = vec![];
-        for document in serde_yaml::Deserializer::from_str(&str) {
-            match Value::deserialize(document) {
-                Ok(value) => documents.push(value),
-                Err(e) => return Err(InvalidYamlError::new_err(e.to_string())),
-            }
-        }
-        Ok(documents)
-    }
+    #[pymodule_export]
+    use crate::dumper::RSafeDumper;
 
-    fn serialize_yaml(yaml: &Value) -> PyResult<String> {
-        match serde_yaml::to_string(&yaml) {
-            Ok(s) => Ok(s),
-            Err(err) => Err(PyValueError::new_err(err.to_string())),
-        }
-    }
+    #[pymodule_export]
+    use crate::mark::PyMark;
 
-    fn yaml_to_pyobject(py: Python, yaml: &Value) -> PyResult<Py<PyAny>> {
-        match pythonize(py, yaml) {
-            Ok(obj) => Ok(obj.unbind()),
-            Err(err) => Err(PyValueError::new_err(err.to_string())),
-        }
-    }
+    #[pymodule_export]
+    use crate::nodes::PyScalarNode;
 
-    fn pyobject_to_yaml(py: Python, obj: Py<PyAny>) -> PyResult<Value> {
-        match depythonize(obj.bind(py)) {
-            Ok(obj) => Ok(obj),
-            Err(err) => Err(PyValueError::new_err(err.to_string())),
-        }
+    #[pymodule_export]
+    use crate::nodes::PySequenceNode;
+
+    #[pymodule_export]
+    use crate::nodes::PyMappingNode;
+
+    #[pyfunction]
+    fn loads(py: Python, str: String) -> PyResult<Option<Py<PyAny>>> {
+        RSafeLoader::new(str).get_single_data(py)
     }
 
     #[pyfunction]
-    fn loads(py: Python, str: String) -> PyResult<Py<PyAny>> {
+    fn loads_all(py: Python, str: String) -> PyResult<Option<Py<PyAny>>> {
         if str.is_empty() {
-            Ok(Python::None(py))
+            Ok(Some(Python::None(py)))
         } else {
-            let value = deserialize_yaml(str)?;
-            yaml_to_pyobject(py, &value)
-        }
-    }
-
-    #[pyfunction]
-    fn loads_all(py: Python, str: String) -> PyResult<Py<PyAny>> {
-        if str.is_empty() {
-            Ok(Python::None(py))
-        } else {
-            let documents = deserialize_all_yaml(str)?;
-            let mut pydocs = vec![];
-            for doc in documents {
-                pydocs.push(yaml_to_pyobject(py, &doc)?);
+            let mut loader = RSafeLoader::new(str);
+            let mut docs = Vec::new();
+            while loader.check_data(py)? {
+                docs.push(loader.get_data(py)?)
             }
-            Ok(PyList::new(py, pydocs)?.into_any().unbind())
+            Ok(Some(PyList::new(py, docs)?.into()))
         }
     }
 
     #[pyfunction]
     fn dumps(py: Python, obj: Py<PyAny>) -> PyResult<String> {
-        let yaml = pyobject_to_yaml(py, obj)?;
-        serialize_yaml(&yaml)
+        crate::dumper::dumps_to_string(py, obj.bind(py))
+    }
+
+    #[pymodule_init]
+    fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
+        register_nodes(m)?;
+        register_loader(m)?;
+        register_mark(m)?;
+        register_dumper(m)?;
+        Ok(())
     }
 }
