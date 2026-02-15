@@ -619,7 +619,7 @@ impl RSafeLoader {
 
     /// Construct integer value
     fn construct_yaml_int(&self, py: Python, node: &PyNode) -> PyResult<Py<PyAny>> {
-        let mut value = self.construct_scalar(py, node)?.extract::<String>(py)?;
+        let value = self.construct_scalar(py, node)?.extract::<String>(py)?;
         let i = match value.parse::<i64>() {
             Ok(v) => v,
             Err(_) => self.construct_yaml_int_fallback(py, value)?,
