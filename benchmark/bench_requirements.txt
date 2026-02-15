@@ -1,0 +1,8 @@
+oyaml
+pyyaml
+yaml-rs
+ruamel-yaml
+polars == 1.37.1
+altair == 6.0.0
+py-cpuinfo == 9.0.0
+vl-convert-python == 1.9.0.post1

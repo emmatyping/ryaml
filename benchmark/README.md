@@ -19,9 +19,11 @@ py -m venv .venv
 ```bash
 # Using pip
 pip install -r benchmark/bench_requirements.txt
+pip install .
 
 # Using uv
 uv pip install -r benchmark/bench_requirements.txt
+uv pip install .
 ```
 
 ## Run `benchmark/run.py`
