@@ -1,14 +1,14 @@
 //! Module implement pyyaml compatibility layer for ryaml via libyaml
 //! Implements RLoader, which can load YAML 1.1
 
-use rustc_hash::{FxBuildHasher, FxHashMap};
-use std::collections::HashMap;
-use std::io::Cursor;
-
-use libyaml_safer::{Event, EventData, MappingStyle, Parser, ScalarStyle, SequenceStyle};
+use libyaml_safer::{
+    Event, EventData, MappingStyle, OwnedStrInput, Parser, ScalarStyle, SequenceStyle,
+};
 use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
+use rustc_hash::{FxBuildHasher, FxHashMap};
+use std::collections::HashMap;
 
 use crate::exception::InvalidYamlError;
 use crate::nodes::{PyMappingNode, PyNode, PyScalarNode, PySequenceNode};
@@ -18,7 +18,7 @@ use crate::resolver;
 #[pyclass(name = "_RSafeLoader", subclass)]
 pub struct RSafeLoader {
     /// Parser over an in-memory string passed by Python
-    parser: Parser<Cursor<String>>,
+    parser: Parser<OwnedStrInput>,
     /// Event requested by Python functions
     current_event: Option<Event>,
     /// Event used by internal parser
@@ -39,8 +39,7 @@ pub struct RSafeLoader {
 impl RSafeLoader {
     #[new]
     pub fn new(source: String) -> Self {
-        let mut parser = Parser::new();
-        parser.set_input(Cursor::new(source));
+        let parser = Parser::new(OwnedStrInput::new(source));
         Self {
             parser,
             current_event: None,
