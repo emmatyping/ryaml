@@ -5,6 +5,19 @@ mod mark;
 mod nodes;
 mod resolver;
 
+const TAG_NULL: &str = "tag:yaml.org,2002:null";
+const TAG_BOOL: &str = "tag:yaml.org,2002:bool";
+const TAG_INT: &str = "tag:yaml.org,2002:int";
+const TAG_FLOAT: &str = "tag:yaml.org,2002:float";
+const TAG_STR: &str = "tag:yaml.org,2002:str";
+const TAG_BINARY: &str = "tag:yaml.org,2002:binary";
+const TAG_TIMESTAMP: &str = "tag:yaml.org,2002:timestamp";
+const TAG_SEQ: &str = "tag:yaml.org,2002:seq";
+const TAG_MAP: &str = "tag:yaml.org,2002:map";
+const TAG_SET: &str = "tag:yaml.org,2002:set";
+const TAG_MERGE: &str = "tag:yaml.org,2002:merge";
+const TAG_VALUE: &str = "tag:yaml.org,2002:value";
+
 #[pyo3::pymodule(gil_used = false)]
 mod _ryaml {
 

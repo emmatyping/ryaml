@@ -215,10 +215,10 @@ impl RSafeLoader {
         };
 
         let result = match resolved_tag {
-            "tag:yaml.org,2002:null" => py.None(),
-            "tag:yaml.org,2002:bool" => construct_bool_direct(py, &value)?,
-            "tag:yaml.org,2002:int" => construct_int_direct(py, &value)?,
-            "tag:yaml.org,2002:float" => construct_float_direct(py, &value)?,
+            crate::TAG_NULL => py.None(),
+            crate::TAG_BOOL => construct_bool_direct(py, &value)?,
+            crate::TAG_INT => construct_int_direct(py, &value)?,
+            crate::TAG_FLOAT => construct_float_direct(py, &value)?,
             // str, timestamp, value, merge, and unknown tags all produce strings
             _ => PyString::new(py, &value).into_any().unbind(),
         };
@@ -272,7 +272,7 @@ impl RSafeLoader {
         anchor: Option<String>,
         tag: Option<String>,
     ) -> PyResult<Py<PyAny>> {
-        let is_set = tag.as_deref() == Some("tag:yaml.org,2002:set");
+        let is_set = tag.as_deref() == Some(crate::TAG_SET);
 
         let dict = PyDict::new(py);
         let dict_obj: Py<PyAny> = dict.clone().unbind().into_any();
@@ -386,7 +386,7 @@ fn is_merge_key(event: &Option<Event>) -> bool {
     }) = event
     {
         if let Some(t) = tag {
-            return t == "tag:yaml.org,2002:merge";
+            return t == crate::TAG_MERGE;
         }
         return *plain_implicit && value == "<<";
     }

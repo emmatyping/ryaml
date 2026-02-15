@@ -1,9 +1,9 @@
 //! Shared resolver for YAML 1.1 implicit tag resolution.
 //! Used by both the loader and dumper.
 
-pub const DEFAULT_SCALAR_TAG: &str = "tag:yaml.org,2002:str";
-pub const DEFAULT_SEQUENCE_TAG: &str = "tag:yaml.org,2002:seq";
-pub const DEFAULT_MAPPING_TAG: &str = "tag:yaml.org,2002:map";
+pub const DEFAULT_SCALAR_TAG: &str = crate::TAG_STR;
+pub const DEFAULT_SEQUENCE_TAG: &str = crate::TAG_SEQ;
+pub const DEFAULT_MAPPING_TAG: &str = crate::TAG_MAP;
 
 /// Resolve the implicit tag for a scalar value.
 ///
@@ -16,22 +16,20 @@ pub fn resolve_scalar_tag(value: &str, plain_implicit: bool) -> &'static str {
     }
 
     match value {
-        "" | "~" | "null" | "Null" | "NULL" => "tag:yaml.org,2002:null",
+        "" | "~" | "null" | "Null" | "NULL" => crate::TAG_NULL,
         "yes" | "Yes" | "YES" | "no" | "No" | "NO" | "true" | "True" | "TRUE" | "false"
-        | "False" | "FALSE" | "on" | "On" | "ON" | "off" | "Off" | "OFF" => {
-            "tag:yaml.org,2002:bool"
-        }
+        | "False" | "FALSE" | "on" | "On" | "ON" | "off" | "Off" | "OFF" => crate::TAG_BOOL,
         ".inf" | ".Inf" | ".INF" | "+.inf" | "+.Inf" | "+.INF" | "-.inf" | "-.Inf" | "-.INF"
-        | ".nan" | ".NaN" | ".NAN" => "tag:yaml.org,2002:float",
-        "<<" => "tag:yaml.org,2002:merge",
-        "=" => "tag:yaml.org,2002:value",
+        | ".nan" | ".NaN" | ".NAN" => crate::TAG_FLOAT,
+        "<<" => crate::TAG_MERGE,
+        "=" => crate::TAG_VALUE,
         _ => {
             if is_int(value) {
-                "tag:yaml.org,2002:int"
+                crate::TAG_INT
             } else if is_float(value) {
-                "tag:yaml.org,2002:float"
+                crate::TAG_FLOAT
             } else if is_timestamp(value) {
-                "tag:yaml.org,2002:timestamp"
+                crate::TAG_TIMESTAMP
             } else {
                 DEFAULT_SCALAR_TAG
             }

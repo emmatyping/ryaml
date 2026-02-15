@@ -331,29 +331,29 @@ impl RSafeDumper {
     }
 
     fn represent_none(&self) -> Arc<RepNode> {
-        self.make_scalar("tag:yaml.org,2002:null", "null", None)
+        self.make_scalar(crate::TAG_NULL, "null", None)
     }
 
     fn represent_bool(&self, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
         let b: bool = data.extract()?;
         let value = if b { "true" } else { "false" };
-        Ok(self.make_scalar("tag:yaml.org,2002:bool", value, None))
+        Ok(self.make_scalar(crate::TAG_BOOL, value, None))
     }
 
     fn represent_int(&self, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
         let s = data.str()?.to_string();
-        Ok(self.make_scalar("tag:yaml.org,2002:int", &s, None))
+        Ok(self.make_scalar(crate::TAG_INT, &s, None))
     }
 
     fn represent_float(&self, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
         let f: f64 = data.extract()?;
         let value = format_float(f);
-        Ok(self.make_scalar("tag:yaml.org,2002:float", &value, None))
+        Ok(self.make_scalar(crate::TAG_FLOAT, &value, None))
     }
 
     fn represent_str(&self, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
         let s: String = data.extract()?;
-        Ok(self.make_scalar("tag:yaml.org,2002:str", &s, None))
+        Ok(self.make_scalar(crate::TAG_STR, &s, None))
     }
 
     fn represent_binary(&self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
@@ -370,17 +370,17 @@ impl RSafeDumper {
         }
         result.push('\n');
 
-        Ok(self.make_scalar("tag:yaml.org,2002:binary", &result, Some('|')))
+        Ok(self.make_scalar(crate::TAG_BINARY, &result, Some('|')))
     }
 
     fn represent_date(&self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
         let value: String = data.call_method0("isoformat")?.extract()?;
-        Ok(self.make_scalar("tag:yaml.org,2002:timestamp", &value, None))
+        Ok(self.make_scalar(crate::TAG_TIMESTAMP, &value, None))
     }
 
     fn represent_datetime(&self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
         let value: String = data.call_method1("isoformat", (" ",))?.extract()?;
-        Ok(self.make_scalar("tag:yaml.org,2002:timestamp", &value, None))
+        Ok(self.make_scalar(crate::TAG_TIMESTAMP, &value, None))
     }
 
     fn represent_list(&mut self, py: Python, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
@@ -403,7 +403,7 @@ impl RSafeDumper {
         }
         let flow_style = self.choose_flow_style(best_style);
         Ok(Arc::new(RepNode::Sequence {
-            tag: "tag:yaml.org,2002:seq".to_string(),
+            tag: crate::TAG_SEQ.to_string(),
             value: items,
             flow_style,
         }))
@@ -431,7 +431,7 @@ impl RSafeDumper {
         }
         let flow_style = self.choose_flow_style(best_style);
         Ok(Arc::new(RepNode::Mapping {
-            tag: "tag:yaml.org,2002:map".to_string(),
+            tag: crate::TAG_MAP.to_string(),
             value: items,
             flow_style,
         }))
@@ -454,7 +454,7 @@ impl RSafeDumper {
             }
         }
         Ok(Arc::new(RepNode::Mapping {
-            tag: "tag:yaml.org,2002:set".to_string(),
+            tag: crate::TAG_SET.to_string(),
             value: items,
             flow_style: Some(false),
         }))
