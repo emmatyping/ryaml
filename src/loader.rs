@@ -451,9 +451,8 @@ fn construct_int_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
             exception::constructor_error(py, format!("invalid sexagesimal integer: {}", value))
         })?
     } else {
-        parse_int_skip_underscores(remaining, 10).map_err(|_| {
-            exception::constructor_error(py, format!("invalid integer: {}", value))
-        })?
+        parse_int_skip_underscores(remaining, 10)
+            .map_err(|_| exception::constructor_error(py, format!("invalid integer: {}", value)))?
     };
 
     Ok(PyInt::new(py, sign * result).into_any().unbind())
@@ -495,9 +494,8 @@ fn construct_float_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
             exception::constructor_error(py, format!("invalid sexagesimal float: {}", value))
         })?
     } else {
-        parse_float_skip_underscores(remaining).map_err(|_| {
-            exception::constructor_error(py, format!("invalid float: {}", value))
-        })?
+        parse_float_skip_underscores(remaining)
+            .map_err(|_| exception::constructor_error(py, format!("invalid float: {}", value)))?
     };
 
     Ok(PyFloat::new(py, sign * result).into_any().unbind())
@@ -529,11 +527,7 @@ fn parse_int_skip_underscores(s: &str, radix: u32) -> Result<i64, ()> {
             .checked_add(digit as i64)
             .ok_or(())?;
     }
-    if has_digit {
-        Ok(result)
-    } else {
-        Err(())
-    }
+    if has_digit { Ok(result) } else { Err(()) }
 }
 
 /// Parse sexagesimal integer (e.g. "1:30" = 90), skipping underscores in each segment.
@@ -541,7 +535,11 @@ fn parse_sexagesimal_int(s: &str) -> Result<i64, ()> {
     let mut result: i64 = 0;
     for part in s.split(':') {
         let segment = parse_int_skip_underscores(part, 10)?;
-        result = result.checked_mul(60).ok_or(())?.checked_add(segment).ok_or(())?;
+        result = result
+            .checked_mul(60)
+            .ok_or(())?
+            .checked_add(segment)
+            .ok_or(())?;
     }
     Ok(result)
 }

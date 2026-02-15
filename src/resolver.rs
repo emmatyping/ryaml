@@ -17,11 +17,12 @@ pub fn resolve_scalar_tag(value: &str, plain_implicit: bool) -> &'static str {
 
     match value {
         "" | "~" | "null" | "Null" | "NULL" => "tag:yaml.org,2002:null",
-        "yes" | "Yes" | "YES" | "no" | "No" | "NO" | "true" | "True" | "TRUE"
-        | "false" | "False" | "FALSE" | "on" | "On" | "ON" | "off" | "Off"
-        | "OFF" => "tag:yaml.org,2002:bool",
-        ".inf" | ".Inf" | ".INF" | "+.inf" | "+.Inf" | "+.INF" | "-.inf" | "-.Inf"
-        | "-.INF" | ".nan" | ".NaN" | ".NAN" => "tag:yaml.org,2002:float",
+        "yes" | "Yes" | "YES" | "no" | "No" | "NO" | "true" | "True" | "TRUE" | "false"
+        | "False" | "FALSE" | "on" | "On" | "ON" | "off" | "Off" | "OFF" => {
+            "tag:yaml.org,2002:bool"
+        }
+        ".inf" | ".Inf" | ".INF" | "+.inf" | "+.Inf" | "+.INF" | "-.inf" | "-.Inf" | "-.INF"
+        | ".nan" | ".NaN" | ".NAN" => "tag:yaml.org,2002:float",
         "<<" => "tag:yaml.org,2002:merge",
         "=" => "tag:yaml.org,2002:value",
         _ => {
@@ -314,8 +315,5 @@ fn is_timestamp(value: &str) -> bool {
     }
 
     // Optional offset minutes: :[0-9][0-9]
-    b[i] == b':'
-        && i + 3 == b.len()
-        && b[i + 1].is_ascii_digit()
-        && b[i + 2].is_ascii_digit()
+    b[i] == b':' && i + 3 == b.len() && b[i + 1].is_ascii_digit() && b[i + 2].is_ascii_digit()
 }
