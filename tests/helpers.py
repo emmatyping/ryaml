@@ -16,6 +16,8 @@ YAML_FILES = list(YAML_TEST_SUITE.glob("*.yaml"))
 ALL_YAMLS = 351
 
 KNOWN_BAD = [
+    "2XXW",  # JSON can't represent Python set (!!set)
+    "S4JQ",  # JSON expected value disagrees with pyyaml on non-specific tag `!`
     "6M2F",
     "2JQS",
     "NHX8",
