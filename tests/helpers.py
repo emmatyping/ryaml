@@ -1,133 +1,154 @@
 import math
 from pathlib import Path
 from typing import Any
+from collections.abc import Iterable
+from dataclasses import dataclass
 
-try:
-    from yaml import CSafeLoader as SafeLoader
-except ImportError:
-    from yaml import SafeLoader
-
-import yaml
-
-# https://github.com/yaml/yaml-test-suite
+# https://github.com/yaml/yaml-test-suite/releases/tag/data-2022-01-17
 YAML_TEST_SUITE = Path(__file__).resolve().parent / "yaml-test-suite"
-YAML_FILES = list(YAML_TEST_SUITE.glob("*.yaml"))
 
-ALL_YAMLS = 351
+ALL_YAMLS = 402
 
 KNOWN_BAD = [
-    "6M2F",
     "2JQS",
-    "NHX8",
-    "CFD4",
-    "NKF9",
-    "M2N8",
-    "SM9W",
-    "FRK4",
-    "S3PD",
-    "UKK6",
-    "W5VH",
-    "Y2GN",
-    "8XYN",
-    "2SXE",
-    "7Z25",
-    "K3WX",
-    "5MUD",
-    "VJP3",
-    "4MUZ",
-    "4MUZ",
-    "4MUZ",
-    "9SA2",
-    "NJ66",
-    "5T43",
-    "58MP",
-    "HM87",
-    "DBG4",
-    "QT73",
-    "HWV9",
-    "M7A3",
-    "A2M4",
-    "6BCT",
-    "Q5MG",
-    "6CA3",
-    "Y79Y",
-    "DK95",
-    "DK95",
-    "DK95",
-    "652Z",
-    "HM87",
-    "UT92",
-    "W4TN",
-    "L24T",
-    "JEF9",
-    "FP8R",
-    "DK3J",
-    "MUS6",
-    "MUS6",
-    "6LVF",
     "2LFX",
-    "BEC7",
-    "96NN",
-    "96NN",
-    "R4YG",
-    "Y79Y",
+    "2SXE",
     "4ABK",
-    "MUS6",
-    "UV7Q",
-    "NB6Z",
-    "HS5T",
-    "J3BT",
+    "4MUZ/00",
+    "4MUZ/01",
+    "4MUZ/02",
+    "58MP",
+    "5MUD",
+    "5T43",
+    "652Z",
+    "6BCT",
+    "6CA3",
     "6HB6",
-    "K54U",
-    "Y79Y",
-    "DK95",
-    "DK95",
-    "DC7X",
-    "JR7V",
-    "WZ62",
-    "S98Z",
-    "SU5Z",
-    "CVW2",
-    "9JBA",
-    "YJV2",
-    "G5U8",
-    "MUS6",
-    "EB22",
-    "9HCY",
-    "RHX7",
-    "DK95",
+    "6LVF",
+    "6M2F",
+    "7Z25",
+    "8G76",
+    "8XYN",
+    "96NN/00",
+    "96NN/01",
+    "98YD",
     "9C9N",
+    "9HCY",
+    "9JBA",
+    "9SA2",
+    "A2M4",
+    "BEC7",
+    "CFD4",
+    "CVW2",
+    "DBG4",
+    "DC7X",
+    "DK3J",
+    "DK95",
+    "DK95/00",
+    "DK95/01",
+    "DK95/03",
+    "DK95/04",
+    "EB22",
+    "FP8R",
+    "FRK4",
+    "G5U8",
+    "HM87/00",
+    "HM87/01",
+    "HS5T",
+    "HWV9",
+    "J3BT",
+    "JEF9/02",
+    "JR7V",
+    "K3WX",
+    "K54U",
+    "L24T/01",
+    "M2N8",
+    "M7A3",
+    "MUS6/05",
+    "MUS6/06",
+    "NB6Z",
+    "NHX8",
+    "NJ66",
+    "NKF9",
+    "Q5MG",
     "QB6E",
-    "X4QW",
-    "MUS6",
-    "Y79Y",
+    "QT73",
+    "R4YG",
+    "RHX7",
+    "S3PD",
+    "S4JQ",
+    "S98Z",
+    "SM9W",
+    "SU5Z",
     "U99R",
+    "UKK6",
+    "UT92",
+    "UV7Q",
+    "VJP3/01",
+    "W4TN",
+    "W5VH",
+    "WZ62",
+    "X4QW",
+    "Y2GN",
+    "Y79Y/001",
+    "Y79Y/010",
+    "YJV2"
 ]
 
 TIME_PARSE_TEST = ["U9NS"]
 
-def _get_yamls():
+
+@dataclass(slots=True, frozen=True)
+class YamlTestSuite:
+    id: str
+    dir: Path
+    in_yaml: Path
+    out_yaml: Path | None
+    in_json: Path | None
+    is_error: bool
+
+
+def iter_yaml_test_suite(root: Path) -> Iterable[YamlTestSuite]:
+    root = root.resolve()
+
+    for in_yaml in root.rglob("in.yaml"):
+        dir_ = in_yaml.parent
+
+        in_json = dir_ / "in.json"
+        out_yaml = dir_ / "out.yaml"
+        err = (dir_ / "error").exists()
+
+        rel = dir_.relative_to(root).as_posix()
+
+        yield YamlTestSuite(
+            id=rel,
+            dir=dir_,
+            in_yaml=in_yaml,
+            out_yaml=out_yaml if out_yaml.exists() else None,
+            in_json=in_json if in_json.exists() else None,
+            is_error=err,
+        )
+
+
+def split_cases(cases: Iterable[YamlTestSuite]) -> tuple:
     valid = []
     invalid = []
     skipped = []
 
-    for yaml_file in YAML_FILES:
-        docs = yaml.load(yaml_file.read_text(encoding="utf-8"), Loader=SafeLoader)
-        docs = [docs] if isinstance(docs, dict) else docs
-
-        has_fail = any(doc.get("fail", False) for doc in docs)
-        has_skip = any(doc.get("skip", False) for doc in docs)
-
-        if has_skip or yaml_file.name[:-5] in KNOWN_BAD + TIME_PARSE_TEST:
-            skipped.append(yaml_file)
-        elif has_fail:
-            invalid.append(yaml_file)
+    for ts in cases:
+        if ts.in_json is None or (ts.id in KNOWN_BAD + TIME_PARSE_TEST):
+            skipped.append(ts)
+        elif ts.is_error:
+            invalid.append(ts)
         else:
-            valid.append(yaml_file)
+            valid.append(ts)
 
     return valid, invalid, skipped
 
-VALID_YAMLS, INVALID_YAMLS, SKIPPED_YAMLS = _get_yamls()
+
+YAML_FILES = list(iter_yaml_test_suite(YAML_TEST_SUITE))
+VALID_YAMLS, INVALID_YAMLS, SKIPPED_YAMLS = split_cases(YAML_FILES)
+
 assert (
     len(YAML_FILES)
     == len(VALID_YAMLS) + len(INVALID_YAMLS) + len(SKIPPED_YAMLS)
@@ -135,14 +156,11 @@ assert (
 )
 
 
-def normalize_yaml(doc: dict) -> Any:
-    return (
-        doc.get("yaml", "")
-        .replace("␣", " ")
-        .replace("»", "\t")
-        .replace("—", "")  # Tab line continuation ——»
-        .replace("←", "\r")
-        .replace("⇔", "\ufeff")  # BOM character
-        .replace("↵", "")  # Trailing newline marker
-        .replace("∎\n", "")
-    )
+def _is_nan(obj: Any) -> Any | dict[Any, Any] | list[Any]:
+    if isinstance(obj, dict):
+        return {k: _is_nan(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_is_nan(v) for v in obj]
+    if isinstance(obj, float) and math.isnan(obj):
+        return "ryaml_tests_nan"
+    return obj

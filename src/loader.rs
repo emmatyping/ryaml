@@ -4,7 +4,7 @@
 use libyaml_safer::{Event, EventData, Parser};
 use pyo3::exceptions::PyNotImplementedError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
+use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySet, PyString};
 use rustc_hash::FxBuildHasher;
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -208,8 +208,13 @@ impl RSafeLoader {
         plain_implicit: bool,
     ) -> PyResult<Py<PyAny>> {
         // Resolve tag inline — &'static str, no allocation for common case
+        // "!" is the non-specific tag — resolve as if untagged
         let resolved_tag: &str = if let Some(ref t) = tag {
-            t.as_str()
+            if t == "!" {
+                resolver::resolve_scalar_tag(&value, plain_implicit)
+            } else {
+                t.as_str()
+            }
         } else {
             resolver::resolve_scalar_tag(&value, plain_implicit)
         };
@@ -272,7 +277,9 @@ impl RSafeLoader {
         anchor: Option<String>,
         tag: Option<String>,
     ) -> PyResult<Py<PyAny>> {
-        let is_set = tag.as_deref() == Some(crate::TAG_SET);
+        if tag.as_deref() == Some(crate::TAG_SET) {
+            return self.construct_set_direct(py, anchor);
+        }
 
         let dict = PyDict::new(py);
         let dict_obj: Py<PyAny> = dict.clone().unbind().into_any();
@@ -305,12 +312,6 @@ impl RSafeLoader {
             self._parse_next_event(py)?;
             let value = self.construct_from_events(py)?;
 
-            if is_set {
-                let hashable_key = self.make_hashable(py, key)?;
-                dict.set_item(hashable_key, py.None())?;
-                continue;
-            }
-
             if is_merge {
                 // Collect merge source(s)
                 if let Ok(value_list) = value.downcast_bound::<PyList>(py) {
@@ -342,6 +343,41 @@ impl RSafeLoader {
 
         self.parsed_event = None;
         Ok(dict_obj)
+    }
+
+    /// Construct a Python set from a !!set mapping
+    fn construct_set_direct(&mut self, py: Python, anchor: Option<String>) -> PyResult<Py<PyAny>> {
+        let pyset = PySet::empty(py)?;
+        let set_obj: Py<PyAny> = pyset.clone().unbind().into_any();
+
+        if let Some(anchor_name) = anchor {
+            self.anchors.insert(anchor_name, set_obj.clone_ref(py));
+        }
+
+        loop {
+            self._parse_next_event(py)?;
+            if matches!(
+                &self.parsed_event,
+                Some(Event {
+                    data: EventData::MappingEnd,
+                    ..
+                })
+            ) {
+                break;
+            }
+
+            let key = self.construct_from_events(py)?;
+
+            // Consume the value (always null in a set)
+            self._parse_next_event(py)?;
+            let _value = self.construct_from_events(py)?;
+
+            let hashable_key = self.make_hashable(py, key)?;
+            pyset.add(hashable_key)?;
+        }
+
+        self.parsed_event = None;
+        Ok(set_obj)
     }
 
     /// Convert unhashable types (dict, list) to tuples for use as dict keys
@@ -451,11 +487,23 @@ fn construct_int_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
             exception::constructor_error(py, format!("invalid sexagesimal integer: {}", value))
         })?
     } else {
-        parse_int_skip_underscores(remaining, 10)
-            .map_err(|_| exception::constructor_error(py, format!("invalid integer: {}", value)))?
+        match parse_int_skip_underscores(remaining, 10) {
+            Ok(v) => v,
+            Err(()) => {
+                // Overflow or parse failure — fall back to Python int() for big integers
+                return construct_bigint_via_python(py, value);
+            }
+        }
     };
 
     Ok(PyInt::new(py, sign * result).into_any().unbind())
+}
+
+/// Construct a Python big integer by calling Python's int() builtin
+fn construct_bigint_via_python(py: Python, value: &str) -> PyResult<Py<PyAny>> {
+    let builtins = py.import("builtins")?;
+    let result = builtins.call_method1("int", (value,))?;
+    Ok(result.unbind())
 }
 
 /// Construct a Python float from a scalar value
