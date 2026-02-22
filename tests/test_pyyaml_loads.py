@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 import ryaml
 
@@ -16,7 +15,7 @@ import yaml
 
 from ryaml.compat import RSafeLoader
 
-from helpers import VALID_YAMLS, INVALID_YAMLS, normalize_yaml
+from helpers import VALID_YAMLS, INVALID_YAMLS, YamlTestSuite, _is_nan
 
 def test_loads_empty():
     assert yaml.load('', Loader=RSafeLoader) is None
@@ -42,54 +41,72 @@ def test_loads_key_sequence():
 
     ''', Loader=RSafeLoader) == { 'key': [4, 5] }
 
-@pytest.mark.parametrize("input", VALID_YAMLS, ids=lambda val: f"{val.name[:-5]}")
-def test_valid_yamls_from_test_suite_pyyaml(input: Path) -> None:
-    load_from_str = yaml.load(input.read_text(encoding="utf-8"), Loader=SafeLoader)
 
-    docs = [load_from_str] if isinstance(load_from_str, dict) else load_from_str
+@pytest.mark.parametrize("ts", VALID_YAMLS, ids=lambda ts: ts.id)
+def test_valid_yamls_from_test_suite(ts: YamlTestSuite) -> None:
+    actual = list(yaml.load_all(
+        ts.in_yaml.read_text("utf-8"), Loader=RSafeLoader
+    ))
+    if actual == []:
+        actual = None
+    if isinstance(actual, list) and len(actual) == 1:
+        actual = actual[0]
 
-    for doc in docs:
-        parsed_yaml = list(yaml.load_all(normalize_yaml(doc), Loader=RSafeLoader))
-        if len(parsed_yaml) == 1:
-            parsed_yaml = parsed_yaml[0]
 
 
-        get_json_key = doc.get("json")
+    text = ts.in_json.read_text("utf-8")
 
-        if get_json_key is None:
-            assert parsed_yaml is not None
-            continue
-
-        if get_json_key == "":  # noqa: PLC1901
-            get_json_key = None
-            continue
-
+    if text == "":  # noqa: PLC1901
+        expected = None
+    else:
         try:
-            parsed_json = json.loads(get_json_key)
-        except json.decoder.JSONDecodeError:
-            json_decoder = json.JSONDecoder()
-            parsed_json = []
+            expected = json.loads(text)
+        except json.JSONDecodeError:
+            decoder = json.JSONDecoder()
+            expected = []
             pos = 0
-            while pos < len(get_json_key):
-                obj, pos = json_decoder.raw_decode(get_json_key, pos)
-                parsed_json.append(obj)
-                while pos < len(get_json_key) and get_json_key[pos] in " \t\n\r":
+            n = len(text)
+
+            while pos < n:
+                obj, pos = decoder.raw_decode(text, pos)
+                expected.append(obj)
+                while pos < n and text[pos] in " \t\r\n":
                     pos += 1
 
-            if len(parsed_json) == 1:
-                parsed_json = parsed_json[0]
+    if isinstance(expected, list) and not isinstance(actual, list):
+        actual = [actual]
 
-        assert parsed_yaml == parsed_json
+    # JSON does not have a native "set" type, while Python does.
+    # In YAML, the tag `!!set` represents a set, and Python YAML parsers
+    # (including ours) map it to a Python `set`.
+    # ```python
+    # import yaml as py_yaml
+    #
+    # y = """\
+    # --- !!set
+    # ? Mark McGwire
+    # ? Sammy Sosa
+    # ? Ken Griffey
+    # """
+    # print(py_yaml.safe_load(y))  # {'Mark McGwire', 'Ken Griffey', 'Sammy Sosa'}
+    # print(type(py_yaml.safe_load(y)))  # <class 'set'>
+    # ```
+    if (
+            isinstance(actual, set)
+            and isinstance(expected, dict)
+            and all(v is None for v in expected.values())
+    ):
+        actual = dict.fromkeys(actual)
+
+    assert _is_nan(actual) == _is_nan(expected), (
+        f"\nTest case: {ts.id}\n"
+        f"\nYAML file: {ts.in_yaml}\n"
+        f"\nActual:\n{actual!r}\n"
+        f"\nExpected:\n{expected!r}\n"
+    )
 
 
-@pytest.mark.parametrize("input", INVALID_YAMLS, ids=lambda val: f"{val.name[:-5]}")
-def test_invalid_yamls_from_test_suite_pyyaml(input: Path) -> None:
-    docs = list(yaml.load_all(input.read_text(encoding="utf-8"), Loader=RSafeLoader))
-    if len(docs) == 1:
-        docs = docs[0]
-    if isinstance(docs, dict):
-        docs = [docs]
-    doc = next((d for d in docs if d.get("fail") is True), None)
-    assert doc is not None, "No document!"
+@pytest.mark.parametrize("ts", INVALID_YAMLS, ids=lambda ts: ts.id)
+def test_invalid_yamls_from_test_suite(ts: YamlTestSuite) -> None:
     with pytest.raises(ryaml.InvalidYamlError):
-        list(yaml.load_all(normalize_yaml(doc), Loader=RSafeLoader))
+        ryaml.loads_all(ts.in_yaml.read_text("utf-8"))
