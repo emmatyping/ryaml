@@ -9,10 +9,27 @@ from .error import (
     RepresenterError,
     ReaderError,
 )
-from .compat import RSafeDumper
+from .compat import RSafeDumper, RSafeLoader
 
 from typing import IO, AnyStr, Any
 import io
+
+__all__ = [
+    "InvalidYamlError",
+    "loads",
+    "loads_all",
+    "dumps",
+    "ScannerError",
+    "ParserError",
+    "ComposerError",
+    "ConstructorError",
+    "EmitterError",
+    "SerializerError",
+    "RepresenterError",
+    "ReaderError",
+    "RSafeDumper",
+    "RSafeLoader",
+]
 
 
 def _read_file(fp: IO[AnyStr]) -> str:
@@ -22,7 +39,7 @@ def _read_file(fp: IO[AnyStr]) -> str:
     elif isinstance(data, bytes):
         return data.decode("utf8")
     else:
-        return bytes(data).decode('utf8')
+        return bytes(data).decode("utf8")
 
 
 def load(fp: IO[AnyStr]) -> Any:
@@ -40,6 +57,6 @@ def load_all(fp: IO[AnyStr]) -> list[Any]:
 def dump(fp: IO[AnyStr], obj: Any) -> None:
     yaml = dumps(obj)
     if isinstance(fp, io.TextIOBase):
-        fp.write(yaml) # type: ignore
+        fp.write(yaml)  # type: ignore
     else:
-        fp.write(yaml.encode('utf8')) # type: ignore
+        fp.write(yaml.encode("utf8"))  # type: ignore
