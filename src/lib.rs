@@ -15,6 +15,8 @@ const TAG_TIMESTAMP: &str = "tag:yaml.org,2002:timestamp";
 const TAG_SEQ: &str = "tag:yaml.org,2002:seq";
 const TAG_MAP: &str = "tag:yaml.org,2002:map";
 const TAG_SET: &str = "tag:yaml.org,2002:set";
+const TAG_OMAP: &str = "tag:yaml.org,2002:omap";
+const TAG_PAIRS: &str = "tag:yaml.org,2002:pairs";
 const TAG_MERGE: &str = "tag:yaml.org,2002:merge";
 const TAG_VALUE: &str = "tag:yaml.org,2002:value";
 
