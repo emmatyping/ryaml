@@ -89,8 +89,9 @@ jobs:
         env:
           CIBW_PLATFORM: ${{ matrix.platform || 'auto' }}
           CIBW_ARCHS: ${{ matrix.archs || 'auto' }}
-          CIBW_TEST_REQUIRES: hatch
-          CIBW_TEST_COMMAND: hatch test
+          CIBW_TEST_REQUIRES: pytest pytest-benchmark pyyaml
+          # On pyodide, bare commands may not work, so use python -m pytest
+          CIBW_TEST_COMMAND: python -m pytest {project}/tests
           CIBW_ENVIRONMENT: MACOSX_DEPLOYMENT_TARGET=10.12 ${{ matrix.env }}
           CIBW_SKIP: '*-musllinux_* *-win32'
           CIBW_BUILD: ${{ matrix.build }}

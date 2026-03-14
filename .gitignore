@@ -5,4 +5,3 @@
 .vscode/
 **/*.so
 .benchmarks/
-.hypothesis/
