@@ -89,7 +89,8 @@ jobs:
         env:
           CIBW_PLATFORM: ${{ matrix.platform || 'auto' }}
           CIBW_ARCHS: ${{ matrix.archs || 'auto' }}
-          CIBW_TEST_REQUIRES: pytest pytest-benchmark pyyaml
+          # Use the test dependency group for test requirements
+          CIBW_TEST_GROUPS: test
           # On pyodide, bare commands may not work, so use python -m pytest
           CIBW_TEST_COMMAND: python -m pytest {project}/tests
           CIBW_ENVIRONMENT: MACOSX_DEPLOYMENT_TARGET=10.12 ${{ matrix.env }}
