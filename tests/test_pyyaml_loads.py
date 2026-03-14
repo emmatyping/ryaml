@@ -4,7 +4,6 @@ import ryaml
 
 import pytest
 
-import ryaml
 try:
     from yaml import CSafeLoader as SafeLoader, CSafeDumper as SafeDumper
 except ImportError:

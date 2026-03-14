@@ -145,6 +145,18 @@ impl RSafeLoader {
         Ok(())
     }
 
+    /// Register an anchor, rejecting duplicates (pyyaml ComposerError behavior).
+    fn register_anchor(&mut self, py: Python, name: String, value: Py<PyAny>) -> PyResult<()> {
+        if self.anchors.contains_key(&name) {
+            return Err(exception::composer_error(
+                py,
+                format!("found duplicate anchor '{}'", name),
+            ));
+        }
+        self.anchors.insert(name, value);
+        Ok(())
+    }
+
     /// Construct a document directly from events
     fn construct_document(&mut self, py: Python) -> PyResult<Option<Py<PyAny>>> {
         // Eat document start event
@@ -224,12 +236,22 @@ impl RSafeLoader {
             crate::TAG_BOOL => construct_bool_direct(py, &value)?,
             crate::TAG_INT => construct_int_direct(py, &value)?,
             crate::TAG_FLOAT => construct_float_direct(py, &value)?,
-            // str, timestamp, value, merge, and unknown tags all produce strings
-            _ => PyString::new(py, &value).into_any().unbind(),
+            crate::TAG_STR | crate::TAG_TIMESTAMP | crate::TAG_BINARY => {
+                PyString::new(py, &value).into_any().unbind()
+            }
+            _ => {
+                return Err(exception::constructor_error(
+                    py,
+                    format!(
+                        "could not determine a constructor for the tag '{}'",
+                        resolved_tag
+                    ),
+                ));
+            }
         };
 
         if let Some(anchor_name) = anchor {
-            self.anchors.insert(anchor_name, result.clone_ref(py));
+            self.register_anchor(py, anchor_name, result.clone_ref(py))?;
         }
 
         Ok(result)
@@ -240,14 +262,26 @@ impl RSafeLoader {
         &mut self,
         py: Python,
         anchor: Option<String>,
-        _tag: Option<String>,
+        tag: Option<String>,
     ) -> PyResult<Py<PyAny>> {
+        // Reject unknown tags (pyyaml SafeConstructor behavior)
+        if let Some(ref t) = tag
+            && !matches!(
+                t.as_str(),
+                "!" | crate::TAG_SEQ | crate::TAG_OMAP | crate::TAG_PAIRS
+            )
+        {
+            return Err(exception::constructor_error(
+                py,
+                format!("could not determine a constructor for the tag '{}'", t),
+            ));
+        }
         let list = PyList::empty(py);
         let list_obj: Py<PyAny> = list.clone().unbind().into_any();
 
         // Store in anchors BEFORE recursing (handles circular references)
         if let Some(anchor_name) = anchor {
-            self.anchors.insert(anchor_name, list_obj.clone_ref(py));
+            self.register_anchor(py, anchor_name, list_obj.clone_ref(py))?;
         }
 
         // Consume child events until SequenceEnd
@@ -280,13 +314,23 @@ impl RSafeLoader {
         if tag.as_deref() == Some(crate::TAG_SET) {
             return self.construct_set_direct(py, anchor);
         }
+        // Reject unknown tags (pyyaml SafeConstructor behavior)
+        if let Some(ref t) = tag
+            && t != "!"
+            && t != crate::TAG_MAP
+        {
+            return Err(exception::constructor_error(
+                py,
+                format!("could not determine a constructor for the tag '{}'", t),
+            ));
+        }
 
         let dict = PyDict::new(py);
         let dict_obj: Py<PyAny> = dict.clone().unbind().into_any();
 
         // Store in anchors BEFORE recursing (handles circular references)
         if let Some(anchor_name) = anchor {
-            self.anchors.insert(anchor_name, dict_obj.clone_ref(py));
+            self.register_anchor(py, anchor_name, dict_obj.clone_ref(py))?;
         }
 
         let mut merge_sources: Vec<Py<PyAny>> = Vec::new();
@@ -306,26 +350,70 @@ impl RSafeLoader {
             // Check if the key is a merge key BEFORE constructing it
             let is_merge = is_merge_key(&self.parsed_event);
 
+            if is_merge {
+                // Consume the merge key event without constructing
+                self.parsed_event = None;
+
+                // Parse the value
+                self._parse_next_event(py)?;
+                let value = self.construct_from_events(py)?;
+
+                // Collect merge source(s) — must be a mapping or list of mappings
+                if value.downcast_bound::<PyDict>(py).is_ok() {
+                    merge_sources.push(value);
+                } else if let Ok(value_list) = value.downcast_bound::<PyList>(py) {
+                    for item in value_list.iter() {
+                        if !item.is_instance_of::<PyDict>() {
+                            return Err(exception::constructor_error(
+                                py,
+                                "expected a mapping for merging, but found non-mapping".to_string(),
+                            ));
+                        }
+                        merge_sources.push(item.unbind());
+                    }
+                } else {
+                    return Err(exception::constructor_error(
+                        py,
+                        "expected a mapping or list of mappings for merging, but found non-mapping"
+                            .to_string(),
+                    ));
+                }
+                continue;
+            }
+
+            // Rewrite value tag to str (pyyaml's flatten_mapping behavior)
+            if let Some(Event {
+                data:
+                    EventData::Scalar {
+                        ref mut tag,
+                        ref value,
+                        plain_implicit,
+                        ..
+                    },
+                ..
+            }) = self.parsed_event
+                && (tag.as_deref() == Some(crate::TAG_VALUE)
+                    || (matches!(tag.as_deref(), None | Some("!"))
+                        && plain_implicit
+                        && value == "="))
+            {
+                *tag = Some(crate::TAG_STR.to_string());
+            }
+
             let key = self.construct_from_events(py)?;
 
             // Parse the value
             self._parse_next_event(py)?;
             let value = self.construct_from_events(py)?;
 
-            if is_merge {
-                // Collect merge source(s)
-                if let Ok(value_list) = value.downcast_bound::<PyList>(py) {
-                    for item in value_list.iter() {
-                        merge_sources.push(item.unbind());
-                    }
-                } else {
-                    merge_sources.push(value);
-                }
-                continue;
+            // Reject unhashable keys (dicts, lists) like pyyaml
+            if key.bind(py).hash().is_err() {
+                return Err(exception::constructor_error(
+                    py,
+                    "found unhashable key".to_string(),
+                ));
             }
-
-            let hashable_key = self.make_hashable(py, key)?;
-            dict.set_item(hashable_key, value)?;
+            dict.set_item(&key, value)?;
         }
 
         // Apply merge sources: explicit keys take precedence, then first merge source wins
@@ -351,7 +439,7 @@ impl RSafeLoader {
         let set_obj: Py<PyAny> = pyset.clone().unbind().into_any();
 
         if let Some(anchor_name) = anchor {
-            self.anchors.insert(anchor_name, set_obj.clone_ref(py));
+            self.register_anchor(py, anchor_name, set_obj.clone_ref(py))?;
         }
 
         loop {
@@ -372,39 +460,17 @@ impl RSafeLoader {
             self._parse_next_event(py)?;
             let _value = self.construct_from_events(py)?;
 
-            let hashable_key = self.make_hashable(py, key)?;
-            pyset.add(hashable_key)?;
+            if key.bind(py).hash().is_err() {
+                return Err(exception::constructor_error(
+                    py,
+                    "found unhashable key".to_string(),
+                ));
+            }
+            pyset.add(&key)?;
         }
 
         self.parsed_event = None;
         Ok(set_obj)
-    }
-
-    /// Convert unhashable types (dict, list) to tuples for use as dict keys
-    fn make_hashable(&self, py: Python, obj: Py<PyAny>) -> PyResult<Py<PyAny>> {
-        if let Ok(dict) = obj.downcast_bound::<PyDict>(py) {
-            let mut items = Vec::new();
-            for (key, value) in dict.iter() {
-                let hashable_key = self.make_hashable(py, key.unbind())?;
-                let hashable_value = self.make_hashable(py, value.unbind())?;
-                let pair = pyo3::types::PyTuple::new(py, &[hashable_key, hashable_value])?;
-                items.push(pair);
-            }
-            let tuple = pyo3::types::PyTuple::new(py, &items)?;
-            return Ok(tuple.unbind().into_any());
-        }
-
-        if let Ok(list) = obj.downcast_bound::<PyList>(py) {
-            let mut items = Vec::new();
-            for item in list.iter() {
-                let hashable_item = self.make_hashable(py, item.unbind())?;
-                items.push(hashable_item);
-            }
-            let tuple = pyo3::types::PyTuple::new(py, &items)?;
-            return Ok(tuple.unbind().into_any());
-        }
-
-        Ok(obj)
     }
 }
 
@@ -422,7 +488,8 @@ fn is_merge_key(event: &Option<Event>) -> bool {
     }) = event
     {
         if let Some(t) = tag {
-            return t == crate::TAG_MERGE;
+            // Explicit merge tag, or non-specific "!" on plain "<<"
+            return t == crate::TAG_MERGE || (t == "!" && *plain_implicit && value == "<<");
         }
         return *plain_implicit && value == "<<";
     }
@@ -447,7 +514,15 @@ fn construct_bool_direct(py: Python, value: &str) -> PyResult<Py<PyAny>> {
 /// Construct a Python int from a scalar value
 fn construct_int_direct(py: Python, value: &str) -> PyResult<Py<PyAny>> {
     // Fast path: standard decimal parse (covers 90%+ of real-world ints)
-    if let Ok(v) = value.parse::<i64>() {
+    // Skip for values with leading zero after optional sign — those are octal/hex/binary
+    // in YAML 1.1 and must go through the fallback path.
+    let digits = value
+        .strip_prefix('+')
+        .or_else(|| value.strip_prefix('-'))
+        .unwrap_or(value);
+    if !(digits.starts_with('0') && digits.len() > 1)
+        && let Ok(v) = value.parse::<i64>()
+    {
         return Ok(PyInt::new(py, v).into_any().unbind());
     }
     construct_int_fallback(py, value)
@@ -471,21 +546,25 @@ fn construct_int_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
     let result = if remaining == "0" {
         0i64
     } else if let Some(bin) = remaining.strip_prefix("0b") {
-        parse_int_skip_underscores(bin, 2).map_err(|_| {
-            exception::constructor_error(py, format!("invalid binary integer: {}", value))
-        })?
+        match parse_int_skip_underscores(bin, 2) {
+            Ok(v) => v,
+            Err(()) => return construct_bigint_with_base(py, sign, bin, 2),
+        }
     } else if let Some(hex) = remaining.strip_prefix("0x") {
-        parse_int_skip_underscores(hex, 16).map_err(|_| {
-            exception::constructor_error(py, format!("invalid hex integer: {}", value))
-        })?
+        match parse_int_skip_underscores(hex, 16) {
+            Ok(v) => v,
+            Err(()) => return construct_bigint_with_base(py, sign, hex, 16),
+        }
     } else if remaining.starts_with('0') && !remaining.contains(':') && remaining.len() > 1 {
-        parse_int_skip_underscores(remaining, 8).map_err(|_| {
-            exception::constructor_error(py, format!("invalid octal integer: {}", value))
-        })?
+        match parse_int_skip_underscores(remaining, 8) {
+            Ok(v) => v,
+            Err(()) => return construct_bigint_with_base(py, sign, remaining, 8),
+        }
     } else if remaining.contains(':') {
-        parse_sexagesimal_int(remaining).map_err(|_| {
-            exception::constructor_error(py, format!("invalid sexagesimal integer: {}", value))
-        })?
+        match parse_sexagesimal_int(remaining) {
+            Ok(v) => v,
+            Err(()) => return construct_sexagesimal_bigint(py, sign, remaining),
+        }
     } else {
         match parse_int_skip_underscores(remaining, 10) {
             Ok(v) => v,
@@ -501,8 +580,48 @@ fn construct_int_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
 
 /// Construct a Python big integer by calling Python's int() builtin
 fn construct_bigint_via_python(py: Python, value: &str) -> PyResult<Py<PyAny>> {
+    // YAML 1.1 allows underscores anywhere (e.g. "1__000"), but Python's int()
+    // rejects consecutive underscores, so strip them before passing to Python.
+    let cleaned: String = value.chars().filter(|&c| c != '_').collect();
     let builtins = py.import("builtins")?;
-    let result = builtins.call_method1("int", (value,))?;
+    let result = builtins.call_method1("int", (&cleaned,))?;
+    Ok(result.unbind())
+}
+
+/// Construct a Python big integer from digits in a given base (for octal/hex/binary overflow).
+fn construct_bigint_with_base(
+    py: Python,
+    sign: i64,
+    digits: &str,
+    base: u32,
+) -> PyResult<Py<PyAny>> {
+    let cleaned: String = digits.chars().filter(|&c| c != '_').collect();
+    let builtins = py.import("builtins")?;
+    let py_int = builtins.call_method1("int", (&cleaned, base))?;
+    if sign < 0 {
+        let neg = py_int.call_method1("__mul__", (-1i64,))?;
+        Ok(neg.unbind())
+    } else {
+        Ok(py_int.unbind())
+    }
+}
+
+/// Construct a Python big integer from sexagesimal notation (e.g. "1:30" = 90)
+/// using Python's arbitrary-precision arithmetic when i64 overflows.
+fn construct_sexagesimal_bigint(py: Python, sign: i64, s: &str) -> PyResult<Py<PyAny>> {
+    let builtins = py.import("builtins")?;
+    let sixty = PyInt::new(py, 60i64);
+    let mut result = PyInt::new(py, 0i64).into_any();
+    for part in s.split(':') {
+        let cleaned: String = part.chars().filter(|&c| c != '_').collect();
+        let segment = builtins.call_method1("int", (&cleaned,))?;
+        result = result
+            .call_method1("__mul__", (&sixty,))?
+            .call_method1("__add__", (&segment,))?;
+    }
+    if sign < 0 {
+        result = result.call_method1("__mul__", (-1i64,))?;
+    }
     Ok(result.unbind())
 }
 

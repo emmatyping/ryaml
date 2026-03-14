@@ -44,3 +44,31 @@ include = [
 ]
 
 [tool.cibuildwheel]
+
+[dependency-groups]
+test = [
+    "hypothesis>=6.0",
+    "pytest>=9.0",
+    "pyyaml>=6.0",
+]
+
+[tool.hatch.envs.default]
+dependency-groups = ["test"]
+
+[tool.hatch.envs.hatch-test]
+dependency-groups = ["test"]
+
+[tool.hatch.envs.fuzz]
+extra-dependencies = [
+    "atheris"
+]
+python = "3.13"
+platforms = ["linux"]
+# Since we need the rustc wrapper, install with sanitizer and fuzzer support
+# ourselves
+post-install-commands = [
+    "RUSTC_WRAPPER=./fuzz/sancov-rustc-wrapper.sh maturin develop --release",
+]
+
+[tool.hatch.envs.fuzz.scripts]
+run = 'ASAN_OPTIONS="detect_leaks=0:allocator_may_return_null=1:handle_segv=0" LD_PRELOAD="$(python -c "import atheris; print(atheris.path())")/asan_with_fuzzer.so" python ./fuzz/run.py {args:fuzz/corpus fuzz/seed -fork=4 -max_len=1024}'
