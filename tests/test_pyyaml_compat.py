@@ -3,16 +3,17 @@
 import math
 import textwrap
 import ryaml
+import sys
 from ryaml import RSafeLoader
 import yaml
+import pytest
 from hypothesis import given, settings, HealthCheck
 from hypothesis import strategies as st
 
 try:
     from yaml import CSafeLoader as SafeLoader
 except ImportError:
-    from yaml import SafeLoader
-
+    SafeLoader = None
 
 def test_nonspecific_tag():
     assert ryaml.loads("x: ! 4444") == {"x": 4444}
@@ -97,14 +98,14 @@ def compare(text):
             f"  input:  {text!r}"
         )
 
-# --- Tests ---
 
+@pytest.mark.skipif(sys.platform == "win32", reason="libyaml inconsistent on Windows")
 @given(st.text())
 @settings(max_examples=5000, suppress_health_check=[HealthCheck.too_slow])
 def test_any_text(text):
     compare(text)
 
-
+@pytest.mark.skipif(sys.platform == "win32", reason="libyaml inconsistent on Windows")
 @given(st.binary())
 @settings(max_examples=5000)
 def test_any_bytes(data):
@@ -126,6 +127,7 @@ yaml_scalars = st.one_of(
     st.just(".nan"),
 )
 
+@pytest.mark.skipif(sys.platform == "win32", reason="libyaml inconsistent on Windows")
 @given(st.recursive(
     yaml_scalars,
     lambda children: st.one_of(
