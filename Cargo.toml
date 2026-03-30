@@ -14,7 +14,7 @@ abi3 = ["pyo3/abi3-py310"]
 [dependencies]
 libyaml-safer = { path = "./libyaml-safer"}
 base64 = "0.22"
-rustc-hash = "2.1.1"
+rustc-hash = "2.1.2"
 
 [dependencies.pyo3]
 version = "0.26.0"
