@@ -47,7 +47,7 @@ include = [
 
 [dependency-groups]
 test = [
-    "hypothesis>=6.0",
+    "hypothesis>=6.151.13",
     "pytest>=9.0",
     "pyyaml>=6.0",
 ]
