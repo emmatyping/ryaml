@@ -1,0 +1,219 @@
+"""PyYAML compatibility regressions, including the original 15 examples."""
+
+import datetime as dt
+
+import pytest
+import yaml
+
+import ryaml
+
+
+@pytest.fixture
+def reference():
+    loader = getattr(yaml, "CSafeLoader", None)
+    if loader is None:
+        pytest.skip("PyYAML was built without LibYAML")
+    return lambda source: yaml.load(source, Loader=loader)
+
+
+@pytest.fixture(params=["loads", "RSafeLoader", "loads_all"])
+def load(request):
+    if request.param == "loads":
+        return ryaml.loads
+    if request.param == "loads_all":
+        return lambda source: ryaml.loads_all(source)[0]
+    return lambda source: yaml.load(source, Loader=ryaml.RSafeLoader)
+
+
+def assert_same(actual, expected):
+    """Check types and mapping order as well as values (acyclic examples)."""
+    assert type(actual) is type(expected)
+    if isinstance(expected, dict):
+        assert list(actual) == list(expected)
+        for (ak, av), (ek, ev) in zip(actual.items(), expected.items()):
+            assert_same(ak, ek)
+            assert_same(av, ev)
+    elif isinstance(expected, (list, tuple)):
+        assert len(actual) == len(expected)
+        for a, e in zip(actual, expected):
+            assert_same(a, e)
+    else:
+        assert actual == expected
+
+
+@pytest.mark.parametrize(("source", "expected"), [
+    pytest.param("2026-11-04", dt.date(2026, 11, 4), id="date"),
+    pytest.param("2026-11-04T12:34:56Z",
+                 dt.datetime(2026, 11, 4, 12, 34, 56, tzinfo=dt.timezone.utc),
+                 id="datetime"),
+    pytest.param("!!binary SGVsbG8=", b"Hello", id="binary"),
+    pytest.param("!!omap [{a: 1}, {b: 2}]", [("a", 1), ("b", 2)], id="omap"),
+    pytest.param("!!pairs [{a: 1}, {a: 2}]", [("a", 1), ("a", 2)], id="pairs"),
+    pytest.param("!!bool TrUe", True, id="explicit-mixed-case-bool"),
+    pytest.param("<<: {x: 1}\n<<: {x: 2}\n", {"x": 2}, id="repeated-merges"),
+    pytest.param("<<: {a: 1, b: 2}\nc: 3\n", {"a": 1, "b": 2, "c": 3},
+                 id="merge-key-order"),
+    pytest.param("!!set {<<: {a: null}}", {"a"}, id="set-merge"),
+    pytest.param("!!set {=: null}", {"="}, id="set-value-key"),
+])
+def test_original_examples(load, reference, source, expected):
+    assert_same(reference(source), expected)
+    assert_same(load(source), expected)
+
+
+@pytest.mark.parametrize(("source", "error"), [
+    pytest.param("2026-99-99", ValueError, id="invalid-date"),
+    pytest.param("!!binary a", yaml.constructor.ConstructorError, id="invalid-base64"),
+    pytest.param("!!omap [1]", yaml.constructor.ConstructorError, id="invalid-omap"),
+    pytest.param("!!pairs [{a: 1, b: 2}]", yaml.constructor.ConstructorError,
+                 id="invalid-pairs"),
+    ("!!binary café", yaml.constructor.ConstructorError),
+    ("!!binary a==", yaml.constructor.ConstructorError),
+    ("!!omap [{}]", yaml.constructor.ConstructorError),
+    ("!!omap [{a: 1, a: 2}]", yaml.constructor.ConstructorError),
+    ("!!pairs [a]", yaml.constructor.ConstructorError),
+    ("entry: &entry {a: 1, a: 2}\npairs: !!pairs [*entry]",
+     yaml.constructor.ConstructorError),
+    ("!!timestamp nonsense", AttributeError),
+    ("2026-11-04T25:00:00Z", ValueError),
+    ("!!bool perhaps", KeyError),
+    ("<<: [1]", yaml.constructor.ConstructorError),
+])
+def test_constructor_validation(load, reference, source, error):
+    with pytest.raises(error):
+        reference(source)
+    with pytest.raises(error):
+        load(source)
+
+
+def test_recursive_merge(load, reference):
+    source = "a: &a {b: {<<: *a}, c: 1}"
+    for result in (reference(source), load(source)):
+        assert list(result["a"]["b"]) == ["b", "c"]
+        assert result["a"]["b"]["c"] == 1
+        assert result["a"]["b"]["b"] is result["a"]["b"]
+
+
+@pytest.mark.parametrize("source", [
+    "!!timestamp 2026-1-4",
+    "2026-1-4 1:02:03.123456789 -5:30",
+    "2026-11-04t01:02:03.1+01",
+    "2026-11-04 01:02:03",
+    "2026-11-04T01:02:03.123456789Z",
+    "2026-11-04T01:02:03.1Z",
+    "2026-11-04T01:02:03.",
+    "2026-11-4  01:02:03Z",
+    "2026-11-04T01:02:03.Z",
+    "2026-11-04T01:02:03.+01:30",
+    '!!timestamp "2026-11-04\\t1:02:03.000001\\tZ"',
+    "2026-11-04T01:02:03-00:00",
+    "2026-11-04T01:02:03+01:99",
+    '!!timestamp "2026-11-04\\n"',
+    "TrUe",  # The mixed-case change applies only with an explicit tag.
+    "!!bool oFf",
+    "!!bool YeS",
+    "!!binary |\n  SGVs\n  bG8=\n",
+    "!!binary 'SGVs!!bG8='",  # PyYAML's decoder tolerates non-base64 chars.
+    "!!binary ''",
+    "!!binary Zh==",  # Non-zero padding bits require the permissive decoder.
+    "!!binary Zg====",
+    "!!omap [{[a, b]: 1}]",  # Pair keys do not have to be hashable.
+    "!!pairs [!custom {a: 1}]",  # The wrapper's tag is not constructed.
+    "!!omap [&entry {a: 1}, *entry]",
+    "entry: &entry {a: 1}\npairs: !!pairs [*entry]",
+    "<<: [{x: 1, a: 1}, {x: 2, b: 2}]\nx: 3",
+    "<<: [{x: 1}, {x: 2}]\n<<: {x: 3}",
+    "<<: {x: 1}\n<<: [{x: 2}, {x: 3}]",
+    "base: &base {<<: {x: 1}, x: 2}\ncopy: {<<: *base}",
+    "!!set {<<: [{a: 1}, {b: 2}]}",
+    "<<: !!set {a: null}",
+    "set: &set !!set {a: null}\ncopy: {<<: *set}",
+    "<<: []\na: 1",
+    "&a {<<: *a, x: 1}",
+    '"<<": value\n"=": value',
+])
+def test_related_forms(load, reference, source):
+    assert_same(load(source), reference(source))
+
+
+def test_merge_alias_identity(load, reference):
+    source = "base: &base {<<: {x: 1}}\nalias: *base\ncopy: {<<: *base}"
+    actual = load(source)
+    assert_same(actual, reference(source))
+    assert actual["base"] is actual["alias"]
+    assert actual["copy"] is not actual["base"]
+
+
+def test_merge_state_is_document_local():
+    source = "---\n&base {<<: {x: 1}}\n---\n&base {<<: {x: 2}}\n"
+    expected = [{"x": 1}, {"x": 2}]
+    assert ryaml.loads_all(source) == expected
+    assert list(yaml.load_all(source, Loader=ryaml.RSafeLoader)) == expected
+
+
+def test_recursive_pair_wrapper(load, reference):
+    source = "!!pairs [&wrapper {self: *wrapper}]"
+    for result in (reference(source), load(source)):
+        assert type(result[0]) is tuple
+        key, mapping = result[0]
+        assert key == "self"
+        assert mapping["self"] is mapping
+
+
+@pytest.mark.parametrize("key", [
+    pytest.param("é" * 1000, id="two-byte"),
+    pytest.param("�" * 1000, id="three-byte"),
+    pytest.param("🙂" * 1000, id="four-byte"),
+])
+def test_simple_key_limit_counts_characters(load, reference, key):
+    # LibYAML's 1024 limit on implicit keys is in characters, not UTF-8 bytes.
+    source = f"{key}: 1"
+    assert_same(load(source), reference(source))
+    source = f"{key * 2}: 1"
+    with pytest.raises(yaml.YAMLError):
+        reference(source)
+    with pytest.raises(yaml.YAMLError):
+        load(source)
+
+
+def test_nan_is_shared(load, reference):
+    # PyYAML returns one NaN object, so duplicate `.nan` keys collapse.
+    source = "[.nan, .NaN, .NAN, !!float .nan]"
+    for result in (reference(source), load(source)):
+        assert all(x is result[0] for x in result)
+    source = ".nan: 1\n.NaN: 2\n"
+    for result in (reference(source), load(source)):
+        assert len(result) == 1
+        assert list(result.values()) == [2]
+
+
+@pytest.mark.parametrize("source", [
+    pytest.param("&x <<: {a: 1}\nb: &x 2\n", id="merge-then-value"),
+    pytest.param("a: &x 1\n&x <<: {b: 2}\n", id="value-then-merge"),
+    pytest.param("&x <<: {a: 1}\n&x <<: {b: 2}\n", id="merge-then-merge"),
+])
+def test_anchored_merge_key_duplicate(load, reference, source):
+    with pytest.raises(yaml.composer.ComposerError):
+        reference(source)
+    with pytest.raises(yaml.composer.ComposerError):
+        load(source)
+
+
+@pytest.mark.parametrize("source", [
+    pytest.param("&m <<: {a: 1}\nb: *m\n", id="mapping-value"),
+    pytest.param("- {&m <<: {a: 1}}\n- *m\n", id="sequence-item"),
+])
+def test_alias_to_merge_key_as_value(load, reference, source):
+    # The aliased node is tagged !!merge, which has no constructor.
+    with pytest.raises(yaml.constructor.ConstructorError):
+        reference(source)
+    with pytest.raises(yaml.constructor.ConstructorError):
+        load(source)
+
+
+@pytest.mark.parametrize("source", [
+    pytest.param("&m <<: {a: 1}\n*m : {b: 2}\n", id="same-mapping"),
+    pytest.param("- {&m <<: {a: 1}}\n- {*m : {c: 3}}\n", id="other-mapping"),
+])
+def test_alias_to_merge_key_as_key(load, reference, source):
+    assert_same(load(source), reference(source))
