@@ -3,7 +3,7 @@
 
 use base64::Engine as _;
 use libyaml_safer::{Event, EventData, Parser};
-use pyo3::exceptions::{PyNotImplementedError, PyTypeError};
+use pyo3::exceptions::{PyIndexError, PyNotImplementedError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
@@ -1215,10 +1215,8 @@ fn construct_int_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
     };
     let bytes = value.as_bytes();
     if bytes.is_empty() {
-        return Err(exception::constructor_error(
-            py,
-            "invalid integer: empty value".to_string(),
-        ));
+        // PyYAML indexes value[0] of the empty string.
+        return Err(PyIndexError::new_err("string index out of range"));
     }
 
     let (sign, remaining) = match bytes[0] {
@@ -1227,6 +1225,10 @@ fn construct_int_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
         _ => (1i64, value),
     };
 
+    if remaining.is_empty() {
+        // PyYAML indexes value[0] after stripping the sign.
+        return Err(PyIndexError::new_err("string index out of range"));
+    }
     let result = if remaining == "0" {
         0i64
     } else if let Some(bin) = remaining.strip_prefix("0b") {
@@ -1309,25 +1311,25 @@ fn construct_float_direct(py: Python, value: &str) -> PyResult<Py<PyAny>> {
 
 static NAN: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
+/// Mirrors PyYAML's `construct_yaml_float`: strip underscores, lowercase,
+/// strip one sign, then `.inf` / `.nan` / sexagesimal / `float()`. Pieces Rust
+/// cannot parse go to Python's `float()`, so accepted forms and errors match.
 fn construct_float_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
-    let bytes = value.as_bytes();
-    if bytes.is_empty() {
-        return Err(exception::constructor_error(
-            py,
-            "invalid float: empty value".to_string(),
-        ));
-    }
-
-    let (sign, remaining) = match bytes[0] {
-        b'-' => (-1.0f64, &value[1..]),
-        b'+' => (1.0f64, &value[1..]),
-        _ => (1.0f64, value),
+    let value = value.replace('_', "").to_lowercase();
+    let Some(first) = value.chars().next() else {
+        return Err(PyIndexError::new_err("string index out of range"));
+    };
+    let sign = if first == '-' { -1.0 } else { 1.0 };
+    let remaining = if matches!(first, '-' | '+') {
+        &value[1..]
+    } else {
+        value.as_str()
     };
 
-    if remaining.eq_ignore_ascii_case(".inf") {
+    if remaining == ".inf" {
         return Ok(PyFloat::new(py, sign * f64::INFINITY).into_any().unbind());
     }
-    if remaining.eq_ignore_ascii_case(".nan") {
+    if remaining == ".nan" {
         // PyYAML returns one shared NaN object, so repeated `.nan` mapping keys
         // collapse via dict's identity check; mirror that.
         let nan = NAN.get_or_init(py, || PyFloat::new(py, f64::NAN).into_any().unbind());
@@ -1335,15 +1337,39 @@ fn construct_float_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
     }
 
     let result = if remaining.contains(':') {
-        parse_sexagesimal_float(remaining).map_err(|_| {
-            exception::constructor_error(py, format!("invalid sexagesimal float: {}", value))
-        })?
+        // Least significant part first, as PyYAML sums them. Its base is an
+        // exact Python int, rounded to a float for each multiplication (which
+        // raises OverflowError once it no longer fits).
+        let mut result = 0.0;
+        let mut base = Some(1u128);
+        for (power, part) in remaining.rsplit(':').enumerate() {
+            let digit = python_float(py, part)?;
+            let base_f = match base {
+                Some(b) => b as f64,
+                None => PyInt::new(py, 60)
+                    .pow(power as u32, None::<u32>)?
+                    .call_method0("__float__")?
+                    .extract::<f64>()?,
+            };
+            result += digit * base_f;
+            base = base.and_then(|b| b.checked_mul(60));
+        }
+        result
     } else {
-        parse_float_skip_underscores(remaining)
-            .map_err(|_| exception::constructor_error(py, format!("invalid float: {}", value)))?
+        python_float(py, remaining)?
     };
-
     Ok(PyFloat::new(py, sign * result).into_any().unbind())
+}
+
+/// Python's `float(s)`, using Rust's parser when it accepts `s`.
+fn python_float(py: Python, s: &str) -> PyResult<f64> {
+    if let Ok(v) = s.parse::<f64>() {
+        return Ok(v);
+    }
+    py.import("builtins")?
+        .getattr("float")?
+        .call1((s,))?
+        .extract::<f64>()
 }
 
 // --- Zero-allocation parsing helpers ---
@@ -1385,41 +1411,6 @@ fn parse_sexagesimal_int(s: &str) -> Result<i64, ()> {
             .ok_or(())?
             .checked_add(segment)
             .ok_or(())?;
-    }
-    Ok(result)
-}
-
-/// Parse float string, skipping '_' characters, without heap allocation for typical values.
-fn parse_float_skip_underscores(s: &str) -> Result<f64, ()> {
-    // Fast path: no underscores
-    if !s.contains('_') {
-        return s.parse::<f64>().map_err(|_| ());
-    }
-    // Stack buffer for typical float strings
-    let mut buf = [0u8; 64];
-    let mut len = 0;
-    for b in s.bytes() {
-        if b == b'_' {
-            continue;
-        }
-        if len >= buf.len() {
-            // Fallback to heap for very long strings
-            let cleaned: String = s.chars().filter(|&c| c != '_').collect();
-            return cleaned.parse::<f64>().map_err(|_| ());
-        }
-        buf[len] = b;
-        len += 1;
-    }
-    let cleaned = std::str::from_utf8(&buf[..len]).map_err(|_| ())?;
-    cleaned.parse::<f64>().map_err(|_| ())
-}
-
-/// Parse sexagesimal float (e.g. "1:30.5" = 90.5), skipping underscores in each segment.
-fn parse_sexagesimal_float(s: &str) -> Result<f64, ()> {
-    let mut result: f64 = 0.0;
-    for part in s.split(':') {
-        let segment = parse_float_skip_underscores(part)?;
-        result = result * 60.0 + segment;
     }
     Ok(result)
 }

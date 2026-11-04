@@ -310,3 +310,35 @@ def test_scalar_tag_on_mapping_errors(load, reference, source, error):
         reference(source)
     with pytest.raises(error):
         load(source)
+
+
+@pytest.mark.parametrize(("source", "error"), [
+    ("!!int ''", IndexError),
+    ("!!int '-'", IndexError),
+    ("!!float ''", IndexError),
+    ("!!float '-'", ValueError),
+    ("!!float hello", ValueError),
+    ("!!float 0x1F", ValueError),
+    ("!!float 1:x", ValueError),
+    ("!!float '" + ":".join(["0"] * 200) + "'", OverflowError),
+])
+def test_explicit_float_and_int_errors(load, reference, source, error):
+    # PyYAML's int/float constructors index value[0] and call float(), so
+    # malformed values raise IndexError / ValueError rather than YAMLError.
+    with pytest.raises(error):
+        reference(source)
+    with pytest.raises(error):
+        load(source)
+
+
+@pytest.mark.parametrize("value", [
+    ".I_NF", "-.In_F", "._nan", " 1.5 ", "--5", "+-1.5", "1: 30", "1_0:3_0.5",
+    "١٢.٥", "-Infinity", ":".join(["1"] * 30), ":".join(["7.3"] * 25),
+])
+def test_explicit_float_matches_pyyaml(load, reference, value):
+    # Underscores removed and lowercased first, one sign stripped, Python
+    # float() for the rest; sexagesimal parts summed least significant first.
+    source = f"!!float '{value}'"
+    expected, actual = reference(source), load(source)
+    assert type(actual) is float
+    assert actual == expected or (actual != actual and expected != expected)
