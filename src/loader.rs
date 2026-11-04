@@ -891,7 +891,17 @@ fn construct_int_direct(py: Python, value: &str) -> PyResult<Py<PyAny>> {
     construct_int_fallback(py, value)
 }
 
+/// Mirrors PyYAML's `construct_yaml_int`: strip underscores, strip one sign,
+/// then dispatch on prefix in the same order (a leading `0` means octal even if
+/// the value contains `:`), with Python's `int()` as the fallback.
 fn construct_int_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
+    let cleaned;
+    let value = if value.contains('_') {
+        cleaned = value.replace('_', "");
+        cleaned.as_str()
+    } else {
+        value
+    };
     let bytes = value.as_bytes();
     if bytes.is_empty() {
         return Err(exception::constructor_error(
@@ -918,7 +928,7 @@ fn construct_int_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
             Ok(v) => v,
             Err(()) => return construct_bigint_with_base(py, sign, hex, 16),
         }
-    } else if remaining.starts_with('0') && !remaining.contains(':') && remaining.len() > 1 {
+    } else if remaining.starts_with('0') {
         match parse_int_skip_underscores(remaining, 8) {
             Ok(v) => v,
             Err(()) => return construct_bigint_with_base(py, sign, remaining, 8),
@@ -931,24 +941,13 @@ fn construct_int_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
     } else {
         match parse_int_skip_underscores(remaining, 10) {
             Ok(v) => v,
-            Err(()) => {
-                // Overflow or parse failure — fall back to Python int() for big integers
-                return construct_bigint_via_python(py, value);
-            }
+            // Overflow or parse failure: PyYAML calls int() on the unsigned
+            // remainder, which also accepts e.g. surrounding whitespace.
+            Err(()) => return construct_bigint_with_base(py, sign, remaining, 10),
         }
     };
 
     Ok(PyInt::new(py, sign * result).into_any().unbind())
-}
-
-/// Construct a Python big integer by calling Python's int() builtin
-fn construct_bigint_via_python(py: Python, value: &str) -> PyResult<Py<PyAny>> {
-    // YAML 1.1 allows underscores anywhere (e.g. "1__000"), but Python's int()
-    // rejects consecutive underscores, so strip them before passing to Python.
-    let cleaned: String = value.chars().filter(|&c| c != '_').collect();
-    let builtins = py.import("builtins")?;
-    let result = builtins.call_method1("int", (&cleaned,))?;
-    Ok(result.unbind())
 }
 
 /// Construct a Python big integer from digits in a given base (for octal/hex/binary overflow).

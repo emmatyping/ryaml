@@ -217,3 +217,26 @@ def test_alias_to_merge_key_as_value(load, reference, source):
 ])
 def test_alias_to_merge_key_as_key(load, reference, source):
     assert_same(load(source), reference(source))
+
+
+@pytest.mark.parametrize("value", [
+    "0 :6", "00:01", "01:30", "_0_8", "09",
+])
+def test_explicit_int_leading_zero_is_octal(load, reference, value):
+    # PyYAML checks for a leading 0 (octal) before ':' (sexagesimal).
+    source = f"!!int '{value}'"
+    with pytest.raises(ValueError):
+        reference(source)
+    with pytest.raises(ValueError):
+        load(source)
+
+
+@pytest.mark.parametrize("value", [
+    "--0", "+ 1", "- 1", "-0", "0_x1F", "0_b101", "_0_7", "-_5", "1: 5", "1:-5",
+    "1_000:30", "-12345678901234567890123",
+])
+def test_explicit_int_matches_pyyaml(load, reference, value):
+    # Underscores are removed first, one sign is stripped, and the rest is
+    # passed to int(), which also accepts whitespace and a second sign.
+    source = f"!!int '{value}'"
+    assert_same(load(source), reference(source))
