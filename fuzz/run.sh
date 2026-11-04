@@ -13,6 +13,17 @@ fi
 cd -- "$fuzz_root"
 mkdir -p target/fuzz/artifacts
 export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:allocator_may_return_null=1}"
+# ASan only looks for an unversioned `llvm-symbolizer` on PATH; distro packages
+# often install it as `llvm-symbolizer-NN`. Without one, stack traces are raw
+# addresses.
+if [[ -z "${ASAN_SYMBOLIZER_PATH:-}" ]]; then
+    for candidate in llvm-symbolizer $(compgen -c llvm-symbolizer- | sort -t- -k3 -rn); do
+        if candidate="$(command -v "$candidate")"; then
+            export ASAN_SYMBOLIZER_PATH="$candidate"
+            break
+        fi
+    done
+fi
 fuzz_preload="$fuzz_runtime${LD_PRELOAD:+:$LD_PRELOAD}"
 # libFuzzer's -fork/-merge modes re-run fuzz/run.py via its shebang
 # (/usr/bin/env python3), so put the fuzzing interpreter first on PATH.
