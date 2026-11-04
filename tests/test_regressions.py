@@ -240,3 +240,37 @@ def test_explicit_int_matches_pyyaml(load, reference, value):
     # passed to int(), which also accepts whitespace and a second sign.
     source = f"!!int '{value}'"
     assert_same(load(source), reference(source))
+
+
+@pytest.mark.parametrize("source", [
+    pytest.param("<<: [{x: 2}, !o {x: 3}]\n", id="unknown-tag-in-sequence"),
+    pytest.param("<<: !o {x: 1}\n", id="unknown-tag-mapping"),
+    pytest.param("<<: !o [{x: 1}]\n", id="unknown-tag-sequence"),
+    pytest.param("<<: !!str {x: 1}\n", id="str-tag-mapping"),
+    pytest.param("<<: !!omap [{x: 1}]\n", id="omap"),
+    pytest.param("<<: !!pairs [{x: 1}]\n", id="pairs"),
+    pytest.param("<<: !o {<<: {x: 1}}\n", id="nested-merge"),
+    pytest.param("<<: &a !o {x: 1}\nb: {<<: *a}\n", id="alias-merged-again"),
+    pytest.param("<<: &o !!omap [{x: 1}, {y: 2}]\nb: *o\n", id="omap-alias-value"),
+    pytest.param("<<: &o !!omap [{x: 1, y: 2}]\nb: {<<: *o}\n",
+                 id="omap-alias-merged-again"),
+])
+def test_merge_source_tag_is_ignored(load, reference, source):
+    # PyYAML merges by node kind and never constructs merge sources by tag.
+    assert_same(load(source), reference(source))
+
+
+@pytest.mark.parametrize("source", [
+    pytest.param("<<: [!o {x: !o 1}]\n", id="tagged-value-inside"),
+    pytest.param("<<: &a !o {x: 1}\ny: *a\n", id="alias-as-value"),
+    pytest.param("<<: [&a !o {x: 1}]\nb: *a\n", id="item-alias-as-value"),
+    pytest.param("<<: &o !!omap [{x: 1, y: 2}]\nb: *o\n", id="invalid-omap-alias"),
+    pytest.param("<<: [!o 1]\n", id="tagged-scalar-item"),
+])
+def test_merge_source_tag_still_constructed(load, reference, source):
+    # Values inside merge sources, and aliases used outside a merge, are
+    # constructed by tag as usual.
+    with pytest.raises(yaml.constructor.ConstructorError):
+        reference(source)
+    with pytest.raises(yaml.constructor.ConstructorError):
+        load(source)

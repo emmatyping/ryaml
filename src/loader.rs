@@ -37,6 +37,13 @@ pub struct RSafeLoader {
     /// nodes: an alias to one acts as a merge key in key position and is a
     /// ConstructorError anywhere else.
     merge_anchors: HashSet<String, FxBuildHasher>,
+    /// Anchored merge sources whose tag was ignored for merging (see
+    /// `untag_merge_source`), with that tag. PyYAML constructs such a node by tag
+    /// only when an alias uses it outside a merge, which then fails.
+    merge_source_tags: HashMap<String, String, FxBuildHasher>,
+    /// Anchored !!omap / !!pairs merge sources: `anchors` holds the tuple list an
+    /// alias gets as a value, this holds the mappings an alias merges.
+    merge_source_lists: HashMap<String, Py<PyAny>, FxBuildHasher>,
     pending_mappings: Vec<PendingMapping>,
     // Sets are represented by mapping nodes in YAML and can be merge sources.
     set_mappings: HashMap<usize, (Py<PySet>, Py<PyDict>), FxBuildHasher>,
@@ -54,6 +61,8 @@ impl RSafeLoader {
             parsed_event: None,
             anchors: HashMap::with_hasher(FxBuildHasher),
             merge_anchors: HashSet::with_hasher(FxBuildHasher),
+            merge_source_tags: HashMap::with_hasher(FxBuildHasher),
+            merge_source_lists: HashMap::with_hasher(FxBuildHasher),
             pending_mappings: Vec::new(),
             set_mappings: HashMap::with_hasher(FxBuildHasher),
             anchored_mapping_lengths: HashMap::with_hasher(FxBuildHasher),
@@ -213,6 +222,8 @@ impl RSafeLoader {
         // Clear anchors for next document
         self.anchors.clear();
         self.merge_anchors.clear();
+        self.merge_source_tags.clear();
+        self.merge_source_lists.clear();
         self.set_mappings.clear();
         self.anchored_mapping_lengths.clear();
 
@@ -224,7 +235,12 @@ impl RSafeLoader {
         let event = self.parsed_event.take().unwrap();
         match event.data {
             EventData::Alias { anchor } => {
-                if let Some(obj) = self.anchors.get(&anchor) {
+                if let Some(tag) = self.merge_source_tags.get(&anchor) {
+                    Err(exception::constructor_error(
+                        py,
+                        format!("could not determine a constructor for the tag '{}'", tag),
+                    ))
+                } else if let Some(obj) = self.anchors.get(&anchor) {
                     Ok(obj.clone_ref(py))
                 } else if self.merge_anchors.contains(&anchor) {
                     Err(merge_node_error(py))
@@ -435,7 +451,7 @@ impl RSafeLoader {
 
                 // Parse the value
                 self._parse_next_event(py)?;
-                let mut value = self.construct_from_events(py)?;
+                let mut value = self.construct_merge_value(py)?;
                 if let Some((_, mapping)) = self.set_mappings.get(&(value.as_ptr() as usize)) {
                     value = mapping.clone_ref(py).into_any();
                 }
@@ -525,6 +541,140 @@ impl RSafeLoader {
 
         self.parsed_event = None;
         Ok(dict_obj)
+    }
+
+    /// Construct the value of a `<<` key. PyYAML merges by node kind and never
+    /// constructs the merge value, or the mappings in a merge sequence, by tag.
+    fn construct_merge_value(&mut self, py: Python) -> PyResult<Py<PyAny>> {
+        if let Some(Event {
+            data: EventData::Alias { anchor },
+            ..
+        }) = &self.parsed_event
+        {
+            if let Some(obj) = self
+                .merge_source_lists
+                .get(anchor)
+                .or_else(|| self.anchors.get(anchor))
+            {
+                let obj = obj.clone_ref(py);
+                self.parsed_event = None;
+                return Ok(obj);
+            }
+        }
+        let stripped = self.untag_merge_source(true);
+        let pairs = matches!(
+            stripped.as_deref(),
+            Some(crate::TAG_OMAP | crate::TAG_PAIRS)
+        );
+        if !matches!(
+            &self.parsed_event,
+            Some(Event {
+                data: EventData::SequenceStart { .. },
+                ..
+            })
+        ) {
+            return self.construct_from_events(py);
+        }
+        let Some(Event {
+            data: EventData::SequenceStart { anchor, .. },
+            ..
+        }) = self.parsed_event.take()
+        else {
+            unreachable!()
+        };
+        let list = PyList::empty(py);
+        if let Some(anchor) = &anchor {
+            self.register_anchor(py, anchor.clone(), list.clone().into_any().unbind())?;
+        }
+        loop {
+            self._parse_next_event(py)?;
+            if matches!(
+                &self.parsed_event,
+                Some(Event {
+                    data: EventData::SequenceEnd,
+                    ..
+                })
+            ) {
+                break;
+            }
+            let item = self.construct_merge_value_item(py)?;
+            list.append(item)?;
+        }
+        self.parsed_event = None;
+        if pairs && let Some(anchor) = anchor {
+            // An alias used as another merge source merges these mappings, but
+            // one used as a value gets the !!omap / !!pairs list PyYAML would
+            // construct from the same node (or its error).
+            self.merge_source_lists
+                .insert(anchor.clone(), list.clone().into_any().unbind());
+            let entries = PyList::empty(py);
+            for item in list.iter() {
+                match item.cast::<PyDict>() {
+                    Ok(mapping) if mapping.len() == 1 => {
+                        let (key, value) = mapping.iter().next().unwrap();
+                        entries.append(PyTuple::new(py, [key, value])?)?;
+                    }
+                    _ => {
+                        self.merge_source_tags.insert(anchor, stripped.unwrap());
+                        return Ok(list.into_any().unbind());
+                    }
+                }
+            }
+            self.anchors.insert(anchor, entries.into_any().unbind());
+        }
+        Ok(list.into_any().unbind())
+    }
+
+    fn construct_merge_value_item(&mut self, py: Python) -> PyResult<Py<PyAny>> {
+        if let Some(Event {
+            data: EventData::Alias { anchor },
+            ..
+        }) = &self.parsed_event
+        {
+            if let Some(obj) = self.anchors.get(anchor) {
+                let obj = obj.clone_ref(py);
+                self.parsed_event = None;
+                return Ok(obj);
+            }
+        }
+        self.untag_merge_source(false);
+        self.construct_from_events(py)
+    }
+
+    /// Drop a merge source's tag if constructing by it would reject the node or
+    /// change its shape, so it is merged as a plain mapping or sequence.
+    fn untag_merge_source(&mut self, allow_sequence: bool) -> Option<String> {
+        let (anchor, tag, sequence) = match &mut self.parsed_event {
+            Some(Event {
+                data: EventData::MappingStart { anchor, tag, .. },
+                ..
+            }) if tag
+                .as_deref()
+                .is_some_and(|t| !matches!(t, "!" | crate::TAG_MAP | crate::TAG_SET)) =>
+            {
+                (anchor, tag, false)
+            }
+            Some(Event {
+                data: EventData::SequenceStart { anchor, tag, .. },
+                ..
+            }) if allow_sequence
+                && tag
+                    .as_deref()
+                    .is_some_and(|t| !matches!(t, "!" | crate::TAG_SEQ)) =>
+            {
+                (anchor, tag, true)
+            }
+            _ => return None,
+        };
+        let tag = tag.take().unwrap();
+        // Aliases to !!omap / !!pairs sequences are handled by
+        // `construct_merge_value`, which builds the list PyYAML would.
+        if let Some(anchor) = anchor
+            && !(sequence && matches!(tag.as_str(), crate::TAG_OMAP | crate::TAG_PAIRS))
+        {
+            self.merge_source_tags.insert(anchor.clone(), tag.clone());
+        }
+        Some(tag)
     }
 
     /// !!omap / !!pairs entries are raw single-entry mappings, not constructed
