@@ -274,3 +274,39 @@ def test_merge_source_tag_still_constructed(load, reference, source):
         reference(source)
     with pytest.raises(yaml.constructor.ConstructorError):
         load(source)
+
+
+@pytest.mark.parametrize("source", [
+    pytest.param("!!str\n=:", id="fuzz-block"),
+    pytest.param("!!str {=: hi}", id="str"),
+    pytest.param("!!int {=: 5}", id="int"),
+    pytest.param("!!float {=: 1.5}", id="float"),
+    pytest.param("!!bool {=: yes}", id="bool"),
+    pytest.param("!!null {=: 7}", id="null"),
+    pytest.param("!!binary {=: aGk=}", id="binary"),
+    pytest.param("!!str {a: !o 1, =: b, =: c}", id="first-value-key-other-entries-skipped"),
+    pytest.param("!!str {=: {=: deep}}", id="nested"),
+    pytest.param("!!str {!!value v: x}", id="explicit-value-tag"),
+    pytest.param("!!str {=: !!int 5}", id="raw-text-of-value"),
+    pytest.param("- &v 05\n- !!str {=: *v}\n", id="alias-value"),
+    pytest.param("- !!str {a: &k 1, =: 2}\n- *k\n", id="anchor-in-skipped-entry"),
+    pytest.param("- &a !!str {=: x}\n- *a\n", id="anchored"),
+])
+def test_scalar_tag_on_mapping_uses_value_key(load, reference, source):
+    # SafeConstructor.construct_scalar uses a mapping's `=` key as the scalar.
+    assert_same(load(source), reference(source))
+
+
+@pytest.mark.parametrize(("source", "error"), [
+    ("!!str {a: 1}", yaml.constructor.ConstructorError),
+    ("!!str {=: [1]}", yaml.constructor.ConstructorError),
+    ("!!str {=: {x: 1}}", yaml.constructor.ConstructorError),
+    ("!!int {=: x}", ValueError),
+    ("!!bool {=: 5}", KeyError),
+    ("!!timestamp {=: 2001-12-14}", TypeError),
+])
+def test_scalar_tag_on_mapping_errors(load, reference, source, error):
+    with pytest.raises(error):
+        reference(source)
+    with pytest.raises(error):
+        load(source)

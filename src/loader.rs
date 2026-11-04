@@ -3,7 +3,7 @@
 
 use base64::Engine as _;
 use libyaml_safer::{Event, EventData, Parser};
-use pyo3::exceptions::PyNotImplementedError;
+use pyo3::exceptions::{PyNotImplementedError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
@@ -44,6 +44,9 @@ pub struct RSafeLoader {
     /// Anchored !!omap / !!pairs merge sources: `anchors` holds the tuple list an
     /// alias gets as a value, this holds the mappings an alias merges.
     merge_source_lists: HashMap<String, Py<PyAny>, FxBuildHasher>,
+    /// Raw text of anchored scalars, for an alias used as the `=` value of a
+    /// mapping that is constructed as a scalar (see `mapping_value_scalar`).
+    scalar_anchor_values: HashMap<String, String, FxBuildHasher>,
     pending_mappings: Vec<PendingMapping>,
     // Sets are represented by mapping nodes in YAML and can be merge sources.
     set_mappings: HashMap<usize, (Py<PySet>, Py<PyDict>), FxBuildHasher>,
@@ -63,6 +66,7 @@ impl RSafeLoader {
             merge_anchors: HashSet::with_hasher(FxBuildHasher),
             merge_source_tags: HashMap::with_hasher(FxBuildHasher),
             merge_source_lists: HashMap::with_hasher(FxBuildHasher),
+            scalar_anchor_values: HashMap::with_hasher(FxBuildHasher),
             pending_mappings: Vec::new(),
             set_mappings: HashMap::with_hasher(FxBuildHasher),
             anchored_mapping_lengths: HashMap::with_hasher(FxBuildHasher),
@@ -224,6 +228,7 @@ impl RSafeLoader {
         self.merge_anchors.clear();
         self.merge_source_tags.clear();
         self.merge_source_lists.clear();
+        self.scalar_anchor_values.clear();
         self.set_mappings.clear();
         self.anchored_mapping_lengths.clear();
 
@@ -314,6 +319,7 @@ impl RSafeLoader {
         };
 
         if let Some(anchor_name) = anchor {
+            self.scalar_anchor_values.insert(anchor_name.clone(), value);
             self.register_anchor(py, anchor_name, result.clone_ref(py))?;
         }
 
@@ -382,6 +388,11 @@ impl RSafeLoader {
         let record_length = anchor.is_some();
         let mut length = 0;
         let is_set = tag.as_deref() == Some(crate::TAG_SET);
+        if let Some(t) = tag.as_deref()
+            && is_scalar_tag(t)
+        {
+            return self.construct_mapping_as_scalar(py, anchor, tag.unwrap());
+        }
         // Reject unknown tags (pyyaml SafeConstructor behavior)
         if let Some(ref t) = tag
             && t != "!"
@@ -499,10 +510,7 @@ impl RSafeLoader {
                     },
                 ..
             }) = self.parsed_event
-                && (tag.as_deref() == Some(crate::TAG_VALUE)
-                    || (matches!(tag.as_deref(), None | Some("!"))
-                        && plain_implicit
-                        && value == "="))
+                && is_value_key(tag.as_deref(), value, plain_implicit)
             {
                 *tag = Some(crate::TAG_STR.to_string());
             }
@@ -541,6 +549,135 @@ impl RSafeLoader {
 
         self.parsed_event = None;
         Ok(dict_obj)
+    }
+
+    /// A scalar tag on a mapping: PyYAML's `SafeConstructor.construct_scalar`
+    /// uses the raw value of the mapping's first `=` (value) key, so
+    /// `!!int {=: 5}` is 5. The mapping's other entries are never constructed.
+    fn construct_mapping_as_scalar(
+        &mut self,
+        py: Python,
+        anchor: Option<String>,
+        tag: String,
+    ) -> PyResult<Py<PyAny>> {
+        let Some(value) = self.mapping_value_scalar(py)? else {
+            return Err(expected_scalar_error(py, "mapping"));
+        };
+        if tag == crate::TAG_TIMESTAMP {
+            // PyYAML matches its timestamp regex against the node's entry list.
+            return Err(PyTypeError::new_err(
+                "expected string or bytes-like object, got 'list'",
+            ));
+        }
+        self.construct_scalar_direct(py, anchor, Some(tag), value, false)
+    }
+
+    /// Consume the rest of a mapping (its start event already taken) and return
+    /// the raw scalar text of its first `=` key's value, if it has one.
+    fn mapping_value_scalar(&mut self, py: Python) -> PyResult<Option<String>> {
+        let mut found = None;
+        loop {
+            self._parse_next_event(py)?;
+            let is_value = match &self.parsed_event {
+                Some(Event {
+                    data: EventData::MappingEnd,
+                    ..
+                }) => break,
+                Some(Event {
+                    data:
+                        EventData::Scalar {
+                            tag,
+                            value,
+                            plain_implicit,
+                            ..
+                        },
+                    ..
+                }) => is_value_key(tag.as_deref(), value, *plain_implicit),
+                _ => false,
+            };
+            self.skip_node(py)?;
+            self._parse_next_event(py)?;
+            if is_value && found.is_none() {
+                found = Some(self.node_scalar_value(py)?);
+            } else {
+                self.skip_node(py)?;
+            }
+        }
+        self.parsed_event = None;
+        Ok(found)
+    }
+
+    /// The raw scalar text of the current node, following `=` keys through
+    /// mappings like PyYAML's `construct_scalar`.
+    fn node_scalar_value(&mut self, py: Python) -> PyResult<String> {
+        let event = self.parsed_event.take().unwrap();
+        match event.data {
+            EventData::Scalar {
+                anchor,
+                tag,
+                value,
+                plain_implicit,
+                ..
+            } => {
+                if anchor.is_some() {
+                    // PyYAML composes the node, so later aliases to it work.
+                    let _ = self.construct_scalar_direct(
+                        py,
+                        anchor,
+                        tag,
+                        value.clone(),
+                        plain_implicit,
+                    );
+                }
+                Ok(value)
+            }
+            EventData::Alias { anchor } => match self.scalar_anchor_values.get(&anchor) {
+                Some(value) => Ok(value.clone()),
+                None if self.anchors.contains_key(&anchor) => {
+                    Err(expected_scalar_error(py, "collection"))
+                }
+                None => Err(exception::composer_error(
+                    py,
+                    format!("found undefined alias '{}'", anchor),
+                )),
+            },
+            EventData::MappingStart { .. } => self
+                .mapping_value_scalar(py)?
+                .ok_or_else(|| expected_scalar_error(py, "mapping")),
+            _ => Err(expected_scalar_error(py, "sequence")),
+        }
+    }
+
+    /// Consume the current node without constructing it. Anchored scalars are
+    /// still registered (when they construct cleanly) so later aliases work.
+    fn skip_node(&mut self, py: Python) -> PyResult<()> {
+        let event = self.parsed_event.take().unwrap();
+        match event.data {
+            EventData::Scalar {
+                anchor: anchor @ Some(_),
+                tag,
+                value,
+                plain_implicit,
+                ..
+            } => {
+                let _ = self.construct_scalar_direct(py, anchor, tag, value, plain_implicit);
+            }
+            EventData::SequenceStart { .. } | EventData::MappingStart { .. } => {
+                let mut depth = 1;
+                while depth > 0 {
+                    self._parse_next_event(py)?;
+                    match self.parsed_event.take().unwrap().data {
+                        EventData::SequenceStart { .. } | EventData::MappingStart { .. } => {
+                            depth += 1
+                        }
+                        EventData::SequenceEnd | EventData::MappingEnd => depth -= 1,
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Construct the value of a `<<` key. PyYAML merges by node kind and never
@@ -960,6 +1097,30 @@ fn construct_python_scalar(
         Ok(py.import("ryaml._scalars")?.getattr(name)?.unbind())
     })?;
     Ok(constructor.bind(py).call1((value,))?.unbind())
+}
+
+/// Tags whose constructors take a scalar node.
+fn is_scalar_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        crate::TAG_NULL
+            | crate::TAG_BOOL
+            | crate::TAG_INT
+            | crate::TAG_FLOAT
+            | crate::TAG_BINARY
+            | crate::TAG_TIMESTAMP
+            | crate::TAG_STR
+    )
+}
+
+/// A `=` mapping key, which PyYAML resolves to the `value` tag.
+fn is_value_key(tag: Option<&str>, value: &str, plain_implicit: bool) -> bool {
+    tag == Some(crate::TAG_VALUE)
+        || (matches!(tag, None | Some("!")) && plain_implicit && value == "=")
+}
+
+fn expected_scalar_error(py: Python, found: &str) -> PyErr {
+    exception::constructor_error(py, format!("expected a scalar node, but found {}", found))
 }
 
 fn merge_node_error(py: Python) -> PyErr {
