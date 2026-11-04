@@ -1,0 +1,4 @@
+!!pairs
+- &entry {a: 1}
+- a: 2
+- *entry

@@ -1,0 +1,3 @@
+!!set
+<<: [{a: null}, {b: null}]
+=: null

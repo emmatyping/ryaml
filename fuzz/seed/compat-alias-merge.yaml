@@ -1,0 +1,3 @@
+base: &base {<<: {x: 1}, x: 2}
+alias: *base
+copy: {<<: *base}

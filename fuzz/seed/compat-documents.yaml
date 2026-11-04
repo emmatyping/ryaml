@@ -1,0 +1,4 @@
+---
+&base {<<: {x: 1}, date: 2026-11-04}
+---
+&base {<<: {x: 2}, binary: !!binary SGVsbG8=}
