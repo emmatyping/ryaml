@@ -38,6 +38,13 @@ def approx_equal(a, b, rel_tol=1e-9, _seen=None):
         b_items = sorted(b.items(), key=repr)
         return all(approx_equal(ak, bk, rel_tol, _seen) and approx_equal(av, bv, rel_tol, _seen)
                     for (ak, av), (bk, bv) in zip(a_items, b_items))
+    if isinstance(a, (set, frozenset)):
+        # Set equality checks identity first, and each library has its own NaN
+        # object, so compare NaN members by count rather than by value.
+        def is_nan(x):
+            return isinstance(x, float) and math.isnan(x)
+        return (sum(map(is_nan, a)) == sum(map(is_nan, b))
+                and {x for x in a if not is_nan(x)} == {x for x in b if not is_nan(x)})
     if isinstance(a, (list, tuple)):
         if len(a) != len(b):
             return False
