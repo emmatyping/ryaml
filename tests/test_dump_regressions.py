@@ -478,3 +478,17 @@ def test_only_the_bom_is_escaped_as_a_bom(reference, value, style, allow_unicode
     # libyaml escapes U+FEFF in double-quoted scalars; U+7EFF (a CJK
     # character) is ordinary text.
     assert_same_dump(reference, [value], default_style=style, allow_unicode=allow_unicode)
+
+
+@pytest.mark.parametrize("value", [
+    2**24, 2**63 - 1, 2**63, 2**64, 2**127, 2**128, -2**128, 10**40,
+], ids=lambda v: f"bits-{v.bit_length()}")
+def test_big_ints_like_pyyaml(reference, value):
+    # https://github.com/emmatyping/ryaml/issues/44: ints past 64 bits failed
+    # to dump (the old dumper went through 128-bit integers).
+    assert_same_dump(reference, [{"t1": value}, [value]])
+    import io
+    stream = io.StringIO()
+    ryaml.dump(stream, {"t1": value})
+    assert stream.getvalue() == yaml.safe_dump({"t1": value})
+    assert ryaml.loads(stream.getvalue()) == {"t1": value}
