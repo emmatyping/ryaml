@@ -37,7 +37,8 @@ struct Node {
 
 enum NodeData {
     Scalar {
-        value: String,
+        /// The value's text: this range of `RSafeLoader::text`.
+        value: std::ops::Range<usize>,
         /// The tag was resolved implicitly (no tag, or `!`) from the whole
         /// value, so it matches the resolver's grammar exactly. ryaml's
         /// timestamp constructor uses this to take a fast path. False for a
@@ -67,6 +68,9 @@ pub struct RSafeLoader {
     parsed_event: Option<Event>,
     /// Nodes of the document being loaded.
     nodes: Vec<Node>,
+    /// The text of the document's scalars, one after another. Copying values
+    /// here lets the parser reuse each value's string for the next scalar.
+    text: String,
     /// Composer anchors: name to node.
     anchors: HashMap<String, NodeId, FxBuildHasher>,
     /// Constructed object of each node (PyYAML's `constructed_objects`). Every
@@ -153,6 +157,7 @@ impl RSafeLoader {
             parser,
             parsed_event: None,
             nodes: Vec::new(),
+            text: String::new(),
             anchors: HashMap::with_hasher(FxBuildHasher),
             objects: Vec::new(),
             has_merge: false,
@@ -187,6 +192,7 @@ impl RSafeLoader {
     fn compose_document(&mut self, py: Python) -> PyResult<NodeId> {
         self.parsed_event = None;
         self.nodes.clear();
+        self.text.clear();
         self.anchors.clear();
         self.has_merge = false;
         let root = self.compose_node(py)?;
@@ -233,6 +239,10 @@ impl RSafeLoader {
                         Tag::from_string(tag.expect("explicit tag"))
                     };
                     let implicit = implicit && !value.ends_with('\n');
+                    let start = self.text.len();
+                    self.text.push_str(&value);
+                    self.parser.recycle(value);
+                    let value = start..self.text.len();
                     let node = self.add_node(anchor, tag, NodeData::Scalar { value, implicit });
                     Some(node)
                 }
@@ -287,12 +297,7 @@ impl RSafeLoader {
         }
     }
 
-    fn add_node(
-        &mut self,
-        anchor: Option<String>,
-        tag: Tag,
-        data: NodeData,
-    ) -> NodeId {
+    fn add_node(&mut self, anchor: Option<String>, tag: Tag, data: NodeData) -> NodeId {
         let node = self.nodes.len();
         self.has_merge |= tag == Tag::Merge;
         self.nodes.push(Node {
@@ -324,6 +329,7 @@ impl RSafeLoader {
         self.objects.clear();
         self.pending.clear();
         self.nodes.clear();
+        self.text.clear();
         result
     }
 
@@ -359,15 +365,12 @@ impl RSafeLoader {
         let tag = &self.nodes[node].tag;
         if !matches!(
             tag,
-            Tag::Null
-                | Tag::Bool
-                | Tag::Int
-                | Tag::Float
-                | Tag::Binary
-                | Tag::Timestamp
-                | Tag::Str
+            Tag::Null | Tag::Bool | Tag::Int | Tag::Float | Tag::Binary | Tag::Timestamp | Tag::Str
         ) {
-            return Err(exception::constructor_error(py, unknown_tag_message(tag.as_str())));
+            return Err(exception::constructor_error(
+                py,
+                unknown_tag_message(tag.as_str()),
+            ));
         }
         let value = self.construct_scalar(py, node)?;
         Ok(match self.nodes[node].tag {
@@ -395,7 +398,7 @@ impl RSafeLoader {
     fn construct_scalar(&self, py: Python, mut node: NodeId) -> PyResult<&str> {
         for _ in 0..=self.nodes.len() {
             match &self.nodes[node].data {
-                NodeData::Scalar { value, .. } => return Ok(value),
+                NodeData::Scalar { value, .. } => return Ok(&self.text[value.clone()]),
                 NodeData::Mapping(entries) => {
                     let value_key = entries
                         .iter()
