@@ -374,9 +374,9 @@ impl RSafeDumper {
         Ok(())
     }
 
-    fn dispose(&mut self) {
-        self.emitter.dispose();
-    }
+    /// Like PyYAML's `CEmitter.dispose`, which does nothing: the dumper can
+    /// still be used, and the emitter is freed with it.
+    fn dispose(&mut self) {}
 }
 
 // ── Representer ──────────────────────────────────────────────────────────────
@@ -677,6 +677,23 @@ impl RSafeDumper {
 
 impl RSafeDumper {
     fn serialize(&mut self, py: Python, node: NodeId) -> PyResult<()> {
+        // PyYAML represents the data first, then its serializer checks it is
+        // open.
+        match self.closed {
+            -1 => {
+                return Err(exception::serializer_error(
+                    py,
+                    "serializer is not opened".to_string(),
+                ));
+            }
+            1 => {
+                return Err(exception::serializer_error(
+                    py,
+                    "serializer is closed".to_string(),
+                ));
+            }
+            _ => {}
+        }
         self.emitter
             .emit(Event::document_start(
                 self.version,
@@ -883,7 +900,7 @@ pub fn dumps_to_string(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<String> {
         emitter: ew,
         stream: py.None(),
         dump_unicode: true,
-        closed: -1,
+        closed: 0,
         document_start_implicit: true,
         version: None,
         tags: Vec::new(),

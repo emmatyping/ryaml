@@ -242,3 +242,39 @@ def test_very_deep_nesting_raises_instead_of_crashing():
         ryaml.dumps(value)
     with pytest.raises(RecursionError):
         yaml.dump(value, Dumper=ryaml.RSafeDumper)
+
+
+def _protocol(dumper, ops):
+    import io
+    stream = io.StringIO()
+    instance = dumper(stream)
+    results = []
+    for op in ops:
+        try:
+            if op == "represent":
+                instance.represent({"a": [1]})
+            elif op == "represent-bad":
+                instance.represent(object())
+            else:
+                getattr(instance, op)()
+            results.append("ok")
+        except Exception as e:  # noqa: BLE001
+            results.append(type(e).__name__)
+    return results, stream.getvalue()
+
+
+@pytest.mark.skipif(not hasattr(yaml, "CSafeDumper"), reason="PyYAML was built without LibYAML")
+@pytest.mark.parametrize("ops", [
+    ("represent", "open", "represent", "close"),
+    ("represent-bad", "open", "close"),
+    ("open", "open", "close", "close"),
+    ("open", "close", "represent", "open", "represent-bad"),
+    ("close", "open", "represent", "close"),
+    ("dispose", "open", "represent", "dispose", "close"),
+    ("open", "dispose", "represent", "close", "dispose", "open"),
+], ids="-".join)
+def test_dumper_protocol_like_pyyaml(ops):
+    # open/represent/close/dispose in any order: PyYAML represents first, then
+    # raises SerializerError if not open or already closed, and its dispose()
+    # does nothing.
+    assert _protocol(ryaml.RSafeDumper, ops) == _protocol(yaml.CSafeDumper, ops)
