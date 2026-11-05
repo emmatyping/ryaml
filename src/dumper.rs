@@ -271,7 +271,7 @@ impl RSafeDumper {
     #[pyo3(signature = (stream, default_style=None, default_flow_style=Some(false),
         canonical=None, indent=None, width=None, allow_unicode=None,
         line_break=None, encoding=None, explicit_start=None, explicit_end=None,
-        version=None, tags=None, sort_keys=false))]
+        version=None, tags=None, sort_keys=true))]
     #[allow(unused_variables)]
     fn new(
         py: Python,

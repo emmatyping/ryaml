@@ -415,3 +415,18 @@ def test_failed_represent_leaves_partial_nodes_like_pyyaml(index):
                 results.append(type(e).__name__)
         return results, stream.getvalue()
     assert run(ryaml.RSafeDumper) == run(yaml.CSafeDumper)
+
+
+@pytest.mark.skipif(not hasattr(yaml, "CSafeDumper"), reason="PyYAML was built without LibYAML")
+def test_dumper_class_sorts_keys_by_default():
+    # PyYAML's dumper classes default to sort_keys=True (yaml.dump_all always
+    # passes it, so only direct use shows the default).
+    def run(dumper):
+        import io
+        stream = io.StringIO()
+        instance = dumper(stream)
+        instance.open()
+        instance.represent({"b": 1, "a": {2, 1}})
+        instance.close()
+        return stream.getvalue()
+    assert run(ryaml.RSafeDumper) == run(yaml.CSafeDumper)
