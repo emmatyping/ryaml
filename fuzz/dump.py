@@ -236,7 +236,9 @@ options = st.fixed_dictionaries({}, optional={
     "width": pick([None, -1, 0, 1, 2, 10, 20, 40, 80, 1000]),
     "allow_unicode": pick([None, True, False]),
     "line_break": pick([None, "\n", "\r", "\r\n"]),
-    "encoding": pick([None, "utf-8", "utf-16-le", "utf-16-be"]),
+    # CEmitter: exactly "utf-16-le"/"utf-16-be" select UTF-16, others UTF-8.
+    "encoding": pick([None, "utf-8", "utf-16-le", "utf-16-be", "UTF-16-LE", "utf-16",
+                      "latin-1", ""]),
     "explicit_start": pick([None, True, False]),
     "explicit_end": pick([None, True, False]),
     "version": pick([None, (1, 1), (1, 2)]),
