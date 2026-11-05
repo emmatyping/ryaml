@@ -203,8 +203,10 @@ impl RSafeLoader {
         // Open collections, with a mapping's key waiting for its value.
         let mut open: Vec<(NodeId, Option<NodeId>)> = Vec::new();
         loop {
-            self.parse_next_event(py)?;
-            let event = self.parsed_event.take().expect("event parsed above");
+            let event = match self.parsed_event.take() {
+                Some(event) => event,
+                None => self.parser.parse().map_err(|e| parse_error(py, &e))?,
+            };
             let complete = match event.data {
                 EventData::Alias { anchor } => match self.anchors.get(&anchor) {
                     Some(&node) => Some(node),
