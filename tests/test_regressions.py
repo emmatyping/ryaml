@@ -686,3 +686,39 @@ def test_rsafeloader_does_not_read_with_pyyaml():
     loader = ryaml.RSafeLoader(io.StringIO("a: 1"))
     assert isinstance(loader, yaml.BaseLoader)
     assert loader.get_single_data() == {"a": 1}
+
+
+_K = 16384  # libyaml's raw input chunk (INPUT_RAW_BUFFER_SIZE)
+_LE = codecs.BOM_UTF16_LE
+
+
+@pytest.mark.skipif(not hasattr(yaml, "CSafeLoader"),
+                    reason="PyYAML was built without LibYAML")
+@pytest.mark.parametrize("data", [
+    pytest.param(b"*F*<\xff x", id="invalid-before-scanner-error"),
+    pytest.param(b"*F*<" + b" " * 10000 + b"\xff", id="invalid-same-chunk"),
+    pytest.param(b"*F*<" + b" " * 20000 + b"\xff", id="invalid-next-chunk"),
+    pytest.param(b"*F*<" + b" " * (_K - 5) + b"\xff ", id="invalid-last-byte-of-chunk"),
+    pytest.param(b"*F*<" + b" " * (_K - 4) + b"\xff ", id="invalid-first-byte-of-chunk"),
+    pytest.param(b"*F*<" + b" " * (_K - 5) + "é".encode() + b" \xff", id="split-character"),
+    pytest.param("*F*<" + " " * 20000 + "\x07", id="str-control-next-chunk"),
+    pytest.param("*F*<" + " " * (_K - 5) + "é\x07", id="str-split-character"),
+    pytest.param(_LE + "*F*<".encode("utf-16-le") + b"\x00\xdc" + b"x\x00",
+                 id="utf16-lone-low-surrogate"),
+    pytest.param(_LE + ("*F*<" + " " * 10000).encode("utf-16-le") + b"\x00\xdc",
+                 id="utf16-next-chunk"),
+    pytest.param(_LE + ("a: '" + "x" * (_K // 2 - 4) + "😀'").encode("utf-16-le"),
+                 id="utf16-split-pair"),
+])
+def test_decode_errors_follow_libyaml_chunks(data):
+    # libyaml checks each 16 KB raw chunk in full when the parser first needs
+    # it: invalid input in the current chunk beats a later scanner error, but
+    # invalid input in a later chunk does not.
+    def outcome(load):
+        try:
+            return repr(load(data))
+        except Exception as e:  # noqa: BLE001
+            return type(e).__name__
+    expected = outcome(lambda d: list(yaml.load_all(d, Loader=yaml.CSafeLoader)))
+    assert outcome(lambda d: list(yaml.load_all(d, Loader=ryaml.RSafeLoader))) == expected
+    assert outcome(ryaml.loads_all) == expected
