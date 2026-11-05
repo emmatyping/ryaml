@@ -57,16 +57,16 @@ mod _ryaml {
 
     #[pyfunction]
     fn loads(py: Python, str: Source) -> PyResult<Option<Py<PyAny>>> {
-        RSafeLoader::from_text(str.into_text(py)?).get_single_data(py)
+        RSafeLoader::from_input(str.into_input()).get_single_data(py)
     }
 
     #[pyfunction]
     fn loads_all(py: Python, str: Source) -> PyResult<Option<Py<PyAny>>> {
-        let str = str.into_text(py)?;
-        if str.is_empty() {
+        let input = str.into_input();
+        if input.is_empty() {
             Ok(Some(Python::None(py)))
         } else {
-            let mut loader = RSafeLoader::from_text(str);
+            let mut loader = RSafeLoader::from_input(input);
             let mut docs = Vec::new();
             while loader.check_data(py)? {
                 docs.push(loader.get_data(py)?)

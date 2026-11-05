@@ -653,3 +653,36 @@ def test_rsafeloader_uses_native_methods():
     for name in ("check_data", "get_data", "get_single_data"):
         method = getattr(ryaml.RSafeLoader, name)
         assert type(method).__name__ == "method_descriptor", (name, method)
+
+
+@pytest.mark.skipif(not hasattr(yaml, "CSafeLoader"),
+                    reason="PyYAML was built without LibYAML")
+@pytest.mark.parametrize("data", [
+    pytest.param(b"*F*<\xf4", id="fuzz-alias"),
+    pytest.param(b"|a#{\xd0", id="fuzz-block-scalar"),
+    pytest.param(codecs.BOM_UTF16_LE + "*F*<".encode("utf-16-le") + b"\x00\xd8",
+                 id="utf16"),
+    pytest.param(b"a: 1\n...\n\xff", id="after-document"),
+    pytest.param("*F*<\x07", id="str-control-character"),
+])
+def test_errors_before_bad_bytes_win(data):
+    # libyaml decodes as it reads, so an error earlier in the stream is
+    # raised before a decode error (or bad character) further on.
+    def outcome(load):
+        try:
+            return repr(load(data))
+        except Exception as e:  # noqa: BLE001
+            return type(e).__name__
+    expected = outcome(lambda d: list(yaml.load_all(d, Loader=yaml.CSafeLoader)))
+    assert outcome(lambda d: list(yaml.load_all(d, Loader=ryaml.RSafeLoader))) == expected
+    assert outcome(ryaml.loads_all) == expected
+
+
+def test_rsafeloader_does_not_read_with_pyyaml():
+    # BaseLoader's pure-Python Reader must not see the stream: it would raise
+    # PyYAML's own errors before ryaml's parser runs.
+    with pytest.raises(ryaml.ScannerError):
+        yaml.load(b"*F*<\xf4", Loader=ryaml.RSafeLoader)
+    loader = ryaml.RSafeLoader(io.StringIO("a: 1"))
+    assert isinstance(loader, yaml.BaseLoader)
+    assert loader.get_single_data() == {"a": 1}

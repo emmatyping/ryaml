@@ -12,10 +12,9 @@ use pyo3::types::{
 };
 use rustc_hash::FxBuildHasher;
 use std::collections::{HashMap, HashSet};
-use std::io::Cursor;
 
 use crate::exception;
-use crate::input::Source;
+use crate::input::{Input, Source};
 use crate::resolver;
 
 /// Only mappings with merges need a second construction step. Ordinary mappings
@@ -29,7 +28,7 @@ struct PendingMapping {
 #[pyclass(name = "_RSafeLoader", subclass)]
 pub struct RSafeLoader {
     /// Parser over an in-memory string passed by Python
-    parser: Parser<Cursor<String>>,
+    parser: Parser<Input>,
     /// Event used by internal parser
     parsed_event: Option<Event>,
     /// Anchors mapping anchor name to constructed Python object
@@ -71,8 +70,8 @@ pub struct RSafeLoader {
 #[pymethods]
 impl RSafeLoader {
     #[new]
-    pub fn new(py: Python, source: Source) -> PyResult<Self> {
-        Ok(Self::from_text(source.into_text(py)?))
+    pub fn new(source: Source) -> Self {
+        Self::from_input(source.into_input())
     }
 
     pub fn peek_token(&self) -> PyResult<()> {
@@ -1432,12 +1431,17 @@ fn is_compose_error(py: Python, err: &PyErr) -> bool {
 /// raised it (PyYAML raises `ParserError` for structural errors, for example).
 fn parse_error(py: Python, error: &libyaml_safer::Error) -> PyErr {
     let class = match error.kind() {
-        ErrorKind::Reader => "ReaderError",
+        // I/O errors only come from `Input`: bytes that did not decode.
+        ErrorKind::Reader | ErrorKind::Io => "ReaderError",
         ErrorKind::Parser => "ParserError",
         ErrorKind::Composer => "ComposerError",
-        ErrorKind::Scanner | ErrorKind::Emitter | ErrorKind::Io => "ScannerError",
+        ErrorKind::Scanner | ErrorKind::Emitter => "ScannerError",
     };
-    exception::yaml_error(py, class, format!("{}", error))
+    let message = match error.kind() {
+        ErrorKind::Io => format!("Reader error: {error}"),
+        _ => format!("{error}"),
+    };
+    exception::yaml_error(py, class, message)
 }
 
 /// Tags whose constructors take a scalar node.
@@ -1757,9 +1761,9 @@ fn parse_sexagesimal_int(s: &str) -> Result<i64, ()> {
 }
 
 impl RSafeLoader {
-    pub fn from_text(source: String) -> Self {
+    pub fn from_input(input: Input) -> Self {
         let mut parser = Parser::new();
-        parser.set_input(Cursor::new(source));
+        parser.set_input(input);
         Self {
             parser,
             parsed_event: None,
