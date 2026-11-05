@@ -7,7 +7,6 @@
 //! later from a queue (PyYAML's generator-based `state_generators`). Matching
 //! both phases keeps results and errors identical to PyYAML's SafeLoader.
 
-use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 
 use base64::Engine as _;
@@ -23,14 +22,14 @@ use rustc_hash::FxBuildHasher;
 
 use crate::exception;
 use crate::input::{Input, Source};
-use crate::resolver;
+use crate::resolver::{self, Tag};
 
 type NodeId = usize;
 
 /// A composed node, as in PyYAML's `yaml.nodes`.
 struct Node {
-    /// Resolved tag. Standard tags are static, so most nodes do not allocate.
-    tag: Cow<'static, str>,
+    /// Resolved tag. Standard tags are variants, so most nodes do not allocate.
+    tag: Tag,
     /// Anchored, so aliases can reach it more than once.
     anchored: bool,
     data: NodeData,
@@ -227,9 +226,9 @@ impl RSafeLoader {
                     check_tag_utf8(py, tag.as_deref())?;
                     let implicit = tag.as_deref().is_none_or(|t| t == "!");
                     let tag = if implicit {
-                        Cow::Borrowed(resolver::resolve_scalar_tag(&value, plain_implicit))
+                        resolver::resolve_scalar(&value, plain_implicit)
                     } else {
-                        known_tag(tag.expect("explicit tag"))
+                        Tag::from_string(tag.expect("explicit tag"))
                     };
                     let implicit = implicit && !value.ends_with('\n');
                     let node = self.add_node(anchor, tag, NodeData::Scalar { value, implicit });
@@ -238,7 +237,7 @@ impl RSafeLoader {
                 EventData::SequenceStart { anchor, tag, .. } => {
                     self.check_anchor(py, anchor.as_deref())?;
                     check_tag_utf8(py, tag.as_deref())?;
-                    let tag = collection_tag(tag, crate::TAG_SEQ);
+                    let tag = collection_tag(tag, Tag::Seq);
                     let node = self.add_node(anchor, tag, NodeData::Sequence(Vec::new()));
                     open.push((node, None));
                     None
@@ -246,7 +245,7 @@ impl RSafeLoader {
                 EventData::MappingStart { anchor, tag, .. } => {
                     self.check_anchor(py, anchor.as_deref())?;
                     check_tag_utf8(py, tag.as_deref())?;
-                    let tag = collection_tag(tag, crate::TAG_MAP);
+                    let tag = collection_tag(tag, Tag::Map);
                     let node = self.add_node(anchor, tag, NodeData::Mapping(Vec::new()));
                     open.push((node, None));
                     None
@@ -289,11 +288,11 @@ impl RSafeLoader {
     fn add_node(
         &mut self,
         anchor: Option<String>,
-        tag: Cow<'static, str>,
+        tag: Tag,
         data: NodeData,
     ) -> NodeId {
         let node = self.nodes.len();
-        self.has_merge |= tag == crate::TAG_MERGE;
+        self.has_merge |= tag == Tag::Merge;
         self.nodes.push(Node {
             tag,
             anchored: anchor.is_some(),
@@ -333,10 +332,10 @@ impl RSafeLoader {
             return Ok(object.clone_ref(py));
         }
         let remember = self.has_merge || self.nodes[node].anchored;
-        let object = match self.nodes[node].tag.as_ref() {
-            crate::TAG_SEQ | crate::TAG_OMAP | crate::TAG_PAIRS => PyList::empty(py).into_any(),
-            crate::TAG_MAP => PyDict::new(py).into_any(),
-            crate::TAG_SET => PySet::empty(py)?.into_any(),
+        let object = match self.nodes[node].tag {
+            Tag::Seq | Tag::Omap | Tag::Pairs => PyList::empty(py).into_any(),
+            Tag::Map => PyDict::new(py).into_any(),
+            Tag::Set => PySet::empty(py)?.into_any(),
             _ => {
                 let object = self.construct_scalar_object(py, node)?;
                 if remember {
@@ -355,27 +354,27 @@ impl RSafeLoader {
 
     /// The constructors for scalar tags, and the undefined-tag error.
     fn construct_scalar_object(&mut self, py: Python, node: NodeId) -> PyResult<Py<PyAny>> {
-        let tag = self.nodes[node].tag.as_ref();
+        let tag = &self.nodes[node].tag;
         if !matches!(
             tag,
-            crate::TAG_NULL
-                | crate::TAG_BOOL
-                | crate::TAG_INT
-                | crate::TAG_FLOAT
-                | crate::TAG_BINARY
-                | crate::TAG_TIMESTAMP
-                | crate::TAG_STR
+            Tag::Null
+                | Tag::Bool
+                | Tag::Int
+                | Tag::Float
+                | Tag::Binary
+                | Tag::Timestamp
+                | Tag::Str
         ) {
-            return Err(exception::constructor_error(py, unknown_tag_message(tag)));
+            return Err(exception::constructor_error(py, unknown_tag_message(tag.as_str())));
         }
         let value = self.construct_scalar(py, node)?;
-        Ok(match self.nodes[node].tag.as_ref() {
-            crate::TAG_NULL => py.None(),
-            crate::TAG_BOOL => construct_bool_direct(py, value)?,
-            crate::TAG_INT => construct_int_direct(py, value)?,
-            crate::TAG_FLOAT => construct_float_direct(py, value)?,
-            crate::TAG_BINARY => construct_binary(py, value)?,
-            crate::TAG_TIMESTAMP => match &self.nodes[node].data {
+        Ok(match self.nodes[node].tag {
+            Tag::Null => py.None(),
+            Tag::Bool => construct_bool_direct(py, value)?,
+            Tag::Int => construct_int_direct(py, value)?,
+            Tag::Float => construct_float_direct(py, value)?,
+            Tag::Binary => construct_binary(py, value)?,
+            Tag::Timestamp => match &self.nodes[node].data {
                 NodeData::Scalar { implicit, .. } => construct_timestamp(py, value, *implicit)?,
                 // PyYAML matches its timestamp regex against node.value, which
                 // for a mapping is its list of entries.
@@ -398,7 +397,7 @@ impl RSafeLoader {
                 NodeData::Mapping(entries) => {
                     let value_key = entries
                         .iter()
-                        .find(|(key, _)| self.nodes[*key].tag == crate::TAG_VALUE);
+                        .find(|(key, _)| self.nodes[*key].tag == Tag::Value);
                     match value_key {
                         Some(&(_, value)) => node = value,
                         None => return Err(expected_scalar_error(py, "mapping")),
@@ -420,8 +419,8 @@ impl RSafeLoader {
         node: NodeId,
         object: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        match self.nodes[node].tag.as_ref() {
-            crate::TAG_SEQ => {
+        match &self.nodes[node].tag {
+            Tag::Seq => {
                 let NodeData::Sequence(items) = &self.nodes[node].data else {
                     let found = self.nodes[node].data.kind();
                     return Err(exception::constructor_error(
@@ -438,17 +437,17 @@ impl RSafeLoader {
                     list.append(item)?;
                 }
             }
-            crate::TAG_MAP => {
+            Tag::Map => {
                 let dict = object.cast::<PyDict>()?;
                 self.construct_mapping(py, node, |key, value| dict.set_item(key, value))?;
             }
-            crate::TAG_SET => {
+            Tag::Set => {
                 let set = object.cast::<PySet>()?;
                 self.construct_mapping(py, node, |key, _| set.add(key))?;
             }
             tag => {
                 let pairs = object.cast::<PyList>()?;
-                let what = if tag == crate::TAG_OMAP {
+                let what = if *tag == Tag::Omap {
                     "an ordered map"
                 } else {
                     "pairs"
@@ -510,8 +509,8 @@ impl RSafeLoader {
             let Some(&(key_node, value_node)) = entries.get(index) else {
                 break;
             };
-            match self.nodes[key_node].tag.as_ref() {
-                crate::TAG_MERGE => {
+            match self.nodes[key_node].tag {
+                Tag::Merge => {
                     // Removed before recursing, which also ends merge cycles.
                     if let NodeData::Mapping(entries) = &mut self.nodes[node].data {
                         entries.remove(index);
@@ -549,8 +548,8 @@ impl RSafeLoader {
                         }
                     }
                 }
-                crate::TAG_VALUE => {
-                    self.nodes[key_node].tag = Cow::Borrowed(crate::TAG_STR);
+                Tag::Value => {
+                    self.nodes[key_node].tag = Tag::Str;
                     index += 1;
                 }
                 _ => index += 1,
@@ -654,36 +653,12 @@ fn tag_octets(tag: &str) -> Vec<u8> {
     octets
 }
 
-/// A tag string, borrowing the standard tags so they need no allocation.
-fn known_tag(tag: String) -> Cow<'static, str> {
-    const STANDARD: [&str; 14] = [
-        crate::TAG_NULL,
-        crate::TAG_BOOL,
-        crate::TAG_INT,
-        crate::TAG_FLOAT,
-        crate::TAG_STR,
-        crate::TAG_BINARY,
-        crate::TAG_TIMESTAMP,
-        crate::TAG_SEQ,
-        crate::TAG_MAP,
-        crate::TAG_SET,
-        crate::TAG_OMAP,
-        crate::TAG_PAIRS,
-        crate::TAG_MERGE,
-        crate::TAG_VALUE,
-    ];
-    match STANDARD.iter().find(|standard| **standard == tag) {
-        Some(standard) => Cow::Borrowed(standard),
-        None => Cow::Owned(tag),
-    }
-}
-
 /// A collection's tag: no tag or `!` means the default for its kind.
-fn collection_tag(tag: Option<String>, default: &'static str) -> Cow<'static, str> {
+fn collection_tag(tag: Option<String>, default: Tag) -> Tag {
     match tag {
-        None => Cow::Borrowed(default),
-        Some(tag) if tag == "!" => Cow::Borrowed(default),
-        Some(tag) => known_tag(tag),
+        None => default,
+        Some(tag) if tag == "!" => default,
+        Some(tag) => Tag::from_string(tag),
     }
 }
 

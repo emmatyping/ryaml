@@ -1,18 +1,88 @@
 //! Shared resolver for YAML 1.1 implicit tag resolution.
 //! Used by both the loader and dumper.
 
-pub const DEFAULT_SCALAR_TAG: &str = crate::TAG_STR;
 pub const DEFAULT_SEQUENCE_TAG: &str = crate::TAG_SEQ;
 pub const DEFAULT_MAPPING_TAG: &str = crate::TAG_MAP;
+
+/// A resolved tag. The standard tags are variants, so the loader matches on
+/// them without comparing strings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Tag {
+    Null,
+    Bool,
+    Int,
+    Float,
+    Str,
+    Binary,
+    Timestamp,
+    Seq,
+    Map,
+    Set,
+    Omap,
+    Pairs,
+    Merge,
+    Value,
+    Yaml,
+    Other(String),
+}
+
+impl Tag {
+    const STANDARD: [(&'static str, Tag); 15] = [
+        (crate::TAG_NULL, Tag::Null),
+        (crate::TAG_BOOL, Tag::Bool),
+        (crate::TAG_INT, Tag::Int),
+        (crate::TAG_FLOAT, Tag::Float),
+        (crate::TAG_STR, Tag::Str),
+        (crate::TAG_BINARY, Tag::Binary),
+        (crate::TAG_TIMESTAMP, Tag::Timestamp),
+        (crate::TAG_SEQ, Tag::Seq),
+        (crate::TAG_MAP, Tag::Map),
+        (crate::TAG_SET, Tag::Set),
+        (crate::TAG_OMAP, Tag::Omap),
+        (crate::TAG_PAIRS, Tag::Pairs),
+        (crate::TAG_MERGE, Tag::Merge),
+        (crate::TAG_VALUE, Tag::Value),
+        (crate::TAG_YAML, Tag::Yaml),
+    ];
+
+    /// The tag for an explicit tag string.
+    pub fn from_string(tag: String) -> Tag {
+        match Self::STANDARD.iter().find(|(name, _)| *name == tag) {
+            Some((_, standard)) => standard.clone(),
+            None => Tag::Other(tag),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Tag::Other(tag) => tag,
+            standard => standard.standard_name().expect("standard tag"),
+        }
+    }
+
+    fn standard_name(&self) -> Option<&'static str> {
+        Self::STANDARD
+            .iter()
+            .find(|(_, standard)| standard == self)
+            .map(|(name, _)| *name)
+    }
+}
+
+/// Resolve the implicit tag for a scalar value, as a string.
+pub fn resolve_scalar_tag(value: &str, plain_implicit: bool) -> &'static str {
+    resolve_scalar(value, plain_implicit)
+        .standard_name()
+        .expect("implicit tags are standard")
+}
 
 /// Resolve the implicit tag for a scalar value.
 ///
 /// When `plain_implicit` is true, the value came from a plain (unquoted) scalar
 /// and we check all YAML 1.1 implicit patterns. When false, the value was quoted
 /// and defaults to `str`.
-pub fn resolve_scalar_tag(value: &str, plain_implicit: bool) -> &'static str {
+pub fn resolve_scalar(value: &str, plain_implicit: bool) -> Tag {
     if !plain_implicit {
-        return DEFAULT_SCALAR_TAG;
+        return Tag::Str;
     }
     // PyYAML's resolver regexes end in `$`, which also matches just before a
     // final newline. Only a non-plain scalar tagged `!` can end with one (e.g.
@@ -23,24 +93,24 @@ pub fn resolve_scalar_tag(value: &str, plain_implicit: bool) -> &'static str {
     };
 
     match value {
-        "" | "~" | "null" | "Null" | "NULL" => crate::TAG_NULL,
+        "" | "~" | "null" | "Null" | "NULL" => Tag::Null,
         "yes" | "Yes" | "YES" | "no" | "No" | "NO" | "true" | "True" | "TRUE" | "false"
-        | "False" | "FALSE" | "on" | "On" | "ON" | "off" | "Off" | "OFF" => crate::TAG_BOOL,
+        | "False" | "FALSE" | "on" | "On" | "ON" | "off" | "Off" | "OFF" => Tag::Bool,
         ".inf" | ".Inf" | ".INF" | "+.inf" | "+.Inf" | "+.INF" | "-.inf" | "-.Inf" | "-.INF"
-        | ".nan" | ".NaN" | ".NAN" => crate::TAG_FLOAT,
-        "<<" => crate::TAG_MERGE,
-        "=" => crate::TAG_VALUE,
+        | ".nan" | ".NaN" | ".NAN" => Tag::Float,
+        "<<" => Tag::Merge,
+        "=" => Tag::Value,
         // Only reachable through `!`: these are indicators in plain scalars.
-        "!" | "&" | "*" => crate::TAG_YAML,
+        "!" | "&" | "*" => Tag::Yaml,
         _ => {
             if is_int(value) {
-                crate::TAG_INT
+                Tag::Int
             } else if is_float(value) {
-                crate::TAG_FLOAT
+                Tag::Float
             } else if is_timestamp(value) {
-                crate::TAG_TIMESTAMP
+                Tag::Timestamp
             } else {
-                DEFAULT_SCALAR_TAG
+                Tag::Str
             }
         }
     }
