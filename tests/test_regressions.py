@@ -552,3 +552,27 @@ def test_tagged_pair_entry_alias_constructed_by_tag(load, reference, source):
         reference(source)
     with pytest.raises(yaml.constructor.ConstructorError):
         load(source)
+
+
+@pytest.mark.parametrize("source", [
+    pytest.param("!!pairs\n- &y {{}}", id="fuzz"),
+    pytest.param("!!omap [&y {[1]: 2}]", id="list-key"),
+    pytest.param("- !!pairs [&y !!set {[1]}]\n", id="set-entry"),
+    pytest.param("- &p !!pairs [&y {[1]: 2}]\n- *p\n", id="alias-to-pairs"),
+])
+def test_anchored_pair_entry_unhashable_key(load, reference, source):
+    # The pair itself is fine; only using the entry as a mapping fails.
+    assert repr(load(source)) == repr(reference(source))
+
+
+@pytest.mark.parametrize(("source", "error"), [
+    ("- !!pairs [&y {[1]: 2}]\n- *y\n", yaml.constructor.ConstructorError),
+    ("- !!pairs [&y {[1]: 2}]\n- {<<: *y}\n", yaml.constructor.ConstructorError),
+    ("- !!pairs [&y !!set {[1]}]\n- *y\n", yaml.constructor.ConstructorError),
+    ("- !!pairs [&y {[1]: 2}]\n- &y 3\n", yaml.composer.ComposerError),
+])
+def test_anchored_pair_entry_unhashable_key_alias(load, reference, source, error):
+    with pytest.raises(error):
+        reference(source)
+    with pytest.raises(error):
+        load(source)

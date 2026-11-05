@@ -37,10 +37,11 @@ pub struct RSafeLoader {
     /// nodes: an alias to one acts as a merge key in key position and is a
     /// ConstructorError anywhere else.
     merge_anchors: HashSet<String, FxBuildHasher>,
-    /// Anchored merge sources whose tag was ignored for merging (see
-    /// `untag_merge_source`), with that tag. PyYAML constructs such a node by tag
-    /// only when an alias uses it outside a merge, which then fails.
-    merge_source_tags: HashMap<String, String, FxBuildHasher>,
+    /// Anchored nodes that ryaml used without constructing them as PyYAML would
+    /// (a merge source or pair entry whose tag was ignored, a pair entry with an
+    /// unhashable key), with the ConstructorError message PyYAML raises when an
+    /// alias uses the node as an ordinary value.
+    value_alias_errors: HashMap<String, String, FxBuildHasher>,
     /// Anchored !!omap / !!pairs merge sources: `anchors` holds the tuple list an
     /// alias gets as a value, this holds the mappings an alias merges.
     merge_source_lists: HashMap<String, Py<PyAny>, FxBuildHasher>,
@@ -77,7 +78,7 @@ impl RSafeLoader {
             parsed_event: None,
             anchors: HashMap::with_hasher(FxBuildHasher),
             merge_anchors: HashSet::with_hasher(FxBuildHasher),
-            merge_source_tags: HashMap::with_hasher(FxBuildHasher),
+            value_alias_errors: HashMap::with_hasher(FxBuildHasher),
             merge_source_lists: HashMap::with_hasher(FxBuildHasher),
             scalar_anchor_values: HashMap::with_hasher(FxBuildHasher),
             deferred_scalars: HashMap::with_hasher(FxBuildHasher),
@@ -314,7 +315,7 @@ impl RSafeLoader {
         // Clear anchors for next document
         self.anchors.clear();
         self.merge_anchors.clear();
-        self.merge_source_tags.clear();
+        self.value_alias_errors.clear();
         self.merge_source_lists.clear();
         self.scalar_anchor_values.clear();
         self.deferred_scalars.clear();
@@ -332,11 +333,8 @@ impl RSafeLoader {
         let event = self.parsed_event.take().unwrap();
         match event.data {
             EventData::Alias { anchor } => {
-                if let Some(tag) = self.merge_source_tags.get(&anchor) {
-                    Err(exception::constructor_error(
-                        py,
-                        format!("could not determine a constructor for the tag '{}'", tag),
-                    ))
+                if let Some(message) = self.value_alias_errors.get(&anchor) {
+                    Err(exception::constructor_error(py, message.clone()))
                 } else if let Some(obj) = self.anchors.get(&anchor) {
                     Ok(obj.clone_ref(py))
                 } else if let Some((tag, value, implicit)) = self.deferred_scalars.remove(&anchor) {
@@ -968,7 +966,8 @@ impl RSafeLoader {
                         entries.append(PyTuple::new(py, [key, value])?)?;
                     }
                     _ => {
-                        self.merge_source_tags.insert(anchor, stripped.unwrap());
+                        self.value_alias_errors
+                            .insert(anchor, unknown_tag_message(&stripped.unwrap()));
                         return Ok(list.into_any().unbind());
                     }
                 }
@@ -1025,7 +1024,8 @@ impl RSafeLoader {
         if let Some(anchor) = anchor
             && !(sequence && matches!(tag.as_str(), crate::TAG_OMAP | crate::TAG_PAIRS))
         {
-            self.merge_source_tags.insert(anchor.clone(), tag.clone());
+            self.value_alias_errors
+                .insert(anchor.clone(), unknown_tag_message(&tag));
         }
         Some(tag)
     }
@@ -1117,7 +1117,15 @@ impl RSafeLoader {
         self.parsed_event = None;
         if let (Some(mapping), Some(anchor)) = (wrapper, anchor) {
             // The wrapper is a mapping node if referenced elsewhere by an alias.
-            mapping.set_item(&key, &value)?;
+            // A pair key may be unhashable; PyYAML only fails if an alias then
+            // uses the entry as a mapping (or set).
+            if mapping.set_item(&key, &value).is_err() {
+                self.anchors.remove(&anchor);
+                self.skipped_anchors.insert(anchor.clone());
+                self.value_alias_errors
+                    .insert(anchor, "found unhashable key".to_string());
+                return Ok(PyTuple::new(py, [key, value])?.into_any().unbind());
+            }
             // PyYAML reads the entry by node kind and ignores its tag, but an
             // alias used as a value is constructed by that tag.
             match tag.as_deref() {
@@ -1131,7 +1139,8 @@ impl RSafeLoader {
                     self.anchors.insert(anchor, set.into_any().unbind());
                 }
                 Some(t) => {
-                    self.merge_source_tags.insert(anchor, t.to_string());
+                    self.value_alias_errors
+                        .insert(anchor, unknown_tag_message(t));
                 }
             }
         }
@@ -1383,6 +1392,10 @@ fn construct_python_scalar(
         Ok(py.import("ryaml._scalars")?.getattr(name)?.unbind())
     })?;
     Ok(constructor.bind(py).call1((value,))?.unbind())
+}
+
+fn unknown_tag_message(tag: &str) -> String {
+    format!("could not determine a constructor for the tag '{}'", tag)
 }
 
 fn single_document_error(py: Python) -> PyErr {
