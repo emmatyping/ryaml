@@ -262,13 +262,17 @@ impl RSafeDumper {
     ) -> PyResult<Self> {
         let mut ew = EmitterWrapper::new();
 
-        // Like PyYAML's CEmitter: exactly "utf-16-le" or "utf-16-be" selects
-        // UTF-16, and any other encoding means UTF-8 bytes.
+        // Like PyYAML's CEmitter: it writes str (so UTF-8) to a stream with an
+        // `encoding` attribute, or when no encoding is given. Otherwise it
+        // writes bytes: UTF-16 for exactly "utf-16-le" or "utf-16-be", UTF-8
+        // for any other encoding.
+        let dump_unicode = stream.bind(py).hasattr("encoding")? || encoding.is_none();
         let enc = match encoding
             .as_ref()
             .and_then(|e| e.extract::<String>().ok())
             .as_deref()
         {
+            _ if dump_unicode => Encoding::Utf8,
             Some("utf-16-le") => Encoding::Utf16Le,
             Some("utf-16-be") => Encoding::Utf16Be,
             _ => Encoding::Utf8,
@@ -297,7 +301,6 @@ impl RSafeDumper {
             ew.emitter_mut().set_break(brk);
         }
 
-        let dump_unicode = encoding.is_none();
         let tags = match tags {
             Some(tags) => tags
                 .iter()

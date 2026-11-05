@@ -317,3 +317,31 @@ def test_documents_written_before_close():
         instance.represent("b")
         streams.append(stream.writes)
     assert streams[1] == streams[0]
+
+
+class _BinaryStream(_RecordingStream):
+    pass
+
+
+class _TextStream(_RecordingStream):
+    encoding = None
+
+
+@pytest.mark.skipif(not hasattr(yaml, "CSafeDumper"), reason="PyYAML was built without LibYAML")
+@pytest.mark.parametrize("make_stream", [
+    __import__("io").StringIO, __import__("io").BytesIO, _BinaryStream, _TextStream,
+], ids=["StringIO", "BytesIO", "no-encoding-attribute", "encoding-attribute"])
+@pytest.mark.parametrize("encoding", [None, "utf-8", "utf-16-le"])
+def test_text_or_bytes_chosen_by_stream_like_pyyaml(make_stream, encoding):
+    # CEmitter writes str (UTF-8) to a stream with an `encoding` attribute, or
+    # without an encoding; otherwise bytes in the requested encoding.
+    def run(dumper):
+        stream = make_stream()
+        try:
+            yaml.dump_all([{"a": "\xe9"}], stream, Dumper=dumper, encoding=encoding)
+        except Exception as e:  # noqa: BLE001
+            return type(e).__name__
+        if hasattr(stream, "getvalue"):
+            return stream.getvalue()
+        return stream.writes
+    assert run(ryaml.RSafeDumper) == run(yaml.CSafeDumper)
