@@ -878,6 +878,8 @@ def test_tag_uri_escapes_that_are_not_utf8(load, reference, source, error):
     assert yaml.load("%TAG !e! tag:%c1%88\n--- x", Loader=ryaml.RSafeLoader) == "x"
 
 
+@pytest.mark.skipif(not hasattr(yaml, "CSafeLoader"),
+                    reason="PyYAML was built without LibYAML")
 @pytest.mark.parametrize("source", [
     pytest.param("! '!'", id="yaml-tag-bang"),
     pytest.param('! "&"', id="yaml-tag-ampersand"),
