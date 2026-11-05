@@ -349,7 +349,20 @@ impl RSafeDumper {
 
     fn represent_float(&self, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
         let f: f64 = data.extract()?;
-        let value = format_float(f);
+        let value = if f.is_nan() {
+            ".nan".to_string()
+        } else if f.is_infinite() {
+            if f > 0.0 { ".inf" } else { "-.inf" }.to_string()
+        } else {
+            // PyYAML: repr(data).lower(), with ".0" added before an exponent
+            // when there is no decimal point (repr(1e17) is "1e+17").
+            let value = data.repr()?.to_str()?.to_lowercase();
+            if !value.contains('.') && value.contains('e') {
+                value.replacen('e', ".0e", 1)
+            } else {
+                value
+            }
+        };
         Ok(self.make_scalar(crate::TAG_FLOAT, &value, None))
     }
 
@@ -659,37 +672,6 @@ fn char_to_scalar_style(style: Option<char>) -> ScalarStyle {
         Some('>') => ScalarStyle::Folded,
         _ => ScalarStyle::Any,
     }
-}
-
-/// Format a float matching pyyaml's SafeRepresenter.represent_float
-fn format_float(f: f64) -> String {
-    if f.is_nan() {
-        return ".nan".to_string();
-    }
-    if f.is_infinite() {
-        return if f.is_sign_positive() {
-            ".inf"
-        } else {
-            "-.inf"
-        }
-        .to_string();
-    }
-    // Use Python's repr-like formatting
-    let mut value = format!("{}", f);
-    // Ensure lower case for scientific notation
-    value = value.to_lowercase();
-    // If there's no decimal point but there's an 'e', add '.0' before it
-    if !value.contains('.') && value.contains('e') {
-        value = value.replacen('e', ".0e", 1);
-    }
-    // If there's no decimal point and no 'e', it's an integer-looking float
-    // Python repr would show e.g. "1.0", but Rust format! shows "1" for 1.0f64
-    // Actually Rust shows "1" only for integers; for f64 it shows e.g. "1.5"
-    // But for whole numbers like 1.0, Rust shows "1" with {} formatter
-    if !value.contains('.') && !value.contains('e') {
-        value.push_str(".0");
-    }
-    value
 }
 
 /// Try to sort (key, value) pairs by key. Silently fails on TypeError (matching pyyaml).

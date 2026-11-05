@@ -72,3 +72,12 @@ def test_encodings_like_pyyaml(reference, encoding):
     # Only "utf-16-le" and "utf-16-be" select UTF-16 (with a byte order
     # mark); any other encoding gives UTF-8 bytes.
     assert_same_dump(reference, [{"a": "\xe9"}, None, ["x"]], encoding=encoding)
+
+
+@pytest.mark.parametrize("value", [
+    1e16, 1e17, 123456789012345678.0, 1.5e300, 1e-4, 1e-5, 0.0001234, 5e-324,
+    1.7976931348623157e308, -0.0, 0.1, 1.0, -2.5e-07, 1e22, 9999999999999998.0,
+])
+def test_floats_like_python_repr(reference, value):
+    # PyYAML writes repr(value).lower(), adding ".0" before a bare exponent.
+    assert_same_dump(reference, [value])
