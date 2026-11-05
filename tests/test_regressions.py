@@ -576,3 +576,20 @@ def test_anchored_pair_entry_unhashable_key_alias(load, reference, source, error
         reference(source)
     with pytest.raises(error):
         load(source)
+
+
+@pytest.mark.parametrize(("source", "error"), [
+    ("!- &entry\n- *entry", yaml.constructor.ConstructorError),
+    ("&e !o {a: *e}", yaml.constructor.ConstructorError),
+    ("&m !!str {a: *m}", yaml.constructor.ConstructorError),
+    ("&s !!set [*s]", yaml.constructor.ConstructorError),
+    ("[&e !o [1], &e 2]", yaml.composer.ComposerError),
+    ("&e !o [1, *u]", yaml.composer.ComposerError),
+])
+def test_failed_collection_keeps_its_anchor(load, reference, source, error):
+    # A node that fails to construct still holds its anchor (PyYAML composed
+    # it first), so aliases to it are defined and duplicates still count.
+    for loader in (reference, load):
+        with pytest.raises(error) as info:
+            loader(source)
+        assert type(info.value).__name__ == error.__name__

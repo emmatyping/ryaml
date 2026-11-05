@@ -231,6 +231,17 @@ impl RSafeLoader {
             || self.skipped_anchors.contains(name)
     }
 
+    /// A node that fails to construct still holds its anchor (PyYAML's composer
+    /// registered it first), so a duplicate is still an error and aliases to it
+    /// inside the rest of the document are not "undefined".
+    fn reserve_failed_anchor(&mut self, py: Python, anchor: Option<String>) -> PyResult<()> {
+        if let Some(anchor) = anchor {
+            self.check_new_anchor(py, &anchor)?;
+            self.skipped_anchors.insert(anchor);
+        }
+        Ok(())
+    }
+
     fn check_new_anchor(&self, py: Python, name: &str) -> PyResult<()> {
         if self.is_known_anchor(name) {
             return Err(exception::composer_error(
@@ -453,10 +464,8 @@ impl RSafeLoader {
                 "!" | crate::TAG_SEQ | crate::TAG_OMAP | crate::TAG_PAIRS
             )
         {
-            return Err(exception::constructor_error(
-                py,
-                format!("could not determine a constructor for the tag '{}'", t),
-            ));
+            self.reserve_failed_anchor(py, anchor)?;
+            return Err(exception::constructor_error(py, unknown_tag_message(t)));
         }
         let pairs = matches!(tag.as_deref(), Some(crate::TAG_OMAP | crate::TAG_PAIRS));
         let list = PyList::empty(py);
@@ -535,10 +544,8 @@ impl RSafeLoader {
             && t != crate::TAG_MAP
             && t != crate::TAG_SET
         {
-            return Err(exception::constructor_error(
-                py,
-                format!("could not determine a constructor for the tag '{}'", t),
-            ));
+            self.reserve_failed_anchor(py, anchor)?;
+            return Err(exception::constructor_error(py, unknown_tag_message(t)));
         }
 
         let dict = PyDict::new(py);
@@ -689,9 +696,8 @@ impl RSafeLoader {
             self.scalar_mappings_in_progress.push(anchor.clone());
         }
         let value = self.mapping_value_scalar(py, false);
-        if let Some(anchor) = &anchor {
+        if anchor.is_some() {
             self.scalar_mappings_in_progress.pop();
-            self.skipped_anchors.remove(anchor);
         }
         let Some(value) = value? else {
             return Err(expected_scalar_error(py, "mapping"));
@@ -701,6 +707,11 @@ impl RSafeLoader {
             return Err(PyTypeError::new_err(
                 "expected string or bytes-like object, got 'list'",
             ));
+        }
+        // The anchor stays reserved on the errors above, as PyYAML's composer
+        // registered it; construct_scalar_direct registers it properly.
+        if let Some(anchor) = &anchor {
+            self.skipped_anchors.remove(anchor);
         }
         self.construct_scalar_direct(py, anchor, Some(tag), value, false)
     }
