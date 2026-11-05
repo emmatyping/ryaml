@@ -29,6 +29,19 @@ fuzz_preload="$fuzz_runtime${LD_PRELOAD:+:$LD_PRELOAD}"
 # (/usr/bin/env python3), so put the fuzzing interpreter first on PATH.
 export PATH="$(dirname -- "$fuzz_python"):$PATH"
 
+# `--dump` fuzzes the dumper (fuzz/dump.py) instead of the loader
+# (fuzz/run.py). Its inputs are byte streams decoded into Python values, not
+# YAML, so it has its own corpus.
+target=fuzz/run.py
+if [[ "${1:-}" == "--dump" ]]; then
+    shift
+    target=fuzz/dump.py
+    mkdir -p fuzz/dump-corpus
+    if [[ $# -eq 0 ]]; then
+        set -- fuzz/dump-corpus -fork=8 -max_len=1024 -use_value_profile=1
+    fi
+fi
+
 if [[ $# -eq 0 ]]; then
     set -- fuzz/corpus fuzz/seed -fork=8 -max_len=2048 -dict=fuzz/yaml.dict -use_value_profile=1
 fi
@@ -39,4 +52,4 @@ fi
 # address randomization for the fuzzer process to avoid that. LD_PRELOAD is
 # applied via env *inside* setarch: setarch itself still runs with ASLR, so
 # preloading the runtime into it would hit the same crash.
-exec setarch "$(uname -m)" -R env LD_PRELOAD="$fuzz_preload" "$fuzz_python" fuzz/run.py -artifact_prefix=target/fuzz/artifacts/ "$@"
+exec setarch "$(uname -m)" -R env LD_PRELOAD="$fuzz_preload" "$fuzz_python" "$target" -artifact_prefix=target/fuzz/artifacts/ "$@"

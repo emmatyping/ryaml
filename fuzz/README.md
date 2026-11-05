@@ -50,6 +50,37 @@ detection for the Python interpreter. See the
 for runtime details. Set `RYAML_FUZZ_PYTHON` to use another prepared fuzzing
 environment, or `ASAN_OPTIONS` to override sanitizer options.
 
+## Dumping
+
+`fuzz/dump.py` checks that ryaml's dumper writes exactly the same bytes as
+PyYAML's CSafeDumper. Hypothesis generates dumper options (flow style, scalar
+style, canonical, indent, width, Unicode, line breaks, encodings, document
+markers, version and tag directives, key sorting) and one to three documents of
+Python values: tricky strings (resolver look-alikes, indicators, line breaks,
+BOMs, lone surrogates, long text for folding), ints and floats of every size,
+dates and datetimes with arbitrary UTC offsets, bytes, sets, tuples, and lists
+and dicts that are shared or recursive (anchors and aliases). Some values are
+ones PyYAML's SafeRepresenter refuses (subclasses such as `OrderedDict`,
+frozensets). Each is dumped with `yaml.dump_all` through `CSafeDumper` and
+`RSafeDumper`, and with `ryaml.dumps` against CSafeDumper with
+`sort_keys=False`. Outputs must be identical; when PyYAML raises, ryaml must
+raise the same exception class or a subclass of it.
+
+Fuzz it with libFuzzer (its inputs are Hypothesis choice sequences, kept in
+`fuzz/dump-corpus`):
+
+```sh
+./fuzz/run.sh --dump                                   # fuzz/dump-corpus -fork=8 -max_len=1024
+./fuzz/run.sh --dump fuzz/dump-corpus -fork=2 -max_len=4096
+```
+
+Or run it as an ordinary Hypothesis test in the development environment, which
+shrinks each distinct failure to a minimal example:
+
+```sh
+python -m pytest fuzz/dump.py
+```
+
 ## Coverage
 
 To see which Rust code the corpus reaches, and so where new seeds would help:
