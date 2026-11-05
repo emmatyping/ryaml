@@ -204,6 +204,22 @@ def test_explicit_tag_on_value_mapping(kind, data):
     assert_matches_pyyaml(f"k: !!{kind} {{=: {single_quoted(text)}}}\n")
 
 
+def double_quoted(text):
+    return '"' + "".join(
+        {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\t": "\\t"}.get(c, c) for c in text
+    ) + '"'
+
+
+@pytest.mark.parametrize("kind", sorted(STRATEGIES))
+@SETTINGS
+@given(data=st.data())
+def test_non_specific_tag(kind, data):
+    """`! "text"` resolves a quoted scalar like a plain one. PyYAML's resolver
+    regexes end in `$`, which also matches before a final newline."""
+    text = data.draw(STRATEGIES[kind]) + data.draw(st.sampled_from(["", "", "\n", "\n\n"]))
+    assert_matches_pyyaml(f"k: ! {double_quoted(text)}\n")
+
+
 def _plain_safe(text):
     """Text that stays a single plain scalar in `k: <text>`."""
     if text != text.strip() or "\n" in text or "#" in text or ": " in text:

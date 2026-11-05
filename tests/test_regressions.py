@@ -876,3 +876,39 @@ def test_tag_uri_escapes_that_are_not_utf8(load, reference, source, error):
     if error is UnicodeDecodeError:
         assert messages[0] == messages[1]
     assert yaml.load("%TAG !e! tag:%c1%88\n--- x", Loader=ryaml.RSafeLoader) == "x"
+
+
+@pytest.mark.parametrize("source", [
+    pytest.param("! '!'", id="yaml-tag-bang"),
+    pytest.param('! "&"', id="yaml-tag-ampersand"),
+    pytest.param("{! '*': 1}", id="yaml-tag-key"),
+    pytest.param("! '!'x", id="before-next-document-error"),
+    pytest.param("! |\n 12\n", id="literal-int"),
+    pytest.param("! >\n 1.5\n", id="folded-float"),
+    pytest.param("! '12\n\n'", id="single-quoted-int"),
+    pytest.param('! "2001-12-14 21:59:43.10\\n"', id="timestamp"),
+    pytest.param('! "~\\n"', id="null"),
+    pytest.param("! |\n  !\n", id="yaml-tag-block"),
+    pytest.param("! |\n .inf\n", id="float-value-error"),
+    pytest.param("! |\n true\n", id="bool-key-error"),
+    pytest.param("<<: ! |\n  <<\n", id="merge"),
+    pytest.param("! |+\n 12\n\n", id="two-newlines-stay-str"),
+    pytest.param('! "\\n"', id="lone-newline-stays-str"),
+])
+def test_non_specific_tag_resolves_like_pyyaml(source):
+    # `!` makes libyaml set plain_implicit, so PyYAML resolves quoted and block
+    # scalars too: `!`, `&` and `*` resolve to tag:yaml.org,2002:yaml, and its
+    # regexes' `$` also matches before a final newline.
+    def outcome(load):
+        try:
+            return repr(load(source))
+        except Exception as e:  # noqa: BLE001
+            return type(e).__name__
+    expected = outcome(lambda s: list(yaml.load_all(s, Loader=yaml.CSafeLoader)))
+    assert outcome(lambda s: list(yaml.load_all(s, Loader=ryaml.RSafeLoader))) == expected
+    assert outcome(ryaml.loads_all) == expected
+
+
+@pytest.mark.parametrize("value", ["!", "&", "*", "12\n", "true\n", "<<\n", "2001-12-14\n"])
+def test_dump_quotes_like_pyyaml_resolver(value):
+    assert ryaml.dumps(value) == yaml.safe_dump(value)

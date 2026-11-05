@@ -39,8 +39,10 @@ struct Node {
 enum NodeData {
     Scalar {
         value: String,
-        /// The tag was resolved implicitly (no tag, or `!`). ryaml's timestamp
-        /// constructor uses this to take a fast path for the YAML grammar.
+        /// The tag was resolved implicitly (no tag, or `!`) from the whole
+        /// value, so it matches the resolver's grammar exactly. ryaml's
+        /// timestamp constructor uses this to take a fast path. False for a
+        /// value ending in a newline, which PyYAML's regexes also accept.
         implicit: bool,
     },
     Sequence(Vec<NodeId>),
@@ -229,6 +231,7 @@ impl RSafeLoader {
                     } else {
                         known_tag(tag.expect("explicit tag"))
                     };
+                    let implicit = implicit && !value.ends_with('\n');
                     let node = self.add_node(anchor, tag, NodeData::Scalar { value, implicit });
                     Some(node)
                 }
