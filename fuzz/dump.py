@@ -239,7 +239,16 @@ def documents(draw):
         shared.append(date)  # dates are anchored when shared, unlike str
         return date
 
-    return [value(0) for _ in range(draw(st.integers(1, 3)))]
+    def document():
+        doc = value(0)
+        if draw(st.integers(0, 30)) == 0:
+            # Deep enough for PyYAML's recursive representer to reach the
+            # recursion limit (about 330 levels by default).
+            for _ in range(draw(st.integers(250, 400))):
+                doc = {"k": doc} if draw(st.booleans()) else [doc]
+        return doc
+
+    return [document() for _ in range(draw(st.integers(1, 3)))]
 
 
 # Keyword arguments for yaml.dump_all, each sometimes left out.
