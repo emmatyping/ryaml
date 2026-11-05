@@ -4,7 +4,10 @@
 use std::collections::{HashMap, HashSet};
 
 use base64::Engine as _;
-use libyaml_safer::{Emitter, Encoding, Event, MappingStyle, ScalarStyle, SequenceStyle};
+use libyaml_safer::{
+    Emitter, Encoding, Event, MappingStyle, ScalarStyle, SequenceStyle, TagDirective,
+    VersionDirective,
+};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
@@ -111,6 +114,10 @@ pub struct RSafeDumper {
 
     // Serializer config
     document_start_implicit: bool,
+    /// `%YAML` and `%TAG` directives for every document (PyYAML's
+    /// `use_version` and `use_tags`), tags in the dict's order.
+    version: Option<VersionDirective>,
+    tags: Vec<TagDirective>,
     document_end_implicit: bool,
 
     // Serializer state (reset per document)
@@ -153,7 +160,7 @@ impl RSafeDumper {
         explicit_start: Option<bool>,
         explicit_end: Option<bool>,
         version: Option<(i32, i32)>,
-        tags: Option<HashMap<String, String>>,
+        tags: Option<Bound<'_, PyDict>>,
         sort_keys: bool,
     ) -> PyResult<Self> {
         let mut ew = EmitterWrapper::new();
@@ -194,6 +201,18 @@ impl RSafeDumper {
         }
 
         let dump_unicode = encoding.is_none();
+        let tags = match tags {
+            Some(tags) => tags
+                .iter()
+                .map(|(handle, prefix)| {
+                    Ok(TagDirective {
+                        handle: handle.extract()?,
+                        prefix: prefix.extract()?,
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()?,
+            None => Vec::new(),
+        };
 
         let default_style_char = default_style.and_then(|s| s.chars().next());
 
@@ -203,6 +222,8 @@ impl RSafeDumper {
             dump_unicode,
             closed: -1,
             document_start_implicit: !explicit_start.unwrap_or(false),
+            version: version.map(|(major, minor)| VersionDirective { major, minor }),
+            tags,
             document_end_implicit: !explicit_end.unwrap_or(false),
             serialized_nodes: HashSet::new(),
             anchors: HashMap::new(),
@@ -556,8 +577,8 @@ impl RSafeDumper {
     fn serialize(&mut self, py: Python, node: NodeId) -> PyResult<()> {
         self.emitter
             .emit(Event::document_start(
-                None,
-                &[],
+                self.version,
+                &self.tags,
                 self.document_start_implicit,
             ))
             .map_err(|e| exception::emitter_error(py, e))?;
@@ -767,6 +788,8 @@ pub fn dumps_to_string(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<String> {
         dump_unicode: true,
         closed: -1,
         document_start_implicit: true,
+        version: None,
+        tags: Vec::new(),
         document_end_implicit: true,
         serialized_nodes: HashSet::new(),
         anchors: HashMap::new(),

@@ -137,3 +137,17 @@ def test_lone_surrogates_fail_when_written(reference, docs):
     # PyYAML's emitter encodes each str when it writes it, so a representer
     # error anywhere in the document comes first.
     assert_same_dump(reference, docs)
+
+
+@pytest.mark.parametrize("options", [
+    pytest.param({"version": (1, 1)}, id="version-1.1"),
+    pytest.param({"version": (1, 2)}, id="version-1.2"),
+    pytest.param({"version": (2, 0)}, id="version-2.0"),
+    pytest.param({"tags": {"!e!": "tag:example.com,2000:", "!b!": "x:"}}, id="tags"),
+    pytest.param({"tags": {"!y!": "tag:yaml.org,2002:"}}, id="tags-shorten"),
+    pytest.param({"version": (1, 1), "tags": {"!a!": "p"}, "explicit_end": True},
+                 id="both"),
+])
+def test_version_and_tag_directives(reference, options):
+    # PyYAML passes version and tags to every DOCUMENT-START event.
+    assert_same_dump(reference, ["a", {"b": b"\x00", "s": {1}}], **options)
