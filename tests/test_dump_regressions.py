@@ -533,3 +533,35 @@ def test_big_ints_like_pyyaml(reference, value):
     ryaml.dump(stream, {"t1": value})
     assert stream.getvalue() == yaml.safe_dump({"t1": value})
     assert ryaml.loads(stream.getvalue()) == {"t1": value}
+
+
+@pytest.mark.skipif(not hasattr(yaml, "CSafeDumper"), reason="PyYAML was built without LibYAML")
+@pytest.mark.parametrize("ops", [
+    ("bad", "bad", "bad"),
+    ("bad", "good", "close"),
+    ("badlist", "badlist", "good"),
+], ids="-".join)
+def test_serializer_state_kept_after_a_failed_document(ops):
+    # CEmitter resets its anchors and written nodes only after a document
+    # succeeds, so a document after a failed one (reusing its nodes) sees them.
+    import io
+
+    def run(dumper):
+        shared = ["s"]
+        docs = {
+            "bad": {"\udd3d": "!", (("", ("", "")), "  "): False},
+            "badlist": ["a", ["\ud800", shared], shared],
+            "good": {"a": [1, shared], "b": shared},
+        }
+        stream = io.StringIO()
+        instance = dumper(stream)
+        instance.open()
+        results = []
+        for op in ops:
+            try:
+                instance.represent(docs[op]) if op in docs else getattr(instance, op)()
+                results.append(None)
+            except Exception as e:  # noqa: BLE001
+                results.append(type(e).__name__)
+        return results, stream.getvalue()
+    assert run(ryaml.RSafeDumper) == run(yaml.CSafeDumper)

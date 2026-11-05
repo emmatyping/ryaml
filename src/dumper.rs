@@ -852,10 +852,14 @@ impl RSafeDumper {
             Event::document_start(version, &tags, self.document_start_implicit),
         )?;
 
-        self.node_states.clear();
+        // Like CEmitter, the anchors and written nodes of a document that
+        // failed are kept (they are reset only after a document succeeds), so
+        // a later document reusing its nodes sees them; then the anchor pass
+        // is needed even if nothing repeats in this one.
+        let carried_over = !self.node_states.is_empty();
         self.node_states
             .resize(self.nodes.len(), NodeState::default());
-        if self.has_aliases {
+        if self.has_aliases || carried_over {
             self.anchor_node(py, node, 0)?;
         }
         self.serialize_node(py, node, 0)?;
@@ -863,6 +867,7 @@ impl RSafeDumper {
         self.emit(py, Event::document_end(self.document_end_implicit))?;
 
         // Reset serializer state
+        self.node_states.clear();
         self.last_alias_id = 0;
         Ok(())
     }
