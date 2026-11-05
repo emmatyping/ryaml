@@ -162,3 +162,20 @@ def test_characters_beyond_the_bmp_are_escaped(reference, value, allow_unicode):
     # libyaml's IS_PRINTABLE only accepts characters of up to three UTF-8
     # bytes, so even with allow_unicode, U+10000 and above are escaped.
     assert_same_dump(reference, [value], allow_unicode=allow_unicode)
+
+
+@pytest.mark.parametrize("mapping", [
+    pytest.param({"b": 1, "a": 2, "c": 3}, id="sortable"),
+    pytest.param({("", ""): "", " ": "", "": ""}, id="tuple-and-str"),
+    pytest.param({"b": 1, None: 2, "a": 3}, id="none-and-str"),
+    pytest.param({2: 1, "a": 2, 1: 3}, id="int-and-str"),
+    pytest.param({__import__("datetime").datetime(2001, 1, 1): 1,
+                  __import__("datetime").date(2000, 1, 1): 2}, id="datetime-and-date"),
+    pytest.param({float("nan"): 1, 1.5: 2, float("nan"): 3, 0.5: 4}, id="nan"),
+    pytest.param({True: 1, 0: 2, 2.5: 3}, id="bool-int-float"),
+])
+@pytest.mark.parametrize("sort_keys", [True, False])
+def test_keys_sorted_like_python_sorted(reference, mapping, sort_keys):
+    # PyYAML sorts the items with sorted() and keeps their order if that raises
+    # TypeError; a partial sort would differ.
+    assert_same_dump(reference, [mapping], sort_keys=sort_keys)

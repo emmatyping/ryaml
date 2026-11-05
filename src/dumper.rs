@@ -466,14 +466,7 @@ impl RSafeDumper {
         data: &Bound<'_, PyAny>,
         alias_key: Option<usize>,
     ) -> PyResult<NodeId> {
-        let dict = data.cast::<PyDict>()?;
-        let mut pairs: Vec<(Py<PyAny>, Py<PyAny>)> =
-            dict.iter().map(|(k, v)| (k.unbind(), v.unbind())).collect();
-
-        if self.sort_keys {
-            // Sort by key, ignoring errors (matching pyyaml which wraps in try/except TypeError)
-            let _ = try_sort_pairs(py, &mut pairs);
-        }
+        let pairs = self.mapping_items(py, data.cast::<PyDict>()?.items())?;
 
         let node = self.register(
             alias_key,
@@ -485,9 +478,10 @@ impl RSafeDumper {
         );
         let mut items = Vec::new();
         let mut best_style = true;
-        for (k, v) in &pairs {
-            let key_node = self.represent_data(py, k.bind(py))?;
-            let val_node = self.represent_data(py, v.bind(py))?;
+        for pair in pairs.iter() {
+            let (k, v) = pair.extract::<(Bound<'_, PyAny>, Bound<'_, PyAny>)>()?;
+            let key_node = self.represent_data(py, &k)?;
+            let val_node = self.represent_data(py, &v)?;
             best_style &= self.is_plain_scalar(key_node) && self.is_plain_scalar(val_node);
             items.push((key_node, val_node));
         }
@@ -530,6 +524,24 @@ impl RSafeDumper {
     }
 
     // ── Helpers ──
+
+    /// PyYAML's `represent_mapping`: the (key, value) items, sorted with
+    /// Python's `sorted` when `sort_keys` is set, or left in order if that
+    /// raises `TypeError` (keys that cannot be compared).
+    fn mapping_items<'py>(
+        &self,
+        py: Python<'py>,
+        items: Bound<'py, PyList>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        if !self.sort_keys {
+            return Ok(items);
+        }
+        match py.import("builtins")?.getattr("sorted")?.call1((&items,)) {
+            Ok(sorted) => Ok(sorted.cast_into::<PyList>()?),
+            Err(e) if e.is_instance_of::<pyo3::exceptions::PyTypeError>(py) => Ok(items),
+            Err(e) => Err(e),
+        }
+    }
 
     /// Add a collection node and record it as `alias_key`'s node before its
     /// items are represented, like PyYAML's `represent_sequence` and
@@ -749,30 +761,6 @@ fn char_to_scalar_style(style: Option<char>) -> ScalarStyle {
         Some('>') => ScalarStyle::Folded,
         _ => ScalarStyle::Any,
     }
-}
-
-/// Try to sort (key, value) pairs by key. Silently fails on TypeError (matching pyyaml).
-fn try_sort_pairs(py: Python, pairs: &mut [(Py<PyAny>, Py<PyAny>)]) -> PyResult<()> {
-    // Use Python's comparison to sort keys
-    pairs.sort_by(|a, b| {
-        a.0.bind(py)
-            .lt(b.0.bind(py))
-            .and_then(|lt| {
-                if lt {
-                    Ok(std::cmp::Ordering::Less)
-                } else {
-                    a.0.bind(py).gt(b.0.bind(py)).map(|gt| {
-                        if gt {
-                            std::cmp::Ordering::Greater
-                        } else {
-                            std::cmp::Ordering::Equal
-                        }
-                    })
-                }
-            })
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    Ok(())
 }
 
 // ── Fast-path for dumps() ────────────────────────────────────────────────────
