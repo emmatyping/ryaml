@@ -203,3 +203,42 @@ def test_folded_scalar_line_breaks(reference, value):
     # libyaml adds a blank line before a break only when the text after the
     # run of breaks is not blank (it looks at the first non-break character).
     assert_same_dump(reference, [value], default_style=">")
+
+
+def _nested(depth, leaf, kind):
+    value = leaf
+    for _ in range(depth):
+        value = {"k": value} if kind == "dict" else [value]
+    return value
+
+
+def _dump_outcome(dumper, value):
+    try:
+        yaml.dump_all([value], Dumper=dumper)
+        return "ok"
+    except Exception as e:  # noqa: BLE001
+        return type(e).__name__
+
+
+@pytest.mark.skipif(not hasattr(yaml, "CSafeDumper"), reason="PyYAML was built without LibYAML")
+@pytest.mark.parametrize("kind", ["list", "dict"])
+@pytest.mark.parametrize("leaf", ["x", [], object()], ids=["scalar", "empty", "unrepresentable"])
+def test_deep_nesting_fails_where_pyyaml_does(kind, leaf):
+    # PyYAML's representer is recursive Python (three frames per level), so it
+    # raises RecursionError past a depth set by the recursion limit and the
+    # caller's stack. Both dumpers are called from the same place here.
+    outcomes = {
+        depth: (_dump_outcome(yaml.CSafeDumper, _nested(depth, leaf, kind)),
+                _dump_outcome(ryaml.RSafeDumper, _nested(depth, leaf, kind)))
+        for depth in range(250, 340)
+    }
+    assert {d: r for d, (r, _) in outcomes.items()} == {d: a for d, (_, a) in outcomes.items()}
+    assert {r for r, _ in outcomes.values()} >= {"RecursionError"}
+
+
+def test_very_deep_nesting_raises_instead_of_crashing():
+    value = _nested(200_000, "x", "list")
+    with pytest.raises(RecursionError):
+        ryaml.dumps(value)
+    with pytest.raises(RecursionError):
+        yaml.dump(value, Dumper=ryaml.RSafeDumper)
