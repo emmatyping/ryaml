@@ -52,6 +52,9 @@ SPECIAL_STRINGS = [
     "\n", "\n\n", "a\n", "\na", "a\nb", "a\n\nb", "a \nb", "a\n b", "\r", "a\r\nb",
     "\x85", "\u2028", "\u2029", "\ufeff", "\ufeffa", "\x00", "\x07", "\x1b", "\x7f",
     "\x9f", "\xa0", "\u00e9", "\u4e2d\u6587", "\U0001f600", "\U0010ffff", "\ufffe", "\ud800", "a\udfffb",
+    # Around libyaml's printable ranges (it escapes everything past the BMP).
+    "\u00bf\u00c0", "\ud7ff", "\ue000", "\uefff\uf000", "\ufffd", "\U00010000",
+    "a\U0001f600 b", "\u0085", "\u00ad", "\u2028a", "\u3000",
 ]
 SPECIAL_FLOATS = [
     0.0, -0.0, 1.0, -1.0, 0.5, 0.1, 1e-7, 1e16, 1e17, 1e22, 123456789012345678.0,
