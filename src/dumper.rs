@@ -182,6 +182,8 @@ pub struct RSafeDumper {
     closed: i8,
 
     // Serializer config
+    /// The emitter writes every tag (canonical output).
+    canonical: bool,
     document_start_implicit: bool,
     /// The `version` and `tags` options (PyYAML's `use_version` and
     /// `use_tags`), turned into `%YAML` and `%TAG` directives for each document
@@ -326,6 +328,7 @@ impl RSafeDumper {
         Ok(RSafeDumper {
             emitter: ew,
             closed: -1,
+            canonical: canonical.0,
             document_start_implicit: !explicit_start.0,
             version,
             tags,
@@ -824,15 +827,17 @@ impl RSafeDumper {
         match &self.nodes[node] {
             RepNode::Scalar { tag, value, style } => {
                 let value = value.as_ref().map_err(|e| e.clone_ref(py))?;
-                let detected_tag = resolver::resolve_scalar_tag(value, true);
-                let default_tag = resolver::resolve_scalar_tag(value, false);
-                let plain_implicit = *tag == detected_tag;
-                let quoted_implicit = *tag == default_tag;
+                let plain_implicit = *tag == resolver::resolve_scalar_tag(value, true);
+                // A non-plain scalar always resolves to str.
+                let quoted_implicit = *tag == crate::TAG_STR;
                 let scalar_style = char_to_scalar_style(*style);
+                // The emitter only looks at the tag when it is canonical or
+                // neither implicit flag is set, so skip building it otherwise.
+                let tag = (self.canonical || !plain_implicit && !quoted_implicit).then_some(*tag);
 
                 let event = Event::scalar(
                     anchor_ref,
-                    Some(tag),
+                    tag,
                     value,
                     plain_implicit,
                     quoted_implicit,
@@ -850,7 +855,9 @@ impl RSafeDumper {
                 } else {
                     SequenceStyle::Block
                 };
-                let event = Event::sequence_start(anchor_ref, Some(tag), implicit, style);
+                // As for scalars, the tag only matters when it is written.
+                let tag = (self.canonical || !implicit).then_some(*tag);
+                let event = Event::sequence_start(anchor_ref, tag, implicit, style);
                 self.emit(py, event)?;
                 for index in 0.. {
                     let RepNode::Sequence { value, .. } = &self.nodes[node] else {
@@ -872,7 +879,8 @@ impl RSafeDumper {
                 } else {
                     MappingStyle::Block
                 };
-                let event = Event::mapping_start(anchor_ref, Some(tag), implicit, style);
+                let tag = (self.canonical || !implicit).then_some(*tag);
+                let event = Event::mapping_start(anchor_ref, tag, implicit, style);
                 self.emit(py, event)?;
                 for index in 0.. {
                     let RepNode::Mapping { value, .. } = &self.nodes[node] else {
@@ -978,6 +986,7 @@ pub fn dumps_to_string(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<String> {
     let mut dumper = RSafeDumper {
         emitter: ew,
         closed: 0,
+        canonical: false,
         document_start_implicit: true,
         version: None,
         tags: None,
