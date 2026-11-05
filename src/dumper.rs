@@ -193,6 +193,8 @@ impl EmitterWrapper {
         self.emitter.as_mut().expect("emitter already disposed")
     }
 
+    // Inlined so the event is not copied again on its way to the emitter.
+    #[inline(always)]
     fn emit(&mut self, event: Event) -> Result<(), String> {
         self.emitter_mut()
             .emit(event)
@@ -774,6 +776,7 @@ impl RSafeDumper {
 impl RSafeDumper {
     /// Emit an event; the emitter writes each flush to the stream (see
     /// `StreamWriter`).
+    #[inline(always)]
     fn emit(&mut self, py: Python, event: Event) -> PyResult<()> {
         self.emitter.emit(event).map_err(|e| {
             // A failed write raises the stream's own exception, as in PyYAML.
