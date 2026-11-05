@@ -11,10 +11,19 @@ From the repository root, start four fuzzing workers with:
 ./fuzz/run.sh
 ```
 
-The default arguments are `fuzz/corpus fuzz/seed -fork=4 -max_len=1024`.
+The default arguments are `fuzz/corpus fuzz/seed -fork=8 -max_len=2048
+-dict=fuzz/yaml.dict -use_value_profile=1`; `fuzz/yaml.dict` lists YAML
+indicators, directives, tags and resolver keywords for libFuzzer to splice in.
 New corpus entries go into `fuzz/corpus`; crash artifacts go into
 `target/fuzz/artifacts`. Stop with Ctrl+C. YAML files are passed directly to the
 parser comparison, without Hypothesis decoding their bytes first.
+
+Each input is loaded by PyYAML's CSafeLoader and by ryaml as decoded text, as
+raw bytes, and as raw bytes behind a comment that moves libyaml's 16 KB input
+chunk boundary into the input. Results must match exactly: types, float bits
+(including `-0.0`), datetime UTC offsets, mapping key order, and which
+collections are the same object (from anchors, aliases and merge keys). When
+both fail, ryaml's exception must be (a subclass of) PyYAML's.
 
 To pass your own libFuzzer arguments, supply the complete argument list:
 

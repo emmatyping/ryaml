@@ -30,7 +30,7 @@ fuzz_preload="$fuzz_runtime${LD_PRELOAD:+:$LD_PRELOAD}"
 export PATH="$(dirname -- "$fuzz_python"):$PATH"
 
 if [[ $# -eq 0 ]]; then
-    set -- fuzz/corpus fuzz/seed -fork=8 -max_len=2048
+    set -- fuzz/corpus fuzz/seed -fork=8 -max_len=2048 -dict=fuzz/yaml.dict -use_value_profile=1
 fi
 
 # Atheris's bundled ASan runtime predates LLVM's fix for kernels with
