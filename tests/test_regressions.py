@@ -401,3 +401,26 @@ def test_scalar_tag_on_mapping_undefined_alias(load, reference, source):
 ])
 def test_scalar_tag_on_mapping_defined_alias_in_skipped_entry(load, reference, source):
     assert_same(load(source), reference(source))
+
+
+@pytest.mark.parametrize("source", [
+    pytest.param("&base\n- e: {<<: *base}", id="fuzz"),
+    pytest.param("&b\n- {x: 1}\n- {y: 2, z: {<<: *b}}\n", id="later-item"),
+    pytest.param("&b [{a: {<<: *b}, k: 1}]", id="sibling-key"),
+    pytest.param("&b [{<<: *b}]", id="self"),
+])
+def test_recursive_merge_sequence(load, reference, source):
+    # The aliased sequence is still under construction when its << is read, so
+    # it must be expanded after the document is built, as PyYAML does.
+    assert repr(load(source)) == repr(reference(source))
+
+
+@pytest.mark.parametrize("source", [
+    "&b [1, {c: {<<: *b}}]",
+    "&b\n- {c: {<<: *b}}\n- 1\n",
+])
+def test_recursive_merge_sequence_non_mapping(load, reference, source):
+    with pytest.raises(yaml.constructor.ConstructorError):
+        reference(source)
+    with pytest.raises(yaml.constructor.ConstructorError):
+        load(source)

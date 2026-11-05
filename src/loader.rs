@@ -495,25 +495,10 @@ impl RSafeLoader {
                 // Collect merge source(s) — must be a mapping or list of mappings
                 if value.downcast_bound::<PyDict>(py).is_ok() {
                     merge_sources.push(value);
-                } else if let Ok(value_list) = value.downcast_bound::<PyList>(py) {
-                    // Flatten each sequence in reverse order so its first
-                    // mapping wins, while later << entries still win overall.
-                    for item in value_list.iter().rev() {
-                        let item = if let Some((_, mapping)) =
-                            self.set_mappings.get(&(item.as_ptr() as usize))
-                        {
-                            mapping.bind(py).clone().into_any()
-                        } else {
-                            item
-                        };
-                        if !item.is_instance_of::<PyDict>() {
-                            return Err(exception::constructor_error(
-                                py,
-                                "expected a mapping for merging, but found non-mapping".to_string(),
-                            ));
-                        }
-                        merge_sources.push(item.unbind());
-                    }
+                } else if value.downcast_bound::<PyList>(py).is_ok() {
+                    // Expanded in `finish_mapping`: the list may be an alias to
+                    // a sequence still under construction (a recursive merge).
+                    merge_sources.push(value);
                 } else {
                     return Err(exception::constructor_error(
                         py,
@@ -963,7 +948,7 @@ impl RSafeLoader {
         // Parents are appended after their children. Flatten parents first, as
         // PyYAML does, and break recursive merge edges at the explicit entries.
         for i in (0..pending.len()).rev() {
-            finish_mapping(py, i, &pending, &indices, &mut visited)?;
+            finish_mapping(py, i, &pending, &indices, &self.set_mappings, &mut visited)?;
         }
         Ok(())
     }
@@ -976,6 +961,7 @@ fn finish_mapping(
     index: usize,
     pending: &[PendingMapping],
     indices: &HashMap<usize, usize, FxBuildHasher>,
+    set_mappings: &HashMap<usize, (Py<PySet>, Py<PyDict>), FxBuildHasher>,
     visited: &mut [bool],
 ) -> PyResult<()> {
     if visited[index] {
@@ -985,17 +971,53 @@ fn finish_mapping(
     let mapping = &pending[index];
     let mut merged: Option<Bound<'_, PyDict>> = None;
     for source in &mapping.sources {
-        if let Some(&source_index) = indices.get(&(source.as_ptr() as usize)) {
-            finish_mapping(py, source_index, pending, indices, visited)?;
-        }
-        let source = source.bind(py).cast::<PyDict>()?;
-        if let Some(merged) = &merged {
-            merged.update(source.as_mapping())?;
-        } else {
-            merged = Some(source.copy()?);
+        let source = source.bind(py);
+        let Ok(list) = source.cast::<PyList>() else {
+            merge_source(
+                py,
+                source,
+                &mut merged,
+                pending,
+                indices,
+                set_mappings,
+                visited,
+            )?;
+            continue;
+        };
+        // A merge sequence is flattened in reverse so its first mapping wins,
+        // while later << entries still win overall.
+        let items: Vec<_> = list.iter().collect();
+        for item in items.into_iter().rev() {
+            let item = match set_mappings.get(&(item.as_ptr() as usize)) {
+                Some((_, mapping)) => mapping.bind(py).clone().into_any(),
+                None => item,
+            };
+            if !item.is_instance_of::<PyDict>() {
+                return Err(exception::constructor_error(
+                    py,
+                    "expected a mapping for merging, but found non-mapping".to_string(),
+                ));
+            }
+            merge_source(
+                py,
+                &item,
+                &mut merged,
+                pending,
+                indices,
+                set_mappings,
+                visited,
+            )?;
         }
     }
-    let merged = merged.expect("pending mappings have at least one merge source");
+    let Some(merged) = merged else {
+        // Only empty merge sequences: nothing to merge.
+        if let Some(set) = &mapping.set {
+            for key in mapping.dict.bind(py).keys().iter() {
+                set.bind(py).add(key)?;
+            }
+        }
+        return Ok(());
+    };
     let dict = mapping.dict.bind(py);
     merged.update(dict.as_mapping())?;
     dict.clear();
@@ -1004,6 +1026,26 @@ fn finish_mapping(
         for key in dict.keys().iter() {
             set.bind(py).add(key)?;
         }
+    }
+    Ok(())
+}
+
+fn merge_source<'py>(
+    py: Python<'py>,
+    source: &Bound<'py, PyAny>,
+    merged: &mut Option<Bound<'py, PyDict>>,
+    pending: &[PendingMapping],
+    indices: &HashMap<usize, usize, FxBuildHasher>,
+    set_mappings: &HashMap<usize, (Py<PySet>, Py<PyDict>), FxBuildHasher>,
+    visited: &mut [bool],
+) -> PyResult<()> {
+    if let Some(&source_index) = indices.get(&(source.as_ptr() as usize)) {
+        finish_mapping(py, source_index, pending, indices, set_mappings, visited)?;
+    }
+    let source = source.cast::<PyDict>()?;
+    match merged {
+        Some(merged) => merged.update(source.as_mapping())?,
+        None => *merged = Some(source.copy()?),
     }
     Ok(())
 }
