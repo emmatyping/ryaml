@@ -926,10 +926,13 @@ impl RSafeDumper {
                 let tag =
                     (self.canonical || !plain_implicit && !quoted_implicit).then(|| tag.as_str());
 
+                // Reuse the string of an already written scalar's event.
+                let mut text = self.emitter.emitter_mut().take_spare_string();
+                text.push_str(value);
                 let event = Event::scalar(
                     anchor_ref,
                     tag,
-                    value,
+                    text,
                     plain_implicit,
                     quoted_implicit,
                     scalar_style,
