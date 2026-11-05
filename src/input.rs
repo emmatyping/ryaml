@@ -228,7 +228,7 @@ fn decode_utf16_bytes(
     bytes: &[u8],
     unit: fn([u8; 2]) -> u16,
 ) -> (String, Vec<usize>, Option<DecodeError>) {
-    let units = bytes.chunks_exact(2).map(|pair| unit([pair[0], pair[1]]));
+    let units = bytes.as_chunks::<2>().0.iter().map(|&pair| unit(pair));
     let mut text = String::with_capacity(bytes.len() / 2);
     let mut chunk_ends = Vec::new();
     // The current chunk: its first byte and the text offset there.
