@@ -482,3 +482,48 @@ def test_parse_error_classes(load, reference, source, error):
         with pytest.raises(error) as info:
             loader(source)
         assert type(info.value).__name__ == error.__name__
+
+
+@pytest.mark.parametrize(("source", "error"), [
+    ("[!!int x, &a 1, &a 2]", yaml.composer.ComposerError),
+    ("[!!int x, *u]", yaml.composer.ComposerError),
+    ("[!!bool maybe, *u]", yaml.composer.ComposerError),
+    ("[{<<: 1}, *u]", yaml.composer.ComposerError),
+    ("[{a: [!!int x]}, &d 1, &d 2]", yaml.composer.ComposerError),
+    ("[&a !!int x, &a 1]", yaml.composer.ComposerError),
+    ("[&a 1, &a !!int x]", yaml.composer.ComposerError),
+    ("a: !!int x\nb: [1\n", yaml.parser.ParserError),
+    ("[!!int x, \x07]", yaml.reader.ReaderError),
+])
+def test_compose_errors_win_over_construction_errors(load, reference, source, error):
+    # PyYAML composes the whole document before constructing it, so parse and
+    # composer errors anywhere in the document beat earlier construction errors.
+    for loader in (reference, load):
+        with pytest.raises(error) as info:
+            loader(source)
+        assert type(info.value).__name__ == error.__name__
+
+
+@pytest.mark.skipif(not hasattr(yaml, "CSafeLoader"),
+                    reason="PyYAML was built without LibYAML")
+@pytest.mark.parametrize(("source", "single", "multi"), [
+    ("[!!int x]\n---\n[*u]\n", yaml.composer.ComposerError, ValueError),
+    ("[!!int x]\n--- [\n", yaml.composer.ComposerError, ValueError),
+    ("[!!int x, ]]", yaml.parser.ParserError, ValueError),
+    ("[!!int x]\n...\n", ValueError, ValueError),
+])
+def test_construction_error_vs_stream_errors(source, single, multi):
+    # Single-document loading checks for the end of the stream before
+    # constructing; load_all constructs each document before reading the next.
+    cases = [
+        (single, lambda s: yaml.load(s, Loader=yaml.CSafeLoader)),
+        (single, lambda s: yaml.load(s, Loader=ryaml.RSafeLoader)),
+        (single, ryaml.loads),
+        (multi, lambda s: list(yaml.load_all(s, Loader=yaml.CSafeLoader))),
+        (multi, lambda s: list(yaml.load_all(s, Loader=ryaml.RSafeLoader))),
+        (multi, ryaml.loads_all),
+    ]
+    for error, loader in cases:
+        with pytest.raises(error) as info:
+            loader(source)
+        assert type(info.value).__name__ == error.__name__

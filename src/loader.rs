@@ -136,7 +136,19 @@ impl RSafeLoader {
                 ..
             })
         ) {
-            self.construct_document(py)?
+            match self.construct_document(py) {
+                Ok(document) => document,
+                // PyYAML's get_single_node also checks for the end of the
+                // stream before constructing, so that error wins too.
+                Err(err) if !is_compose_error(py, &err) => {
+                    return Err(match self._parse_next_event(py) {
+                        Err(parse_err) => parse_err,
+                        Ok(()) if !self.at_stream_end() => single_document_error(py),
+                        Ok(()) => err,
+                    });
+                }
+                Err(err) => return Err(err),
+            }
         } else {
             None
         };
@@ -150,10 +162,7 @@ impl RSafeLoader {
                 ..
             })
         ) {
-            return Err(exception::composer_error(
-                py,
-                "expected a single document in the stream, but found another document".to_string(),
-            ));
+            return Err(single_document_error(py));
         }
 
         Ok(document)
@@ -231,6 +240,57 @@ impl RSafeLoader {
         Ok(())
     }
 
+    fn at_stream_end(&self) -> bool {
+        matches!(
+            &self.parsed_event,
+            Some(Event {
+                data: EventData::StreamEnd,
+                ..
+            })
+        )
+    }
+
+    /// PyYAML composes a whole document before constructing it, so a parse or
+    /// composer error anywhere in it wins over a construction error raised
+    /// earlier. After a construction error, read the rest of the document and
+    /// return the first such error, or `err` if there is none.
+    fn first_compose_error(&mut self, py: Python, err: PyErr) -> PyErr {
+        if is_compose_error(py, &err) {
+            return err;
+        }
+        loop {
+            let event = match self.parsed_event.take() {
+                Some(event) => event,
+                None => match self.parser.parse() {
+                    Ok(event) => event,
+                    Err(e) => return parse_error(py, &e),
+                },
+            };
+            let anchor = match event.data {
+                EventData::DocumentEnd { .. } | EventData::StreamEnd => return err,
+                EventData::Alias { anchor } => {
+                    if !self.is_known_anchor(&anchor) {
+                        return exception::composer_error(
+                            py,
+                            format!("found undefined alias '{}'", anchor),
+                        );
+                    }
+                    continue;
+                }
+                EventData::Scalar { anchor, .. }
+                | EventData::SequenceStart { anchor, .. }
+                | EventData::MappingStart { anchor, .. } => anchor,
+                _ => None,
+            };
+            if let Some(anchor) = anchor {
+                if let Err(dup) = self.check_new_anchor(py, &anchor) {
+                    return dup;
+                }
+                self.skipped_anchors.insert(anchor);
+            }
+        }
+    }
+
     /// Construct a document directly from events
     fn construct_document(&mut self, py: Python) -> PyResult<Option<Py<PyAny>>> {
         // Eat document start event
@@ -238,7 +298,10 @@ impl RSafeLoader {
 
         // Construct the root object directly from events
         self._parse_next_event(py)?;
-        let result = self.construct_from_events(py)?;
+        let result = match self.construct_from_events(py) {
+            Ok(result) => result,
+            Err(err) => return Err(self.first_compose_error(py, err)),
+        };
 
         // Eat document end event
         self._parse_next_event(py)?;
@@ -332,24 +395,41 @@ impl RSafeLoader {
             resolver::resolve_scalar_tag(&value, plain_implicit)
         };
 
-        let result = match resolved_tag {
-            crate::TAG_NULL => py.None(),
-            crate::TAG_BOOL => construct_bool_direct(py, &value)?,
-            crate::TAG_INT => construct_int_direct(py, &value)?,
-            crate::TAG_FLOAT => construct_float_direct(py, &value)?,
-            crate::TAG_TIMESTAMP => {
-                construct_timestamp(py, &value, tag.as_deref().is_none_or(|tag| tag == "!"))?
-            }
-            crate::TAG_BINARY => construct_binary(py, &value)?,
-            crate::TAG_STR => PyString::new(py, &value).into_any().unbind(),
-            _ => {
-                return Err(exception::constructor_error(
-                    py,
-                    format!(
-                        "could not determine a constructor for the tag '{}'",
-                        resolved_tag
-                    ),
-                ));
+        // PyYAML's composer registers (and checks) the anchor before the
+        // constructor runs, so a duplicate wins over a construction error and a
+        // node that fails to construct still holds its anchor.
+        if let Some(anchor_name) = &anchor {
+            self.check_new_anchor(py, anchor_name)?;
+        }
+        let result = (|| -> PyResult<Py<PyAny>> {
+            Ok(match resolved_tag {
+                crate::TAG_NULL => py.None(),
+                crate::TAG_BOOL => construct_bool_direct(py, &value)?,
+                crate::TAG_INT => construct_int_direct(py, &value)?,
+                crate::TAG_FLOAT => construct_float_direct(py, &value)?,
+                crate::TAG_TIMESTAMP => {
+                    construct_timestamp(py, &value, tag.as_deref().is_none_or(|tag| tag == "!"))?
+                }
+                crate::TAG_BINARY => construct_binary(py, &value)?,
+                crate::TAG_STR => PyString::new(py, &value).into_any().unbind(),
+                _ => {
+                    return Err(exception::constructor_error(
+                        py,
+                        format!(
+                            "could not determine a constructor for the tag '{}'",
+                            resolved_tag
+                        ),
+                    ));
+                }
+            })
+        })();
+        let result = match result {
+            Ok(result) => result,
+            Err(err) => {
+                if let Some(anchor_name) = anchor {
+                    self.skipped_anchors.insert(anchor_name);
+                }
+                return Err(err);
             }
         };
 
@@ -1286,6 +1366,30 @@ fn construct_python_scalar(
         Ok(py.import("ryaml._scalars")?.getattr(name)?.unbind())
     })?;
     Ok(constructor.bind(py).call1((value,))?.unbind())
+}
+
+fn single_document_error(py: Python) -> PyErr {
+    exception::composer_error(
+        py,
+        "expected a single document in the stream, but found another document".to_string(),
+    )
+}
+
+/// Whether `err` comes from reading or composing (PyYAML's first phase) rather
+/// than from constructing Python objects.
+fn is_compose_error(py: Python, err: &PyErr) -> bool {
+    let Ok(module) = py.import("ryaml.error") else {
+        return false;
+    };
+    [
+        "ReaderError",
+        "ScannerError",
+        "ParserError",
+        "ComposerError",
+    ]
+    .iter()
+    .filter_map(|name| module.getattr(*name).ok())
+    .any(|class| err.value(py).is_instance(&class).unwrap_or(false))
 }
 
 /// The PyYAML exception class for a libyaml-safer error, by the stage that
