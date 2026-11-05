@@ -829,3 +829,50 @@ def test_scanner_error_after_node_properties_wins(load, reference, source, error
         with pytest.raises(error) as info:
             loader(source)
         assert type(info.value).__name__ == error.__name__
+
+
+@pytest.mark.parametrize("source", [
+    pytest.param("!a%c3%a9 x", id="two-octets"),
+    pytest.param("!a%e2%82%ac [x]", id="three-octets"),
+    pytest.param("!<tag:%f0%9f%98%80> {a: 1}", id="verbatim-four-octets"),
+    pytest.param("%TAG !e! tag:%c3%a9,\n--- !e!%c3%a8 x", id="tag-directive-prefix"),
+])
+def test_tag_uri_escapes_decode_as_utf8(load, reference, source):
+    # Escaped octets form UTF-8 characters, not one character per octet.
+    with pytest.raises(yaml.constructor.ConstructorError) as expected:
+        reference(source)
+    with pytest.raises(yaml.constructor.ConstructorError) as actual:
+        load(source)
+    assert expected.value.problem in str(actual.value)
+
+
+@pytest.mark.parametrize(("source", "error"), [
+    pytest.param("!a%c1%88 x", UnicodeDecodeError, id="overlong"),
+    pytest.param("!a%ed%a0%80 [1]", UnicodeDecodeError, id="surrogate"),
+    pytest.param("!%f4%90%80%80 {}", UnicodeDecodeError, id="above-max"),
+    pytest.param("!<tag:%c1%88> x", UnicodeDecodeError, id="verbatim"),
+    pytest.param("!!%c1%88 x", UnicodeDecodeError, id="secondary-handle"),
+    pytest.param("!a%c1%88%c3%a9%e0%80%80 x", UnicodeDecodeError, id="several-runs"),
+    pytest.param("%TAG !e! tag:%c1%88\n--- !e!x 1", UnicodeDecodeError,
+                 id="tag-directive-prefix"),
+    pytest.param("- !a%c1%88 x\n- ]", UnicodeDecodeError, id="before-later-error"),
+    pytest.param("!a%c1%88\n!!", yaml.scanner.ScannerError, id="after-peek"),
+    pytest.param("!e!x%c1%88 1", yaml.parser.ParserError, id="after-undefined-handle"),
+    pytest.param("[&a 1, &a !a%c1%88 2]", yaml.composer.ComposerError,
+                 id="after-duplicate-anchor"),
+    pytest.param("[*u, !a%c1%88 2]", yaml.composer.ComposerError, id="after-undefined-alias"),
+    pytest.param("!a%00%c1%88 x", yaml.constructor.ConstructorError, id="after-nul"),
+])
+def test_tag_uri_escapes_that_are_not_utf8(load, reference, source, error):
+    # libyaml only checks the UTF-8 lead and continuation bits of escaped
+    # octets, so overlong sequences, surrogates and values above U+10FFFF reach
+    # PyYAML, which fails to decode the tag when composing the node.
+    messages = []
+    for loader in (reference, load):
+        with pytest.raises(error) as info:
+            loader(source)
+        assert type(info.value).__name__ == error.__name__
+        messages.append(str(info.value))
+    if error is UnicodeDecodeError:
+        assert messages[0] == messages[1]
+    assert yaml.load("%TAG !e! tag:%c1%88\n--- x", Loader=ryaml.RSafeLoader) == "x"

@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 
 use base64::Engine as _;
-use libyaml_safer::{ErrorKind, Event, EventData, Parser};
+use libyaml_safer::{ErrorKind, Event, EventData, INVALID_UTF8_ESCAPE, Parser};
 use pyo3::exceptions::{PyIndexError, PyNotImplementedError, PyRecursionError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
@@ -222,6 +222,7 @@ impl RSafeLoader {
                     ..
                 } => {
                     self.check_anchor(py, anchor.as_deref())?;
+                    check_tag_utf8(py, tag.as_deref())?;
                     let implicit = tag.as_deref().is_none_or(|t| t == "!");
                     let tag = if implicit {
                         Cow::Borrowed(resolver::resolve_scalar_tag(&value, plain_implicit))
@@ -233,6 +234,7 @@ impl RSafeLoader {
                 }
                 EventData::SequenceStart { anchor, tag, .. } => {
                     self.check_anchor(py, anchor.as_deref())?;
+                    check_tag_utf8(py, tag.as_deref())?;
                     let tag = collection_tag(tag, crate::TAG_SEQ);
                     let node = self.add_node(anchor, tag, NodeData::Sequence(Vec::new()));
                     open.push((node, None));
@@ -240,6 +242,7 @@ impl RSafeLoader {
                 }
                 EventData::MappingStart { anchor, tag, .. } => {
                     self.check_anchor(py, anchor.as_deref())?;
+                    check_tag_utf8(py, tag.as_deref())?;
                     let tag = collection_tag(tag, crate::TAG_MAP);
                     let node = self.add_node(anchor, tag, NodeData::Mapping(Vec::new()));
                     open.push((node, None));
@@ -609,6 +612,43 @@ impl RSafeLoader {
         }
         Ok(())
     }
+}
+
+/// Raises PyYAML's `UnicodeDecodeError` for a tag whose URI escapes are not
+/// valid UTF-8. libyaml passes such octets through, and PyYAML decodes the tag
+/// when composing the node, after checking its anchor.
+fn check_tag_utf8(py: Python, tag: Option<&str>) -> PyResult<()> {
+    let Some(tag) = tag.filter(|tag| tag.contains(INVALID_UTF8_ESCAPE)) else {
+        return Ok(());
+    };
+    let bytes = PyBytes::new(py, &tag_octets(tag));
+    bytes.call_method1("decode", ("utf-8",))?;
+    unreachable!("libyaml-safer marks only octets that are not UTF-8")
+}
+
+/// The octets libyaml would give for a tag marked by libyaml-safer: each
+/// marker is followed by one escaped sequence, whose width comes from its
+/// leading octet.
+fn tag_octets(tag: &str) -> Vec<u8> {
+    let mut octets = Vec::with_capacity(tag.len());
+    let mut rest = tag;
+    while let Some(start) = rest.find(INVALID_UTF8_ESCAPE) {
+        octets.extend_from_slice(&rest.as_bytes()[..start]);
+        rest = &rest[start + INVALID_UTF8_ESCAPE.len_utf8()..];
+        let octet_at = |rest: &str, i: usize| {
+            u8::from_str_radix(&rest[i * 3 + 1..i * 3 + 3], 16).expect("escaped octet")
+        };
+        let lead = octet_at(rest, 0);
+        let width = match lead {
+            b if b & 0xe0 == 0xc0 => 2,
+            b if b & 0xf0 == 0xe0 => 3,
+            _ => 4,
+        };
+        octets.extend((0..width).map(|i| octet_at(rest, i)));
+        rest = &rest[width * 3..];
+    }
+    octets.extend_from_slice(rest.as_bytes());
+    octets
 }
 
 /// A tag string, borrowing the standard tags so they need no allocation.
