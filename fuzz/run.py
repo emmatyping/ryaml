@@ -9,6 +9,7 @@ import atheris
 from hypothesis import given, strategies as st
 
 with atheris.instrument_imports():
+    import ryaml
     from ryaml.compat import RSafeLoader
     try:
         from yaml import CSafeLoader as SafeLoader
@@ -76,47 +77,59 @@ def same_value(a, b, _pairs=None):
         return sorted(map(repr, map(key, a))) == sorted(map(repr, map(key, b)))
     return all(same_value(x, y, _pairs) for x, y in zip(a, b))
 
-def compare(text):
-    pyyaml_val = pyyaml_exc = None
-    ryaml_val = ryaml_exc = None
-
+def outcome(load, text):
+    """(value, None) or (None, exception class)."""
     try:
-        pyyaml_val = list(yaml.load_all(text, Loader=SafeLoader))
+        return load(text), None
     except Exception as e:
-        pyyaml_exc = type(e)
+        return None, type(e)
 
-    try:
-        ryaml_val = list(yaml.load_all(text, Loader=RSafeLoader))
-    except Exception as e:
-        ryaml_exc = type(e)
 
-    both_succeeded = (pyyaml_exc is None) and (ryaml_exc is None)
-    both_failed    = (pyyaml_exc is not None) and (ryaml_exc is not None)
-
-    assert both_succeeded or both_failed, (
-        f"One raised, one didn't:\n"
+def check(text, name, expected, actual):
+    pyyaml_val, pyyaml_exc = expected
+    ryaml_val, ryaml_exc = actual
+    assert (pyyaml_exc is None) == (ryaml_exc is None), (
+        f"One raised, one didn't ({name}):\n"
         f"  pyyaml: {pyyaml_exc or pyyaml_val!r}\n"
         f"  ryaml:  {ryaml_exc  or ryaml_val!r}\n"
         f"  input:  {text!r}"
     )
-
-    if both_failed:
+    if pyyaml_exc is not None:
         # ryaml's exceptions subclass PyYAML's (e.g. ScannerError), so callers
         # catching PyYAML's class still catch ryaml's.
         assert issubclass(ryaml_exc, pyyaml_exc), (
-            f"Different exceptions:\n"
+            f"Different exceptions ({name}):\n"
             f"  pyyaml: {pyyaml_exc}\n"
             f"  ryaml:  {ryaml_exc}\n"
             f"  input:  {text!r}"
         )
-
-    if both_succeeded:
+    else:
         assert same_value(pyyaml_val, ryaml_val), (
-            f"Result mismatch:\n"
+            f"Result mismatch ({name}):\n"
             f"  pyyaml: {pyyaml_val!r}\n"
             f"  ryaml:  {ryaml_val!r}\n"
             f"  input:  {text!r}"
         )
+
+
+def ryaml_loads_all(text):
+    # The native API returns None rather than [] for empty input.
+    return ryaml.loads_all(text) or []
+
+
+def compare(text, single=False):
+    """Every document, through RSafeLoader and the native ryaml.loads_all; with
+    `single`, also yaml.load/ryaml.loads (get_single_data, which requires
+    exactly one document)."""
+    expected = outcome(lambda t: list(yaml.load_all(t, Loader=SafeLoader)), text)
+    check(text, "RSafeLoader load_all", expected,
+          outcome(lambda t: list(yaml.load_all(t, Loader=RSafeLoader)), text))
+    check(text, "ryaml.loads_all", expected, outcome(ryaml_loads_all, text))
+    if single:
+        expected = outcome(lambda t: yaml.load(t, Loader=SafeLoader), text)
+        check(text, "RSafeLoader load", expected,
+              outcome(lambda t: yaml.load(t, Loader=RSafeLoader), text))
+        check(text, "ryaml.loads", expected, outcome(ryaml.loads, text))
 
 # Build structured-but-varied YAML strings from fragments
 yaml_scalars = st.one_of(
@@ -189,8 +202,8 @@ def fuzz_yaml(data):
     # Corpus entries are YAML files, not Hypothesis's encoded choice streams.
     compare(data.decode("utf-8", errors="replace"))
     # Also pass the raw bytes, so encoding detection (UTF-16 BOMs etc.) and
-    # invalid UTF-8 are compared too.
-    compare(data)
+    # invalid UTF-8 are compared too, plus the single-document API.
+    compare(data, single=True)
     compare(pad_to_chunk_boundary(data))
 
 
