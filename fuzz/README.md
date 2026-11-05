@@ -55,16 +55,26 @@ environment, or `ASAN_OPTIONS` to override sanitizer options.
 `fuzz/dump.py` checks that ryaml's dumper writes exactly the same bytes as
 PyYAML's CSafeDumper. Hypothesis generates dumper options (flow style, scalar
 style, canonical, indent, width, Unicode, line breaks, encodings, document
-markers, version and tag directives, key sorting) and one to three documents of
-Python values: tricky strings (resolver look-alikes, indicators, line breaks,
-BOMs, lone surrogates, long text for folding), ints and floats of every size,
-dates and datetimes with arbitrary UTC offsets, bytes, sets, tuples, and lists
-and dicts that are shared or recursive (anchors and aliases). Some values are
-ones PyYAML's SafeRepresenter refuses (subclasses such as `OrderedDict`,
-frozensets). Each is dumped with `yaml.dump_all` through `CSafeDumper` and
-`RSafeDumper`, and with `ryaml.dumps` against CSafeDumper with
-`sort_keys=False`. Outputs must be identical; when PyYAML raises, ryaml must
-raise the same exception class or a subclass of it.
+markers, version and tag directives, key sorting; also unusual values PyYAML
+reads by truthiness, compares with exact strings or converts like `int()`) and
+one to three documents of Python values: tricky strings (resolver look-alikes,
+indicators, line breaks, BOMs, lone surrogates, characters at the edges of
+libyaml's printable ranges, long text for folding), ints and floats of every
+size, dates and datetimes with arbitrary UTC offsets, bytes, sets, tuples, and
+lists and dicts that are shared or recursive (anchors and aliases), sometimes
+nested deep enough to reach the recursion limit. Some values are ones PyYAML's
+SafeRepresenter refuses (subclasses such as `OrderedDict`, frozensets,
+`Decimal`, ...). Each example is checked in one of three ways:
+
+- `yaml.dump_all` through `CSafeDumper` and `RSafeDumper` (and `ryaml.dumps`
+  against CSafeDumper with `sort_keys=False`): the output, or the exception
+  class, must match;
+- `yaml.dump_all` into a stream (`StringIO`, `BytesIO`, or recording streams
+  with and without an `encoding` attribute): every `write` call must match,
+  also when the dump fails part way;
+- the dumper protocol driven directly: a random sequence of
+  `open`/`represent`/`close`/`dispose` calls must give the same outcome for
+  every call and the same writes.
 
 Fuzz it with libFuzzer (its inputs are Hypothesis choice sequences, kept in
 `fuzz/dump-corpus`):
