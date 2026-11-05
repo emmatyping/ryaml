@@ -414,8 +414,10 @@ impl RSafeDumper {
         let node = self.represent_data(py, data.bind(py))?;
         self.serialize(py, node)?;
         self.represented_objects.clear();
-        self.object_keeper.clear();
-        self.nodes.clear();
+        for object in self.object_keeper.drain(..) {
+            drop(object.into_bound(py));
+        }
+        self.clear_nodes(py);
         Ok(())
     }
 
@@ -716,6 +718,20 @@ impl RSafeDumper {
     /// Add a collection node and record it as `alias_key`'s node before its
     /// items are represented, like PyYAML's `represent_sequence` and
     /// `represent_mapping`.
+    /// Drop the document's nodes, releasing their strings through `Bound`
+    /// (a direct decref) rather than pyo3's deferred `Py` drop.
+    fn clear_nodes(&mut self, py: Python) {
+        for node in self.nodes.drain(..) {
+            if let RepNode::Scalar {
+                value: ScalarText::Str(text),
+                ..
+            } = node
+            {
+                drop(text.into_bound(py));
+            }
+        }
+    }
+
     fn register(&mut self, alias_key: Option<usize>, node: RepNode) -> NodeId {
         let id = self.nodes.len();
         self.nodes.push(node);
@@ -975,6 +991,24 @@ impl RSafeDumper {
 static DATE_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static DATETIME_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 
+/// Whether `value` (whose shortest digits, in `sci` as written by `{:e}`,
+/// end in an odd digit) may lie exactly halfway between that string and the
+/// one with the last digit one lower or higher: only then can its exact
+/// rounding differ. A halfway value parses back from the midpoint string (the
+/// digits followed by 5), which is much cheaper than exact formatting.
+fn may_be_halfway(sci: &str, mantissa_end: usize, value: f64) -> bool {
+    let (mantissa, exponent) = (&sci[..mantissa_end], &sci[mantissa_end..]);
+    let (last, head) = (
+        mantissa.as_bytes()[mantissa.len() - 1],
+        &mantissa[..mantissa.len() - 1],
+    );
+    let point = if mantissa.contains('.') { "" } else { "." };
+    let lower = format!("{head}{}{point}5{exponent}", char::from(last - 1));
+    let upper = format!("{mantissa}{point}5{exponent}");
+    let value = value.abs();
+    lower.parse::<f64>() == Ok(value) || upper.parse::<f64>() == Ok(value)
+}
+
 /// PyYAML's `represent_float`: `.nan`, `.inf`, `-.inf`, or `repr(value)`
 /// lowercased, with `.0` added before an exponent when there is no decimal
 /// point (`1e+17` becomes `1.0e+17`).
@@ -1009,7 +1043,7 @@ fn write_python_float_repr(value: f64, out: &mut String) {
     // formatting may pick the odd one. Exact formatting to as many digits
     // rounds halfway cases to even, so use it when it still round-trips.
     let mantissa_end = sci.find('e').expect("{:e} has an exponent");
-    if sci.as_bytes()[mantissa_end - 1] % 2 == 1 {
+    if sci.as_bytes()[mantissa_end - 1] % 2 == 1 && may_be_halfway(&sci, mantissa_end, value) {
         let digits = sci[..mantissa_end].replace('.', "").len();
         let mut even = String::with_capacity(24);
         write!(even, "{:.*e}", digits - 1, value.abs()).expect("formatting into a String");
