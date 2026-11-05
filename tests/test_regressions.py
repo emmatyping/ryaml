@@ -814,3 +814,18 @@ def test_decode_errors_follow_libyaml_reader(data):
     expected = outcome(lambda d: list(yaml.load_all(d, Loader=yaml.CSafeLoader)))
     assert outcome(lambda d: list(yaml.load_all(d, Loader=ryaml.RSafeLoader))) == expected
     assert outcome(ryaml.loads_all) == expected
+
+
+@pytest.mark.parametrize(("source", "error"), [
+    ("&a !m!p\n&5 !!", yaml.scanner.ScannerError),
+    ("!m!p &a\n&5 !!", yaml.scanner.ScannerError),
+    ("&a !m!p x", yaml.parser.ParserError),
+    ("!m!p &a x", yaml.parser.ParserError),
+])
+def test_scanner_error_after_node_properties_wins(load, reference, source, error):
+    # libyaml peeks at the next token before resolving a tag handle, so a
+    # scanner error there beats "found undefined tag handle".
+    for loader in (reference, load):
+        with pytest.raises(error) as info:
+            loader(source)
+        assert type(info.value).__name__ == error.__name__
