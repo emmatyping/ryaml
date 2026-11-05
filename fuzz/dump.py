@@ -55,6 +55,8 @@ SPECIAL_STRINGS = [
 ]
 SPECIAL_FLOATS = [
     0.0, -0.0, 1.0, -1.0, 0.5, 0.1, 1e-7, 1e16, 1e17, 1e22, 123456789012345678.0,
+    # Around repr's switch to exponent notation.
+    9999999999999998.0, 1e15, 1.5e16, 1e-4, 9.9e-5, 0.00012345,
     5e-324, 1.7976931348623157e308, math.inf, -math.inf, math.nan,
 ]
 SPECIAL_INTS = [0, 1, -1, 7, 10, 2**31, 2**63 - 1, 2**63, -2**63 - 1, 10**30]
