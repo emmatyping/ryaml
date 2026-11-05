@@ -345,3 +345,39 @@ def test_text_or_bytes_chosen_by_stream_like_pyyaml(make_stream, encoding):
             return stream.getvalue()
         return stream.writes
     assert run(ryaml.RSafeDumper) == run(yaml.CSafeDumper)
+
+
+class _RefusesFirstWrite(_RecordingStream):
+    def write(self, data):
+        if not hasattr(self, "refused"):
+            self.refused = True
+            raise TypeError("first write refused")
+        super().write(data)
+
+
+@pytest.mark.skipif(not hasattr(yaml, "CSafeDumper"), reason="PyYAML was built without LibYAML")
+@pytest.mark.parametrize("make_stream", [__import__("io").BytesIO, _RefusesFirstWrite],
+                         ids=["always-refuses", "refuses-first"])
+@pytest.mark.parametrize("options", [
+    {}, {"explicit_end": True}, {"encoding": "utf-16-le"},
+    {"encoding": "utf-16-le", "explicit_end": True},
+], ids=["implicit", "explicit-end", "utf-16", "utf-16-explicit-end"])
+def test_failed_writes_like_libyaml(make_stream, options):
+    # When the stream's write fails, libyaml drops the UTF-8 output (for UTF-16
+    # it keeps it, and writes it twice later) and processes the failed event
+    # again with the next one; the stream's own exception is raised.
+    def run(dumper):
+        stream = make_stream()
+        instance = dumper(stream, **options)
+        results = []
+        for op in ("open", "represent", "represent", "close", "close"):
+            try:
+                if op == "represent":
+                    instance.represent({"a": [1]})
+                else:
+                    getattr(instance, op)()
+                results.append(None)
+            except Exception as e:  # noqa: BLE001
+                results.append(type(e).__name__)
+        return results, getattr(stream, "writes", None) or stream.getvalue()
+    assert run(ryaml.RSafeDumper) == run(yaml.CSafeDumper)

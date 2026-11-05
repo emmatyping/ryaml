@@ -45,20 +45,45 @@ enum RepNode {
 
 type NodeId = usize;
 
-/// The emitter's output, one chunk per flush: libyaml calls PyYAML's output
-/// handler (which writes to the stream) once per flush, so each chunk becomes
-/// one `write` call.
+/// Where the emitter's output goes. Like PyYAML's CEmitter, whose libyaml
+/// output handler writes every flush to the stream (at each document end, and
+/// whenever the buffer fills), each flush is written to `stream` as it happens,
+/// as `str` or `bytes`. Without a stream (`ryaml.dumps`) the output is kept.
 #[derive(Default)]
-struct FlushedChunks {
-    chunks: Vec<Vec<u8>>,
+struct StreamWriter {
+    stream: Option<Py<PyAny>>,
+    dump_unicode: bool,
+    output: Vec<u8>,
+    /// The exception the stream's `write` raised, re-raised by `emit`.
+    error: Option<PyErr>,
 }
 
-impl std::io::Write for FlushedChunks {
+impl std::io::Write for StreamWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // The emitter writes each flush with one write_all, which a writer
-        // that takes everything turns into one call.
-        self.chunks.push(buf.to_vec());
-        Ok(buf.len())
+        let Some(stream) = &self.stream else {
+            self.output.extend_from_slice(buf);
+            return Ok(buf.len());
+        };
+        let result = Python::attach(|py| -> PyResult<()> {
+            let stream = stream.bind(py);
+            if self.dump_unicode {
+                let text = std::str::from_utf8(buf).map_err(|e| {
+                    exception::emitter_error(py, format!("invalid utf8 output: {e}"))
+                })?;
+                stream.call_method1("write", (text,))?;
+            } else {
+                stream.call_method1("write", (PyBytes::new(py, buf),))?;
+            }
+            Ok(())
+        });
+        match result {
+            // The emitter writes each flush with one write_all.
+            Ok(()) => Ok(buf.len()),
+            Err(error) => {
+                self.error = Some(error);
+                Err(std::io::Error::other("write error"))
+            }
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -73,13 +98,13 @@ impl std::io::Write for FlushedChunks {
 /// We guarantee emitter is always dropped before output by setting it
 /// to None in dispose()/Drop.
 struct EmitterWrapper {
-    output: Box<FlushedChunks>,
+    output: Box<StreamWriter>,
     emitter: Option<Emitter<'static>>,
 }
 
 impl EmitterWrapper {
     fn new() -> Self {
-        let output = Box::new(FlushedChunks::default());
+        let output = Box::new(StreamWriter::default());
         let emitter = Emitter::new();
         EmitterWrapper {
             output,
@@ -87,11 +112,13 @@ impl EmitterWrapper {
         }
     }
 
-    fn configure(&mut self, encoding: Encoding) {
+    fn configure(&mut self, encoding: Encoding, stream: Option<Py<PyAny>>, dump_unicode: bool) {
+        self.output.stream = stream;
+        self.output.dump_unicode = dump_unicode;
         // SAFETY: output lives in a Box (stable heap address) and we guarantee
         // the emitter is dropped before output (see dispose/Drop).
-        let output_ref: &'static mut FlushedChunks =
-            unsafe { &mut *(self.output.as_mut() as *mut FlushedChunks) };
+        let output_ref: &'static mut StreamWriter =
+            unsafe { &mut *(self.output.as_mut() as *mut StreamWriter) };
         let emitter = self.emitter.as_mut().unwrap();
         emitter.set_encoding(encoding);
         emitter.set_output(output_ref);
@@ -107,9 +134,14 @@ impl EmitterWrapper {
             .map_err(|e| format!("emitter error: {e}"))
     }
 
-    /// The output flushed so far, one chunk per flush.
-    fn take_output(&mut self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut self.output.chunks)
+    /// The output flushed so far, without a stream.
+    fn take_output(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.output.output)
+    }
+
+    /// The exception the stream raised during the last emit, if any.
+    fn take_write_error(&mut self) -> Option<PyErr> {
+        self.output.error.take()
     }
 
     fn dispose(&mut self) {
@@ -128,8 +160,6 @@ impl Drop for EmitterWrapper {
 pub struct RSafeDumper {
     // Emitter
     emitter: EmitterWrapper,
-    stream: Py<PyAny>,
-    dump_unicode: bool,
     // -1 = not opened, 0 = open, 1 = closed
     closed: i8,
 
@@ -277,7 +307,7 @@ impl RSafeDumper {
             Some("utf-16-be") => Encoding::Utf16Be,
             _ => Encoding::Utf8,
         };
-        ew.configure(enc);
+        ew.configure(enc, Some(stream.clone_ref(py)), dump_unicode);
 
         if let Some(true) = canonical {
             ew.emitter_mut().set_canonical(true);
@@ -318,8 +348,6 @@ impl RSafeDumper {
 
         Ok(RSafeDumper {
             emitter: ew,
-            stream,
-            dump_unicode,
             closed: -1,
             document_start_implicit: !explicit_start.unwrap_or(false),
             version: version.map(|(major, minor)| VersionDirective { major, minor }),
@@ -685,29 +713,15 @@ impl RSafeDumper {
 // ── Serializer ───────────────────────────────────────────────────────────────
 
 impl RSafeDumper {
-    /// Emit an event, then write whatever the emitter flushed to the stream,
-    /// like PyYAML's CEmitter, whose libyaml output handler writes each flush
-    /// (at every document end, and when the buffer fills). `ryaml.dumps` has
-    /// no stream and takes the output at the end.
+    /// Emit an event; the emitter writes each flush to the stream (see
+    /// `StreamWriter`).
     fn emit(&mut self, py: Python, event: Event) -> PyResult<()> {
-        self.emitter
-            .emit(event)
-            .map_err(|e| exception::emitter_error(py, e))?;
-        if self.stream.is_none(py) {
-            return Ok(());
-        }
-        let stream = self.stream.bind(py);
-        for output in self.emitter.take_output() {
-            if self.dump_unicode {
-                let text = String::from_utf8(output).map_err(|e| {
-                    exception::emitter_error(py, format!("invalid utf8 output: {e}"))
-                })?;
-                stream.call_method1("write", (text,))?;
-            } else {
-                stream.call_method1("write", (PyBytes::new(py, &output),))?;
-            }
-        }
-        Ok(())
+        self.emitter.emit(event).map_err(|e| {
+            // A failed write raises the stream's own exception, as in PyYAML.
+            self.emitter
+                .take_write_error()
+                .unwrap_or_else(|| exception::emitter_error(py, e))
+        })
     }
 
     fn serialize(&mut self, py: Python, node: NodeId) -> PyResult<()> {
@@ -911,12 +925,10 @@ fn char_to_scalar_style(style: Option<char>) -> ScalarStyle {
 /// Dump a Python object to a YAML string, bypassing the pyyaml stream protocol.
 pub fn dumps_to_string(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<String> {
     let mut ew = EmitterWrapper::new();
-    ew.configure(Encoding::Utf8);
+    ew.configure(Encoding::Utf8, None, true);
 
     let mut dumper = RSafeDumper {
         emitter: ew,
-        stream: py.None(),
-        dump_unicode: true,
         closed: 0,
         document_start_implicit: true,
         version: None,
@@ -950,7 +962,7 @@ pub fn dumps_to_string(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<String> {
         .emit(Event::stream_end())
         .map_err(|e| exception::emitter_error(py, e))?;
 
-    let output = dumper.emitter.take_output().concat();
+    let output = dumper.emitter.take_output();
     String::from_utf8(output)
         .map_err(|e| exception::emitter_error(py, format!("invalid utf8 output: {e}")))
 }
