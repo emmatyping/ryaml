@@ -1030,13 +1030,18 @@ fn construct_float_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
     }
 
     let result = if remaining.contains(':') {
-        // Least significant part first, as PyYAML sums them. Its base is an
-        // exact Python int, rounded to a float for each multiplication (which
-        // raises OverflowError once it no longer fits).
+        // PyYAML converts every part first (left to right, so the first bad
+        // part raises ValueError before any OverflowError), then sums them
+        // least significant first. Its base is an exact Python int, rounded to
+        // a float for each multiplication (which raises OverflowError once it
+        // no longer fits).
+        let digits = remaining
+            .split(':')
+            .map(|part| python_float(py, part))
+            .collect::<PyResult<Vec<f64>>>()?;
         let mut result = 0.0;
         let mut base = Some(1u128);
-        for (power, part) in remaining.rsplit(':').enumerate() {
-            let digit = python_float(py, part)?;
+        for (power, digit) in digits.into_iter().rev().enumerate() {
             let base_f = match base {
                 Some(b) => b as f64,
                 None => PyInt::new(py, 60)

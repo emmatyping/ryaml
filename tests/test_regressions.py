@@ -912,3 +912,29 @@ def test_non_specific_tag_resolves_like_pyyaml(source):
 @pytest.mark.parametrize("value", ["!", "&", "*", "12\n", "true\n", "<<\n", "2001-12-14\n"])
 def test_dump_quotes_like_pyyaml_resolver(value):
     assert ryaml.dumps(value) == yaml.safe_dump(value)
+
+
+def _sexagesimal(*parts):
+    return ":".join(parts)
+
+
+@pytest.mark.parametrize("source", [
+    # The empty part's place value (60**181) would overflow a float first.
+    pytest.param("!!float " + _sexagesimal("1", "", *["0"] * 180) + ".5",
+                 id="bad-part-beats-overflow"),
+    pytest.param("!!float " + _sexagesimal("x", *["0"] * 200), id="bad-leading-part"),
+    pytest.param("!!float " + _sexagesimal("1", *["0"] * 200), id="overflow"),
+    pytest.param("!!float " + _sexagesimal("1", *["0"] * 173), id="largest-finite"),
+    pytest.param("!!float " + _sexagesimal("1", *["0"] * 22) + ".5", id="beyond-u128"),
+    pytest.param("!!int " + _sexagesimal("1", *["0"] * 40, "", "0"), id="int-bad-part"),
+    pytest.param("!!int " + _sexagesimal("1", *["0"] * 200), id="int-huge"),
+])
+def test_sexagesimal_parts_convert_before_summing(load, reference, source):
+    # PyYAML converts every part with float()/int() before summing, so a bad
+    # part raises ValueError even where summing would overflow first.
+    def outcome(loader):
+        try:
+            return repr(loader(source))
+        except Exception as e:  # noqa: BLE001
+            return type(e).__name__
+    assert outcome(load) == outcome(reference)
