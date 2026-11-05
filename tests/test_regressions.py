@@ -438,3 +438,30 @@ def test_recursive_merge_sequence_non_mapping(load, reference, source):
 def test_omap_and_pairs_as_merge_source(load, reference, source):
     # PyYAML merges the node (single-entry mappings), not the tuple list.
     assert repr(load(source)) == repr(reference(source))
+
+
+@pytest.mark.parametrize(("source", "error"), [
+    ("!!str &gode0\n=: &gode0\n =:", yaml.composer.ComposerError),
+    ("!!str &a {=: &a x}", yaml.composer.ComposerError),
+    ("!!str &a {b: &a x, =: y}", yaml.composer.ComposerError),
+    ("!!str {a: &k {b: &k 1}, =: q}", yaml.composer.ComposerError),
+    ("!!str &a {=: *a}", RecursionError),
+    ("!!str &a {=: {=: *a}}", RecursionError),
+])
+def test_scalar_tag_on_mapping_own_anchor_errors(load, reference, source, error):
+    # The mapping's anchor is registered before its entries, as PyYAML does.
+    with pytest.raises(error):
+        reference(source)
+    with pytest.raises(error):
+        load(source)
+
+
+@pytest.mark.parametrize("source", [
+    pytest.param("- !!str &a {b: *a, =: y}\n- *a\n", id="self-alias-skipped"),
+    pytest.param("!!str &o {b: !!int &i {=: *o}, =: q}", id="self-alias-in-skipped-value"),
+    pytest.param("- !!str &a {=: !!str &b {=: v}}\n- [*a, *b]\n", id="nested-anchored"),
+    pytest.param("- !!str {a: !!int &i {=: 7}, =: q}\n- *i\n", id="skipped-anchored"),
+    pytest.param("- !!str {a: &m {=: 7}, =: *m}\n", id="alias-to-value-mapping"),
+])
+def test_scalar_tag_on_mapping_own_anchor(load, reference, source):
+    assert_same(load(source), reference(source))

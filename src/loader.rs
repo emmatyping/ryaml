@@ -3,7 +3,7 @@
 
 use base64::Engine as _;
 use libyaml_safer::{Event, EventData, Parser};
-use pyo3::exceptions::{PyIndexError, PyNotImplementedError, PyTypeError};
+use pyo3::exceptions::{PyIndexError, PyNotImplementedError, PyRecursionError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
@@ -54,6 +54,9 @@ pub struct RSafeLoader {
     /// Anchored collections inside skipped entries. They count for duplicate
     /// anchors, but cannot be constructed afterwards.
     skipped_anchors: HashSet<String, FxBuildHasher>,
+    /// Anchors of mappings currently being constructed as scalars (see
+    /// `construct_mapping_as_scalar`), innermost last.
+    scalar_mappings_in_progress: Vec<String>,
     pending_mappings: Vec<PendingMapping>,
     // Sets are represented by mapping nodes in YAML and can be merge sources.
     set_mappings: HashMap<usize, (Py<PySet>, Py<PyDict>), FxBuildHasher>,
@@ -79,6 +82,7 @@ impl RSafeLoader {
             scalar_anchor_values: HashMap::with_hasher(FxBuildHasher),
             deferred_scalars: HashMap::with_hasher(FxBuildHasher),
             skipped_anchors: HashSet::with_hasher(FxBuildHasher),
+            scalar_mappings_in_progress: Vec::new(),
             pending_mappings: Vec::new(),
             set_mappings: HashMap::with_hasher(FxBuildHasher),
             pairs_mappings: HashMap::with_hasher(FxBuildHasher),
@@ -252,6 +256,7 @@ impl RSafeLoader {
         self.scalar_anchor_values.clear();
         self.deferred_scalars.clear();
         self.skipped_anchors.clear();
+        self.scalar_mappings_in_progress.clear();
         self.set_mappings.clear();
         self.pairs_mappings.clear();
         self.anchored_mapping_lengths.clear();
@@ -598,7 +603,19 @@ impl RSafeLoader {
         anchor: Option<String>,
         tag: String,
     ) -> PyResult<Py<PyAny>> {
-        let Some(value) = self.mapping_value_scalar(py)? else {
+        // PyYAML's composer registers the anchor before the mapping's entries,
+        // so they can neither reuse it nor see it as undefined.
+        if let Some(anchor) = &anchor {
+            self.check_new_anchor(py, anchor)?;
+            self.skipped_anchors.insert(anchor.clone());
+            self.scalar_mappings_in_progress.push(anchor.clone());
+        }
+        let value = self.mapping_value_scalar(py, false);
+        if let Some(anchor) = &anchor {
+            self.scalar_mappings_in_progress.pop();
+            self.skipped_anchors.remove(anchor);
+        }
+        let Some(value) = value? else {
             return Err(expected_scalar_error(py, "mapping"));
         };
         if tag == crate::TAG_TIMESTAMP {
@@ -612,8 +629,14 @@ impl RSafeLoader {
 
     /// Consume the rest of a mapping (its start event already taken) and return
     /// the raw scalar text of its first `=` key's value, if it has one.
-    fn mapping_value_scalar(&mut self, py: Python) -> PyResult<Option<String>> {
+    ///
+    /// When `skipping` (the mapping is inside an entry PyYAML never constructs),
+    /// a `=` value that is not a plain scalar is only checked, not resolved:
+    /// resolving it could fail (e.g. an alias back into a mapping still being
+    /// built) where PyYAML does nothing. Its result is then unknown (`None`).
+    fn mapping_value_scalar(&mut self, py: Python, skipping: bool) -> PyResult<Option<String>> {
         let mut found = None;
+        let mut value_seen = false;
         loop {
             self._parse_next_event(py)?;
             let is_value = match &self.parsed_event {
@@ -635,11 +658,19 @@ impl RSafeLoader {
             };
             self.skip_node(py)?;
             self._parse_next_event(py)?;
-            if is_value && found.is_none() {
+            let scalar = matches!(
+                &self.parsed_event,
+                Some(Event {
+                    data: EventData::Scalar { .. },
+                    ..
+                })
+            );
+            if is_value && !value_seen && (scalar || !skipping) {
                 found = Some(self.node_scalar_value(py)?);
             } else {
                 self.skip_node(py)?;
             }
+            value_seen |= is_value;
         }
         self.parsed_event = None;
         Ok(found)
@@ -664,7 +695,14 @@ impl RSafeLoader {
             }
             EventData::Alias { anchor } => match self.scalar_anchor_values.get(&anchor) {
                 Some(value) => Ok(value.clone()),
-                None if self.anchors.contains_key(&anchor) => {
+                // PyYAML's construct_scalar follows the alias back into the
+                // mapping it is constructing, forever.
+                None if self.scalar_mappings_in_progress.contains(&anchor) => Err(
+                    PyRecursionError::new_err("maximum recursion depth exceeded"),
+                ),
+                None if self.anchors.contains_key(&anchor)
+                    || self.skipped_anchors.contains(&anchor) =>
+                {
                     Err(expected_scalar_error(py, "collection"))
                 }
                 None => Err(exception::composer_error(
@@ -672,53 +710,94 @@ impl RSafeLoader {
                     format!("found undefined alias '{}'", anchor),
                 )),
             },
-            EventData::MappingStart { .. } => self
-                .mapping_value_scalar(py)?
+            EventData::MappingStart { anchor, tag, .. } => self
+                .scan_mapping(py, anchor, tag, false)?
                 .ok_or_else(|| expected_scalar_error(py, "mapping")),
             _ => Err(expected_scalar_error(py, "sequence")),
         }
     }
 
     /// Consume the current node without constructing it. PyYAML still composes
-    /// it, so every anchor inside is checked for duplicates and recorded:
-    /// scalars are deferred until an alias uses them.
+    /// it, so every anchor inside is checked for duplicates and recorded, and
+    /// every alias must refer to an earlier anchor.
     fn skip_node(&mut self, py: Python) -> PyResult<()> {
-        let mut depth = 0usize;
-        loop {
-            if depth > 0 {
-                self._parse_next_event(py)?;
+        match self.parsed_event.take().unwrap().data {
+            EventData::Scalar {
+                anchor: Some(anchor),
+                tag,
+                value,
+                plain_implicit,
+                ..
+            } => self.defer_scalar(py, anchor, tag, value, plain_implicit)?,
+            EventData::Alias { anchor } if !self.is_known_anchor(&anchor) => {
+                return Err(exception::composer_error(
+                    py,
+                    format!("found undefined alias '{}'", anchor),
+                ));
             }
-            let event = self.parsed_event.take().unwrap();
-            match event.data {
-                EventData::Scalar {
-                    anchor: Some(anchor),
-                    tag,
-                    value,
-                    plain_implicit,
-                    ..
-                } => self.defer_scalar(py, anchor, tag, value, plain_implicit)?,
-                EventData::SequenceStart { anchor, .. }
-                | EventData::MappingStart { anchor, .. } => {
-                    if let Some(anchor) = anchor {
-                        self.check_new_anchor(py, &anchor)?;
-                        self.skipped_anchors.insert(anchor);
+            EventData::SequenceStart { anchor, .. } => {
+                if let Some(anchor) = anchor {
+                    self.check_new_anchor(py, &anchor)?;
+                    self.skipped_anchors.insert(anchor);
+                }
+                loop {
+                    self._parse_next_event(py)?;
+                    if matches!(
+                        &self.parsed_event,
+                        Some(Event {
+                            data: EventData::SequenceEnd,
+                            ..
+                        })
+                    ) {
+                        self.parsed_event = None;
+                        break;
                     }
-                    depth += 1;
+                    self.skip_node(py)?;
                 }
-                EventData::SequenceEnd | EventData::MappingEnd => depth -= 1,
-                // The composer resolves every alias, constructed or not.
-                EventData::Alias { anchor } if !self.is_known_anchor(&anchor) => {
-                    return Err(exception::composer_error(
-                        py,
-                        format!("found undefined alias '{}'", anchor),
-                    ));
-                }
-                _ => {}
             }
-            if depth == 0 {
-                return Ok(());
+            EventData::MappingStart { anchor, tag, .. } => {
+                self.scan_mapping(py, anchor, tag, true)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Read a mapping (its start event already taken) without constructing it,
+    /// returning the raw text of its `=` value like `mapping_value_scalar`. Its
+    /// anchor is registered first, as PyYAML's composer does; afterwards an
+    /// alias to it constructs lazily if it has a scalar tag and a `=` value
+    /// (what PyYAML would build), and is otherwise a skipped collection.
+    fn scan_mapping(
+        &mut self,
+        py: Python,
+        anchor: Option<String>,
+        tag: Option<String>,
+        skipping: bool,
+    ) -> PyResult<Option<String>> {
+        let Some(anchor) = anchor else {
+            return self.mapping_value_scalar(py, skipping);
+        };
+        self.check_new_anchor(py, &anchor)?;
+        self.skipped_anchors.insert(anchor.clone());
+        self.scalar_mappings_in_progress.push(anchor.clone());
+        let value = self.mapping_value_scalar(py, skipping);
+        self.scalar_mappings_in_progress.pop();
+        let value = value?;
+        if let Some(value) = &value {
+            // An alias in another `=` value follows this mapping's `=` key.
+            self.scalar_anchor_values
+                .insert(anchor.clone(), value.clone());
+            if let Some(t) = tag.as_deref()
+                && is_scalar_tag(t)
+                && t != crate::TAG_TIMESTAMP
+            {
+                self.skipped_anchors.remove(&anchor);
+                self.deferred_scalars
+                    .insert(anchor, (tag, value.clone(), false));
             }
         }
+        Ok(value)
     }
 
     fn defer_scalar(
