@@ -252,26 +252,29 @@ def documents(draw):
     return [document() for _ in range(draw(st.integers(1, 3)))]
 
 
-# Keyword arguments for yaml.dump_all, each sometimes left out.
+# Keyword arguments for yaml.dump_all, each sometimes left out. Besides the
+# usual values, values PyYAML uses by truthiness, compares with exact strings,
+# converts like int(), or only checks when serializing (version, tags).
 options = st.fixed_dictionaries({}, optional={
-    "default_flow_style": pick([False, True, None]),
-    "default_style": pick([None, "'", '"', "|", ">", ""]),
-    "canonical": pick([None, True, False]),
-    "indent": pick([None, 0, 1, 2, 3, 4, 9, 10]),
-    "width": pick([None, -1, 0, 1, 2, 10, 20, 40, 80, 1000]),
-    "allow_unicode": pick([None, True, False]),
-    "line_break": pick([None, "\n", "\r", "\r\n"]),
+    "default_flow_style": pick([False, True, None, 0, 1, ""]),
+    "default_style": pick([None, "'", '"', "|", ">", "", "'x", "x", 0]),
+    "canonical": pick([None, True, False, 1, ""]),
+    "indent": pick([None, 0, 1, 2, 3, 4, 9, 10, 2.7, "3"]),
+    "width": pick([None, -1, 0, 1, 2, 10, 20, 40, 80, 1000, 9.99, 2**31]),
+    "allow_unicode": pick([None, True, False, 1]),
+    "line_break": pick([None, "\n", "\r", "\r\n", "x", 5]),
     # CEmitter: exactly "utf-16-le"/"utf-16-be" select UTF-16, others UTF-8.
     "encoding": pick([None, "utf-8", "utf-16-le", "utf-16-be", "UTF-16-LE", "utf-16",
                       "latin-1", ""]),
-    "explicit_start": pick([None, True, False]),
-    "explicit_end": pick([None, True, False]),
-    "version": pick([None, (1, 1), (1, 2), (1, 0), (2, 0)]),
+    "explicit_start": pick([None, True, False, 1]),
+    "explicit_end": pick([None, True, False, "x"]),
+    "version": pick([None, (1, 1), (1, 2), (1, 0), (2, 0), [1, 1], (1,), "11"]),
     # Prefixes of the standard tags make the emitter shorten !!binary etc.
     "tags": pick([None, {"!e!": "tag:example.com,2000:"},
                   {"!y!": "tag:yaml.org,2002:", "!!": "tag:example.com,2000:"},
-                  {"!": "tag:yaml.org,2002:"}, {"!e!": "tag:yaml.org,2002:b"}]),
-    "sort_keys": st.booleans(),
+                  {"!": "tag:yaml.org,2002:"}, {"!e!": "tag:yaml.org,2002:b"},
+                  {"!e!": 1}, {"!e!": b"p:"}, {}]),
+    "sort_keys": pick([True, False, 0, "x"]),
 })
 
 
