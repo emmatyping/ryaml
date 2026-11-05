@@ -151,3 +151,14 @@ def test_lone_surrogates_fail_when_written(reference, docs):
 def test_version_and_tag_directives(reference, options):
     # PyYAML passes version and tags to every DOCUMENT-START event.
     assert_same_dump(reference, ["a", {"b": b"\x00", "s": {1}}], **options)
+
+
+@pytest.mark.parametrize("value", [
+    "\U0001f600", "a\U00010000b", "\U0010ffff", "�", "", "é",
+    {"\U0001f600": "\U0001f389"},
+])
+@pytest.mark.parametrize("allow_unicode", [True, False])
+def test_characters_beyond_the_bmp_are_escaped(reference, value, allow_unicode):
+    # libyaml's IS_PRINTABLE only accepts characters of up to three UTF-8
+    # bytes, so even with allow_unicode, U+10000 and above are escaped.
+    assert_same_dump(reference, [value], allow_unicode=allow_unicode)
