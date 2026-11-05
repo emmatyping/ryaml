@@ -3,12 +3,9 @@ import pytest
 import ryaml
 import yaml
 
-try:
-    from yaml import CSafeLoader as SafeLoader
-except ImportError:
-    from yaml import SafeLoader
-
-from helpers import VALID_YAMLS, INVALID_YAMLS, YamlTestSuite, _is_nan
+from helpers import (
+    VALID_YAMLS, INVALID_YAMLS, YamlTestSuite, _is_nan, load_reference,
+)
 
 
 def test_loads_empty():
@@ -44,7 +41,7 @@ def test_valid_yamls_from_test_suite(ts: YamlTestSuite) -> None:
         assert actual is None
         actual = []
     # JSON fixtures cannot express YAML 1.1 dates, binary data, sets or tuples.
-    expected = list(yaml.load_all(source, Loader=SafeLoader))
+    expected = load_reference(source)
     assert _is_nan(actual) == _is_nan(expected), (
         f"YAML test suite case {ts.id}: {actual!r} != {expected!r}"
     )
