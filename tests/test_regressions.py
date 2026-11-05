@@ -978,3 +978,22 @@ def test_long_scalars_across_input_chunks(load, reference, source, encode):
         except Exception as e:  # noqa: BLE001
             return type(e).__name__
     assert outcome(load) == outcome(reference)
+
+
+@pytest.mark.parametrize(("start", "error"), [
+    pytest.param(b"[", b"x:,", id="plain-flow"),
+    pytest.param(b'"', b"x\\q", id="double-quoted"),
+])
+@pytest.mark.parametrize("shift", range(8))
+def test_word_after_blanks_reads_next_chunk_first(load, reference, start, error, shift):
+    # After blanks, libyaml starts the next word by caching 4 characters, which
+    # reads (and decodes) the next 16 KB chunk before scanning the word. An
+    # error in the word must not win over the next chunk's decoding error.
+    source = (start + b"ab " * 6000)[:16384 - shift] + error + b"\xff]\n"
+
+    def outcome(loader):
+        try:
+            return loader(source)
+        except Exception as e:  # noqa: BLE001
+            return type(e).__name__
+    assert outcome(load) == outcome(reference)
