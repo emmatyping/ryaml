@@ -11,10 +11,21 @@ From the repository root, start four fuzzing workers with:
 ./fuzz/run.sh
 ```
 
-The default arguments are `fuzz/corpus fuzz/seed -fork=4 -max_len=1024`.
+The default arguments are `fuzz/corpus fuzz/seed -fork=8 -max_len=2048
+-dict=fuzz/yaml.dict -use_value_profile=1`; `fuzz/yaml.dict` lists YAML
+indicators, directives, tags and resolver keywords for libFuzzer to splice in.
 New corpus entries go into `fuzz/corpus`; crash artifacts go into
 `target/fuzz/artifacts`. Stop with Ctrl+C. YAML files are passed directly to the
 parser comparison, without Hypothesis decoding their bytes first.
+
+Each input is loaded by PyYAML's CSafeLoader and by ryaml (through
+`RSafeLoader` and the native `ryaml.loads_all`) as decoded text, as raw bytes,
+and as raw bytes behind a comment that moves libyaml's 16 KB input chunk
+boundary into the input. The raw bytes also go through the single-document API
+(`yaml.load` with `RSafeLoader`, and `ryaml.loads`). Results must match exactly: types, float bits
+(including `-0.0`), datetime UTC offsets, mapping key order, and which
+collections are the same object (from anchors, aliases and merge keys). When
+both fail, ryaml's exception must be (a subclass of) PyYAML's.
 
 To pass your own libFuzzer arguments, supply the complete argument list:
 
@@ -28,11 +39,33 @@ Replay only the compatibility seeds:
 ./fuzz/run.sh -runs=0 fuzz/seed/compat-*.yaml
 ```
 
+ryaml and libyaml-safer are built with overflow checks and debug assertions
+(see `fuzz/sancov-rustc-wrapper.sh`), so integer overflow and failed
+`debug_assert!`s panic; the panic reaches Python as pyo3's `PanicException`,
+which the harness does not catch, so libFuzzer records a crash.
+
 The launcher finds Atheris's `asan_with_fuzzer.so`, preloads it, and disables leak
 detection for the Python interpreter. See the
 [Atheris native-extension guide](https://github.com/google/atheris/blob/master/native_extension_fuzzing.md)
 for runtime details. Set `RYAML_FUZZ_PYTHON` to use another prepared fuzzing
 environment, or `ASAN_OPTIONS` to override sanitizer options.
+
+## Coverage
+
+To see which Rust code the corpus reaches, and so where new seeds would help:
+
+```sh
+rustup component add llvm-tools-preview   # once
+./fuzz/coverage.sh                        # or: ./fuzz/coverage.sh DIR_OR_FILE...
+```
+
+This builds a separate `-C instrument-coverage` extension (stable Rust, no
+sanitizers) into `target/coverage`, replays the inputs through `fuzz/run.py`'s
+comparisons, and writes `target/coverage/summary.txt`, annotated sources in
+`target/coverage/html/`, and every never-executed line in
+`target/coverage/uncovered.txt`. Seeds named `fuzz/seed/cov-*.yaml` were added
+for branches it showed unreached. The emitter, dumper and libyaml-safer's
+document API are not exercised by this harness (it only loads).
 
 ## Rebuild
 

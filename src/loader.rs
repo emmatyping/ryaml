@@ -1,9 +1,18 @@
-//! Module implement pyyaml compatibility layer for ryaml via libyaml
-//! Implements RLoader, which can load YAML 1.1
+//! PyYAML-compatible loading for ryaml (YAML 1.1).
+//!
+//! Like PyYAML, each document is loaded in two phases. The composer turns
+//! parser events into a node graph (resolving tags, registering anchors and
+//! raising composer errors), then the constructor builds Python objects from it
+//! in PyYAML's order: scalars at once, collections created empty and filled
+//! later from a queue (PyYAML's generator-based `state_generators`). Matching
+//! both phases keeps results and errors identical to PyYAML's SafeLoader.
+
+use std::borrow::Cow;
+use std::collections::{HashMap, VecDeque};
 
 use base64::Engine as _;
-use libyaml_safer::{Event, EventData, Parser};
-use pyo3::exceptions::PyNotImplementedError;
+use libyaml_safer::{ErrorKind, Event, EventData, INVALID_UTF8_ESCAPE, Parser};
+use pyo3::exceptions::{PyIndexError, PyNotImplementedError, PyRecursionError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
@@ -11,53 +20,72 @@ use pyo3::types::{
     PyTzInfo,
 };
 use rustc_hash::FxBuildHasher;
-use std::collections::{HashMap, HashSet};
-use std::io::Cursor;
 
 use crate::exception;
+use crate::input::{Input, Source};
 use crate::resolver;
 
-/// Only mappings with merges need a second construction step. Ordinary mappings
-/// are constructed directly without allocating a node graph.
-struct PendingMapping {
-    dict: Py<PyDict>,
-    sources: Vec<Py<PyAny>>,
-    set: Option<Py<PySet>>,
+type NodeId = usize;
+
+/// A composed node, as in PyYAML's `yaml.nodes`.
+struct Node {
+    /// Resolved tag. Standard tags are static, so most nodes do not allocate.
+    tag: Cow<'static, str>,
+    /// Anchored, so aliases can reach it more than once.
+    anchored: bool,
+    data: NodeData,
+}
+
+enum NodeData {
+    Scalar {
+        value: String,
+        /// The tag was resolved implicitly (no tag, or `!`) from the whole
+        /// value, so it matches the resolver's grammar exactly. ryaml's
+        /// timestamp constructor uses this to take a fast path. False for a
+        /// value ending in a newline, which PyYAML's regexes also accept.
+        implicit: bool,
+    },
+    Sequence(Vec<NodeId>),
+    /// Key/value pairs in document order. `flatten_mapping` rewrites them.
+    Mapping(Vec<(NodeId, NodeId)>),
+}
+
+impl NodeData {
+    /// PyYAML's `node.id`, used in error messages.
+    fn kind(&self) -> &'static str {
+        match self {
+            NodeData::Scalar { .. } => "scalar",
+            NodeData::Sequence(_) => "sequence",
+            NodeData::Mapping(_) => "mapping",
+        }
+    }
 }
 
 #[pyclass(name = "_RSafeLoader", subclass)]
 pub struct RSafeLoader {
-    /// Parser over an in-memory string passed by Python
-    parser: Parser<Cursor<String>>,
-    /// Event used by internal parser
+    parser: Parser<Input>,
+    /// The next event, if it has been parsed but not used yet.
     parsed_event: Option<Event>,
-    /// Anchors mapping anchor name to constructed Python object
-    anchors: HashMap<String, Py<PyAny>, FxBuildHasher>,
-    /// Anchors placed on a `<<` merge key. PyYAML keeps these as `merge`-tagged
-    /// nodes: an alias to one acts as a merge key in key position and is a
-    /// ConstructorError anywhere else.
-    merge_anchors: HashSet<String, FxBuildHasher>,
-    pending_mappings: Vec<PendingMapping>,
-    // Sets are represented by mapping nodes in YAML and can be merge sources.
-    set_mappings: HashMap<usize, (Py<PySet>, Py<PyDict>), FxBuildHasher>,
-    anchored_mapping_lengths: HashMap<usize, usize, FxBuildHasher>,
+    /// Nodes of the document being loaded.
+    nodes: Vec<Node>,
+    /// Composer anchors: name to node.
+    anchors: HashMap<String, NodeId, FxBuildHasher>,
+    /// Constructed object of each node (PyYAML's `constructed_objects`). Every
+    /// node needs one: besides aliases, merges copy entries that point to
+    /// unanchored nodes, including the mapping being filled.
+    objects: Vec<Option<Py<PyAny>>>,
+    /// The document has a `<<` key. Without one, only anchored nodes can be
+    /// reached twice, so other objects need not be remembered.
+    has_merge: bool,
+    /// Collections created empty and still to be filled, in PyYAML's order.
+    pending: VecDeque<(NodeId, Py<PyAny>)>,
 }
 
 #[pymethods]
 impl RSafeLoader {
     #[new]
-    pub fn new(source: String) -> Self {
-        let mut parser = Parser::new();
-        parser.set_input(Cursor::new(source));
-        Self {
-            parser,
-            parsed_event: None,
-            anchors: HashMap::with_hasher(FxBuildHasher),
-            merge_anchors: HashSet::with_hasher(FxBuildHasher),
-            pending_mappings: Vec::new(),
-            set_mappings: HashMap::with_hasher(FxBuildHasher),
-            anchored_mapping_lengths: HashMap::with_hasher(FxBuildHasher),
-        }
+    pub fn new(source: Source) -> Self {
+        Self::from_input(source.into_input())
     }
 
     pub fn peek_token(&self) -> PyResult<()> {
@@ -86,593 +114,577 @@ impl RSafeLoader {
     /// Get the next document as a Python object
     pub fn get_data(&mut self, py: Python) -> PyResult<Option<Py<PyAny>>> {
         if self.check_node(py)? {
-            return self.construct_document(py);
+            let root = self.compose_document(py)?;
+            return self.construct_document(py, root).map(Some);
         }
         Ok(None)
     }
 
     /// Get a single document as a Python object
     pub fn get_single_data(&mut self, py: Python) -> PyResult<Option<Py<PyAny>>> {
-        // Eat stream start event
-        self._parse_next_event(py)?;
+        // PyYAML's get_single_node: drop STREAM-START, compose a document if
+        // there is one, and check the stream ends before constructing anything.
+        self.parse_next_event(py)?;
         self.parsed_event = None;
-
-        // Get document
-        self._parse_next_event(py)?;
-        let document = if !matches!(
-            &self.parsed_event,
-            Some(Event {
-                data: EventData::StreamEnd,
-                ..
-            })
-        ) {
-            self.construct_document(py)?
-        } else {
+        self.parse_next_event(py)?;
+        let root = if self.at(|data| matches!(data, EventData::StreamEnd)) {
             None
+        } else {
+            Some(self.compose_document(py)?)
         };
-
-        // Make sure there are no more documents
-        self._parse_next_event(py)?;
-        if !matches!(
-            &self.parsed_event,
-            Some(Event {
-                data: EventData::StreamEnd,
-                ..
-            })
-        ) {
-            return Err(exception::composer_error(
-                py,
-                "expected a single document in the stream, but found another document".to_string(),
-            ));
+        self.parse_next_event(py)?;
+        if !self.at(|data| matches!(data, EventData::StreamEnd)) {
+            return Err(single_document_error(py));
         }
-
-        Ok(document)
+        match root {
+            Some(root) => self.construct_document(py, root).map(Some),
+            None => Ok(None),
+        }
     }
 
     pub fn dispose(&self) {}
 }
 
+/// Parsing and composing (PyYAML's `Composer`).
 impl RSafeLoader {
-    fn check_node(&mut self, py: Python) -> PyResult<bool> {
-        self._parse_next_event(py)?;
-        if matches!(
-            &self.parsed_event,
-            Some(Event {
-                data: EventData::StreamStart { .. },
-                ..
-            })
-        ) {
-            self.parsed_event = None;
-            self._parse_next_event(py)?;
+    pub fn from_input(input: Input) -> Self {
+        let mut parser = Parser::new();
+        parser.set_input(input);
+        Self {
+            parser,
+            parsed_event: None,
+            nodes: Vec::new(),
+            anchors: HashMap::with_hasher(FxBuildHasher),
+            objects: Vec::new(),
+            has_merge: false,
+            pending: VecDeque::new(),
         }
-        if matches!(
-            &self.parsed_event,
-            Some(Event {
-                data: EventData::StreamEnd,
-                ..
-            })
-        ) {
-            return Ok(false);
-        }
-        Ok(true)
     }
 
-    /// Parse the next event if needed
-    fn _parse_next_event(&mut self, py: Python) -> PyResult<()> {
+    fn parse_next_event(&mut self, py: Python) -> PyResult<()> {
         if self.parsed_event.is_none() {
             match self.parser.parse() {
-                Ok(event) => {
-                    self.parsed_event = Some(event);
-                }
-                Err(e) => return Err(exception::scanner_error(py, format!("{}", e))),
+                Ok(event) => self.parsed_event = Some(event),
+                Err(e) => return Err(parse_error(py, &e)),
             }
         }
         Ok(())
     }
 
-    /// Register an anchor, rejecting duplicates (pyyaml ComposerError behavior).
-    fn register_anchor(&mut self, py: Python, name: String, value: Py<PyAny>) -> PyResult<()> {
-        self.check_new_anchor(py, &name)?;
-        self.anchors.insert(name, value);
-        Ok(())
+    fn at(&self, test: impl Fn(&EventData) -> bool) -> bool {
+        self.parsed_event.as_ref().is_some_and(|e| test(&e.data))
     }
 
-    fn register_merge_anchor(&mut self, py: Python, name: String) -> PyResult<()> {
-        self.check_new_anchor(py, &name)?;
-        self.merge_anchors.insert(name);
-        Ok(())
-    }
-
-    fn check_new_anchor(&self, py: Python, name: &str) -> PyResult<()> {
-        if self.anchors.contains_key(name) || self.merge_anchors.contains(name) {
-            return Err(exception::composer_error(
-                py,
-                format!("found duplicate anchor '{}'", name),
-            ));
+    fn check_node(&mut self, py: Python) -> PyResult<bool> {
+        self.parse_next_event(py)?;
+        if self.at(|data| matches!(data, EventData::StreamStart { .. })) {
+            self.parsed_event = None;
+            self.parse_next_event(py)?;
         }
-        Ok(())
+        Ok(!self.at(|data| matches!(data, EventData::StreamEnd)))
     }
 
-    /// Construct a document directly from events
-    fn construct_document(&mut self, py: Python) -> PyResult<Option<Py<PyAny>>> {
-        // Eat document start event
+    /// Compose the document at the current DOCUMENT-START event.
+    fn compose_document(&mut self, py: Python) -> PyResult<NodeId> {
         self.parsed_event = None;
-
-        // Construct the root object directly from events
-        self._parse_next_event(py)?;
-        let result = self.construct_from_events(py)?;
-
-        // Eat document end event
-        self._parse_next_event(py)?;
-        self.parsed_event = None;
-
-        // Resolve merges after all explicit entries, including ancestor entries,
-        // exist. Preserve the objects already referenced by aliases.
-        self.finish_mappings(py)?;
-
-        // Clear anchors for next document
+        self.nodes.clear();
         self.anchors.clear();
-        self.merge_anchors.clear();
-        self.set_mappings.clear();
-        self.anchored_mapping_lengths.clear();
-
-        Ok(Some(result))
-    }
-
-    /// Core single-pass constructor: consume the current event and produce a Python object
-    fn construct_from_events(&mut self, py: Python) -> PyResult<Py<PyAny>> {
-        let event = self.parsed_event.take().unwrap();
-        match event.data {
-            EventData::Alias { anchor } => {
-                if let Some(obj) = self.anchors.get(&anchor) {
-                    Ok(obj.clone_ref(py))
-                } else if self.merge_anchors.contains(&anchor) {
-                    Err(merge_node_error(py))
-                } else {
-                    Err(exception::composer_error(
-                        py,
-                        format!("found undefined alias '{}'", anchor),
-                    ))
-                }
-            }
-            EventData::Scalar {
-                anchor,
-                tag,
-                value,
-                plain_implicit,
-                ..
-            } => self.construct_scalar_direct(py, anchor, tag, value, plain_implicit),
-            EventData::SequenceStart { anchor, tag, .. } => {
-                self.construct_sequence_direct(py, anchor, tag)
-            }
-            EventData::MappingStart { anchor, tag, .. } => {
-                self.construct_mapping_direct(py, anchor, tag)
-            }
-            _ => Err(exception::composer_error(
-                py,
-                format!("unexpected event: {:?}", event.data),
-            )),
-        }
-    }
-
-    /// Construct a Python object directly from a scalar event
-    fn construct_scalar_direct(
-        &mut self,
-        py: Python,
-        anchor: Option<String>,
-        tag: Option<String>,
-        value: String,
-        plain_implicit: bool,
-    ) -> PyResult<Py<PyAny>> {
-        // Resolve tag inline — &'static str, no allocation for common case
-        // "!" is the non-specific tag — resolve as if untagged
-        let resolved_tag: &str = if let Some(ref t) = tag {
-            if t == "!" {
-                resolver::resolve_scalar_tag(&value, plain_implicit)
-            } else {
-                t.as_str()
-            }
-        } else {
-            resolver::resolve_scalar_tag(&value, plain_implicit)
-        };
-
-        let result = match resolved_tag {
-            crate::TAG_NULL => py.None(),
-            crate::TAG_BOOL => construct_bool_direct(py, &value)?,
-            crate::TAG_INT => construct_int_direct(py, &value)?,
-            crate::TAG_FLOAT => construct_float_direct(py, &value)?,
-            crate::TAG_TIMESTAMP => {
-                construct_timestamp(py, &value, tag.as_deref().is_none_or(|tag| tag == "!"))?
-            }
-            crate::TAG_BINARY => construct_binary(py, &value)?,
-            crate::TAG_STR => PyString::new(py, &value).into_any().unbind(),
-            _ => {
-                return Err(exception::constructor_error(
-                    py,
-                    format!(
-                        "could not determine a constructor for the tag '{}'",
-                        resolved_tag
-                    ),
-                ));
-            }
-        };
-
-        if let Some(anchor_name) = anchor {
-            self.register_anchor(py, anchor_name, result.clone_ref(py))?;
-        }
-
-        Ok(result)
-    }
-
-    /// Construct a Python list directly from sequence events
-    fn construct_sequence_direct(
-        &mut self,
-        py: Python,
-        anchor: Option<String>,
-        tag: Option<String>,
-    ) -> PyResult<Py<PyAny>> {
-        // Reject unknown tags (pyyaml SafeConstructor behavior)
-        if let Some(ref t) = tag
-            && !matches!(
-                t.as_str(),
-                "!" | crate::TAG_SEQ | crate::TAG_OMAP | crate::TAG_PAIRS
-            )
-        {
-            return Err(exception::constructor_error(
-                py,
-                format!("could not determine a constructor for the tag '{}'", t),
-            ));
-        }
-        let pairs = matches!(tag.as_deref(), Some(crate::TAG_OMAP | crate::TAG_PAIRS));
-        let list = PyList::empty(py);
-        let list_obj: Py<PyAny> = list.clone().unbind().into_any();
-
-        // Store in anchors BEFORE recursing (handles circular references)
-        if let Some(anchor_name) = anchor {
-            self.register_anchor(py, anchor_name, list_obj.clone_ref(py))?;
-        }
-
-        // Consume child events until SequenceEnd
-        loop {
-            self._parse_next_event(py)?;
-            if matches!(
-                &self.parsed_event,
-                Some(Event {
-                    data: EventData::SequenceEnd,
-                    ..
-                })
-            ) {
-                break;
-            }
-            let item = if pairs {
-                self.construct_pair_entry(py)?
-            } else {
-                self.construct_from_events(py)?
-            };
-            list.append(item)?;
-        }
-
+        self.has_merge = false;
+        let root = self.compose_node(py)?;
+        // Drop the DOCUMENT-END event.
+        self.parse_next_event(py)?;
         self.parsed_event = None;
-        Ok(list_obj)
+        self.anchors.clear();
+        Ok(root)
     }
 
-    /// Construct a Python dict directly from mapping events, with inline merge key handling
-    fn construct_mapping_direct(
-        &mut self,
-        py: Python,
-        anchor: Option<String>,
-        tag: Option<String>,
-    ) -> PyResult<Py<PyAny>> {
-        let record_length = anchor.is_some();
-        let mut length = 0;
-        let is_set = tag.as_deref() == Some(crate::TAG_SET);
-        // Reject unknown tags (pyyaml SafeConstructor behavior)
-        if let Some(ref t) = tag
-            && t != "!"
-            && t != crate::TAG_MAP
-            && t != crate::TAG_SET
-        {
-            return Err(exception::constructor_error(
-                py,
-                format!("could not determine a constructor for the tag '{}'", t),
-            ));
-        }
-
-        let dict = PyDict::new(py);
-        let set = if is_set {
-            Some(PySet::empty(py)?)
-        } else {
-            None
-        };
-        let dict_obj: Py<PyAny> = match &set {
-            Some(set) => set.clone().into_any().unbind(),
-            None => dict.clone().into_any().unbind(),
-        };
-
-        // Store in anchors BEFORE recursing (handles circular references)
-        if let Some(anchor_name) = anchor {
-            self.register_anchor(py, anchor_name, dict_obj.clone_ref(py))?;
-        }
-
-        if let Some(set) = &set {
-            self.set_mappings.insert(
-                dict_obj.as_ptr() as usize,
-                (set.clone().unbind(), dict.clone().unbind()),
-            );
-        }
-        let mut merge_sources: Vec<Py<PyAny>> = Vec::new();
-
+    /// PyYAML's `compose_node`, with an explicit stack instead of recursion so
+    /// deeply nested input cannot overflow the native stack.
+    fn compose_node(&mut self, py: Python) -> PyResult<NodeId> {
+        // Open collections, with a mapping's key waiting for its value.
+        let mut open: Vec<(NodeId, Option<NodeId>)> = Vec::new();
         loop {
-            self._parse_next_event(py)?;
-            if matches!(
-                &self.parsed_event,
-                Some(Event {
-                    data: EventData::MappingEnd,
-                    ..
-                })
-            ) {
-                break;
-            }
-
-            length += 1;
-            // Check if the key is a merge key BEFORE constructing it
-            let is_merge = is_merge_key(&self.parsed_event, &self.merge_anchors);
-
-            if is_merge {
-                // Consume the merge key event without constructing, but keep
-                // its anchor so duplicates and later aliases behave like PyYAML.
-                if let Some(Event {
-                    data:
-                        EventData::Scalar {
-                            anchor: Some(anchor),
-                            ..
-                        },
-                    ..
-                }) = self.parsed_event.take()
-                {
-                    self.register_merge_anchor(py, anchor)?;
-                }
-
-                // Parse the value
-                self._parse_next_event(py)?;
-                let mut value = self.construct_from_events(py)?;
-                if let Some((_, mapping)) = self.set_mappings.get(&(value.as_ptr() as usize)) {
-                    value = mapping.clone_ref(py).into_any();
-                }
-
-                // Collect merge source(s) — must be a mapping or list of mappings
-                if value.downcast_bound::<PyDict>(py).is_ok() {
-                    merge_sources.push(value);
-                } else if let Ok(value_list) = value.downcast_bound::<PyList>(py) {
-                    // Flatten each sequence in reverse order so its first
-                    // mapping wins, while later << entries still win overall.
-                    for item in value_list.iter().rev() {
-                        let item = if let Some((_, mapping)) =
-                            self.set_mappings.get(&(item.as_ptr() as usize))
-                        {
-                            mapping.bind(py).clone().into_any()
-                        } else {
-                            item
-                        };
-                        if !item.is_instance_of::<PyDict>() {
-                            return Err(exception::constructor_error(
-                                py,
-                                "expected a mapping for merging, but found non-mapping".to_string(),
-                            ));
-                        }
-                        merge_sources.push(item.unbind());
+            self.parse_next_event(py)?;
+            let event = self.parsed_event.take().expect("event parsed above");
+            let complete = match event.data {
+                EventData::Alias { anchor } => match self.anchors.get(&anchor) {
+                    Some(&node) => Some(node),
+                    None => {
+                        return Err(exception::composer_error(
+                            py,
+                            format!("found undefined alias '{anchor}'"),
+                        ));
                     }
-                } else {
-                    return Err(exception::constructor_error(
+                },
+                EventData::Scalar {
+                    anchor,
+                    tag,
+                    value,
+                    plain_implicit,
+                    ..
+                } => {
+                    self.check_anchor(py, anchor.as_deref())?;
+                    check_tag_utf8(py, tag.as_deref())?;
+                    let implicit = tag.as_deref().is_none_or(|t| t == "!");
+                    let tag = if implicit {
+                        Cow::Borrowed(resolver::resolve_scalar_tag(&value, plain_implicit))
+                    } else {
+                        known_tag(tag.expect("explicit tag"))
+                    };
+                    let implicit = implicit && !value.ends_with('\n');
+                    let node = self.add_node(anchor, tag, NodeData::Scalar { value, implicit });
+                    Some(node)
+                }
+                EventData::SequenceStart { anchor, tag, .. } => {
+                    self.check_anchor(py, anchor.as_deref())?;
+                    check_tag_utf8(py, tag.as_deref())?;
+                    let tag = collection_tag(tag, crate::TAG_SEQ);
+                    let node = self.add_node(anchor, tag, NodeData::Sequence(Vec::new()));
+                    open.push((node, None));
+                    None
+                }
+                EventData::MappingStart { anchor, tag, .. } => {
+                    self.check_anchor(py, anchor.as_deref())?;
+                    check_tag_utf8(py, tag.as_deref())?;
+                    let tag = collection_tag(tag, crate::TAG_MAP);
+                    let node = self.add_node(anchor, tag, NodeData::Mapping(Vec::new()));
+                    open.push((node, None));
+                    None
+                }
+                EventData::SequenceEnd | EventData::MappingEnd => {
+                    Some(open.pop().expect("end event closes an open collection").0)
+                }
+                other => {
+                    return Err(exception::composer_error(
                         py,
-                        "expected a mapping or list of mappings for merging, but found non-mapping"
-                            .to_string(),
+                        format!("unexpected event: {other:?}"),
                     ));
                 }
-                continue;
+            };
+            let Some(node) = complete else { continue };
+            let Some((parent, key)) = open.last_mut() else {
+                return Ok(node);
+            };
+            match &mut self.nodes[*parent].data {
+                NodeData::Sequence(items) => items.push(node),
+                NodeData::Mapping(entries) => match key.take() {
+                    None => *key = Some(node),
+                    Some(key) => entries.push((key, node)),
+                },
+                NodeData::Scalar { .. } => unreachable!("scalars are never open"),
             }
+        }
+    }
 
-            // Rewrite value tag to str (pyyaml's flatten_mapping behavior)
-            if let Some(Event {
-                data:
-                    EventData::Scalar {
-                        ref mut tag,
-                        ref value,
-                        plain_implicit,
-                        ..
-                    },
-                ..
-            }) = self.parsed_event
-                && (tag.as_deref() == Some(crate::TAG_VALUE)
-                    || (matches!(tag.as_deref(), None | Some("!"))
-                        && plain_implicit
-                        && value == "="))
+    fn check_anchor(&self, py: Python, anchor: Option<&str>) -> PyResult<()> {
+        match anchor {
+            Some(anchor) if self.anchors.contains_key(anchor) => Err(exception::composer_error(
+                py,
+                format!("found duplicate anchor '{anchor}'"),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    fn add_node(
+        &mut self,
+        anchor: Option<String>,
+        tag: Cow<'static, str>,
+        data: NodeData,
+    ) -> NodeId {
+        let node = self.nodes.len();
+        self.has_merge |= tag == crate::TAG_MERGE;
+        self.nodes.push(Node {
+            tag,
+            anchored: anchor.is_some(),
+            data,
+        });
+        if let Some(anchor) = anchor {
+            self.anchors.insert(anchor, node);
+        }
+        node
+    }
+}
+
+/// Constructing (PyYAML's `SafeConstructor`).
+impl RSafeLoader {
+    /// PyYAML's `construct_document`: construct the root, then fill collections
+    /// in the order they were created.
+    fn construct_document(&mut self, py: Python, root: NodeId) -> PyResult<Py<PyAny>> {
+        self.objects.clear();
+        self.objects.resize_with(self.nodes.len(), || None);
+        self.pending.clear();
+        let result = self.construct_object(py, root).and_then(|data| {
+            while let Some((node, object)) = self.pending.pop_front() {
+                self.fill_collection(py, node, object.bind(py))?;
+            }
+            Ok(data)
+        });
+        self.objects.clear();
+        self.pending.clear();
+        self.nodes.clear();
+        result
+    }
+
+    /// PyYAML's `construct_object`: each node is constructed once. Collections
+    /// are created empty here and filled later (`fill_collection`).
+    fn construct_object(&mut self, py: Python, node: NodeId) -> PyResult<Py<PyAny>> {
+        if let Some(object) = &self.objects[node] {
+            return Ok(object.clone_ref(py));
+        }
+        let remember = self.has_merge || self.nodes[node].anchored;
+        let object = match self.nodes[node].tag.as_ref() {
+            crate::TAG_SEQ | crate::TAG_OMAP | crate::TAG_PAIRS => PyList::empty(py).into_any(),
+            crate::TAG_MAP => PyDict::new(py).into_any(),
+            crate::TAG_SET => PySet::empty(py)?.into_any(),
+            _ => {
+                let object = self.construct_scalar_object(py, node)?;
+                if remember {
+                    self.objects[node] = Some(object.clone_ref(py));
+                }
+                return Ok(object);
+            }
+        };
+        let object = object.unbind();
+        self.pending.push_back((node, object.clone_ref(py)));
+        if remember {
+            self.objects[node] = Some(object.clone_ref(py));
+        }
+        Ok(object)
+    }
+
+    /// The constructors for scalar tags, and the undefined-tag error.
+    fn construct_scalar_object(&mut self, py: Python, node: NodeId) -> PyResult<Py<PyAny>> {
+        let tag = self.nodes[node].tag.as_ref();
+        if !matches!(
+            tag,
+            crate::TAG_NULL
+                | crate::TAG_BOOL
+                | crate::TAG_INT
+                | crate::TAG_FLOAT
+                | crate::TAG_BINARY
+                | crate::TAG_TIMESTAMP
+                | crate::TAG_STR
+        ) {
+            return Err(exception::constructor_error(py, unknown_tag_message(tag)));
+        }
+        let value = self.construct_scalar(py, node)?;
+        Ok(match self.nodes[node].tag.as_ref() {
+            crate::TAG_NULL => py.None(),
+            crate::TAG_BOOL => construct_bool_direct(py, value)?,
+            crate::TAG_INT => construct_int_direct(py, value)?,
+            crate::TAG_FLOAT => construct_float_direct(py, value)?,
+            crate::TAG_BINARY => construct_binary(py, value)?,
+            crate::TAG_TIMESTAMP => match &self.nodes[node].data {
+                NodeData::Scalar { implicit, .. } => construct_timestamp(py, value, *implicit)?,
+                // PyYAML matches its timestamp regex against node.value, which
+                // for a mapping is its list of entries.
+                _ => {
+                    return Err(PyTypeError::new_err(
+                        "expected string or bytes-like object, got 'list'",
+                    ));
+                }
+            },
+            _ => PyString::new(py, value).into_any().unbind(),
+        })
+    }
+
+    /// PyYAML's `SafeConstructor.construct_scalar`: a scalar's text, or for a
+    /// mapping the text of its first `=` (value) key's value, recursively.
+    fn construct_scalar(&self, py: Python, mut node: NodeId) -> PyResult<&str> {
+        for _ in 0..=self.nodes.len() {
+            match &self.nodes[node].data {
+                NodeData::Scalar { value, .. } => return Ok(value),
+                NodeData::Mapping(entries) => {
+                    let value_key = entries
+                        .iter()
+                        .find(|(key, _)| self.nodes[*key].tag == crate::TAG_VALUE);
+                    match value_key {
+                        Some(&(_, value)) => node = value,
+                        None => return Err(expected_scalar_error(py, "mapping")),
+                    }
+                }
+                NodeData::Sequence(_) => return Err(expected_scalar_error(py, "sequence")),
+            }
+        }
+        // A `=` chain back to a mapping already visited: PyYAML recurses forever.
+        Err(PyRecursionError::new_err(
+            "maximum recursion depth exceeded",
+        ))
+    }
+
+    /// The deferred part of a collection constructor (after PyYAML's `yield`).
+    fn fill_collection(
+        &mut self,
+        py: Python,
+        node: NodeId,
+        object: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        match self.nodes[node].tag.as_ref() {
+            crate::TAG_SEQ => {
+                let NodeData::Sequence(items) = &self.nodes[node].data else {
+                    let found = self.nodes[node].data.kind();
+                    return Err(exception::constructor_error(
+                        py,
+                        format!("expected a sequence node, but found {found}"),
+                    ));
+                };
+                let list = object.cast::<PyList>()?;
+                for index in 0..items.len() {
+                    let NodeData::Sequence(items) = &self.nodes[node].data else {
+                        unreachable!()
+                    };
+                    let item = self.construct_object(py, items[index])?;
+                    list.append(item)?;
+                }
+            }
+            crate::TAG_MAP => {
+                let dict = object.cast::<PyDict>()?;
+                self.construct_mapping(py, node, |key, value| dict.set_item(key, value))?;
+            }
+            crate::TAG_SET => {
+                let set = object.cast::<PySet>()?;
+                self.construct_mapping(py, node, |key, _| set.add(key))?;
+            }
+            tag => {
+                let pairs = object.cast::<PyList>()?;
+                let what = if tag == crate::TAG_OMAP {
+                    "an ordered map"
+                } else {
+                    "pairs"
+                };
+                self.construct_pairs(py, node, what, pairs)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// PyYAML's `SafeConstructor.construct_mapping`: flatten merges, then
+    /// construct each key and value in order.
+    fn construct_mapping(
+        &mut self,
+        py: Python,
+        node: NodeId,
+        mut insert: impl FnMut(&Bound<'_, PyAny>, &Bound<'_, PyAny>) -> PyResult<()>,
+    ) -> PyResult<()> {
+        if !matches!(self.nodes[node].data, NodeData::Mapping(_)) {
+            let found = self.nodes[node].data.kind();
+            return Err(exception::constructor_error(
+                py,
+                format!("expected a mapping node, but found {found}"),
+            ));
+        }
+        self.flatten_mapping(py, node)?;
+        let mut index = 0;
+        while let NodeData::Mapping(entries) = &self.nodes[node].data
+            && let Some(&(key_node, value_node)) = entries.get(index)
+        {
+            index += 1;
+            let key = self.construct_object(py, key_node)?;
+            let key = key.bind(py);
+            if key.is_instance_of::<PyList>()
+                || key.is_instance_of::<PyDict>()
+                || key.is_instance_of::<PySet>()
             {
-                *tag = Some(crate::TAG_STR.to_string());
-            }
-
-            let key = self.construct_from_events(py)?;
-
-            // Parse the value
-            self._parse_next_event(py)?;
-            let value = self.construct_from_events(py)?;
-
-            // Reject unhashable keys (dicts, lists) like pyyaml
-            if key.bind(py).hash().is_err() {
                 return Err(exception::constructor_error(
                     py,
                     "found unhashable key".to_string(),
                 ));
             }
-            dict.set_item(&key, value)?;
+            let value = self.construct_object(py, value_node)?;
+            insert(key, value.bind(py))?;
         }
-
-        if record_length {
-            self.anchored_mapping_lengths
-                .insert(dict_obj.as_ptr() as usize, length);
-        }
-        if !merge_sources.is_empty() {
-            self.pending_mappings.push(PendingMapping {
-                dict: dict.clone().unbind(),
-                sources: merge_sources,
-                set: set.map(Bound::unbind),
-            });
-        } else if let Some(set) = set {
-            for key in dict.keys().iter() {
-                set.add(key)?;
-            }
-        }
-
-        self.parsed_event = None;
-        Ok(dict_obj)
+        Ok(())
     }
 
-    /// !!omap / !!pairs entries are raw single-entry mappings, not constructed
-    /// dicts: their keys may be unhashable, and duplicate entries must be rejected
-    /// before a dict could collapse them.
-    fn construct_pair_entry(&mut self, py: Python) -> PyResult<Py<PyAny>> {
-        let event = self.parsed_event.take().unwrap();
-        let anchor = match event.data {
-            EventData::Alias { anchor } => {
-                if self.merge_anchors.contains(&anchor) {
-                    return Err(exception::constructor_error(
-                        py,
-                        "expected a mapping of length 1".to_string(),
-                    ));
+    /// PyYAML's `flatten_mapping`: replace `<<` entries with the entries of the
+    /// mappings they merge (earlier merges and explicit entries win), and turn
+    /// `=` keys into plain strings. Like PyYAML it rewrites the node itself.
+    fn flatten_mapping(&mut self, py: Python, node: NodeId) -> PyResult<()> {
+        let mut merge: Vec<(NodeId, NodeId)> = Vec::new();
+        let mut index = 0;
+        loop {
+            let NodeData::Mapping(entries) = &self.nodes[node].data else {
+                return Ok(());
+            };
+            let Some(&(key_node, value_node)) = entries.get(index) else {
+                break;
+            };
+            match self.nodes[key_node].tag.as_ref() {
+                crate::TAG_MERGE => {
+                    // Removed before recursing, which also ends merge cycles.
+                    if let NodeData::Mapping(entries) = &mut self.nodes[node].data {
+                        entries.remove(index);
+                    }
+                    match &self.nodes[value_node].data {
+                        NodeData::Mapping(_) => {
+                            self.flatten_mapping(py, value_node)?;
+                            merge.extend(self.mapping_entries(value_node));
+                        }
+                        NodeData::Sequence(items) => {
+                            let mut submerge = Vec::new();
+                            for subnode in items.clone() {
+                                if !matches!(self.nodes[subnode].data, NodeData::Mapping(_)) {
+                                    let found = self.nodes[subnode].data.kind();
+                                    return Err(exception::constructor_error(
+                                        py,
+                                        format!(
+                                            "expected a mapping for merging, but found {found}"
+                                        ),
+                                    ));
+                                }
+                                self.flatten_mapping(py, subnode)?;
+                                submerge.push(self.mapping_entries(subnode));
+                            }
+                            for entries in submerge.into_iter().rev() {
+                                merge.extend(entries);
+                            }
+                        }
+                        NodeData::Scalar { .. } => {
+                            return Err(exception::constructor_error(
+                                py,
+                                "expected a mapping or list of mappings for merging, but found scalar"
+                                    .to_string(),
+                            ));
+                        }
+                    }
                 }
-                let value = self.anchors.get(&anchor).ok_or_else(|| {
-                    exception::composer_error(py, format!("found undefined alias '{}'", anchor))
-                })?;
-                if self
-                    .anchored_mapping_lengths
-                    .get(&(value.as_ptr() as usize))
-                    .is_some_and(|&n| n != 1)
-                {
-                    return Err(exception::constructor_error(
-                        py,
-                        "expected a single mapping item".to_string(),
-                    ));
+                crate::TAG_VALUE => {
+                    self.nodes[key_node].tag = Cow::Borrowed(crate::TAG_STR);
+                    index += 1;
                 }
-                let value =
-                    if let Some((_, mapping)) = self.set_mappings.get(&(value.as_ptr() as usize)) {
-                        mapping.bind(py).clone().into_any()
-                    } else {
-                        value.bind(py).clone()
-                    };
-                if let Ok(mapping) = value.cast::<PyDict>()
-                    && mapping.len() == 1
-                {
-                    let (key, value) = mapping.iter().next().unwrap();
-                    return Ok(PyTuple::new(py, [key, value])?.into_any().unbind());
-                }
-                return Err(exception::constructor_error(
-                    py,
-                    "expected a single mapping item".to_string(),
-                ));
+                _ => index += 1,
             }
-            EventData::MappingStart { anchor, .. } => anchor,
-            _ => {
-                return Err(exception::constructor_error(
-                    py,
-                    "expected a mapping of length 1".to_string(),
-                ));
-            }
-        };
-        let wrapper = if let Some(anchor) = anchor {
-            let mapping = PyDict::new(py);
-            self.register_anchor(py, anchor, mapping.clone().into_any().unbind())?;
-            Some(mapping)
-        } else {
-            None
-        };
-        self._parse_next_event(py)?;
-        if matches!(
-            self.parsed_event.as_ref().map(|e| &e.data),
-            Some(EventData::MappingEnd)
-        ) {
-            return Err(exception::constructor_error(
-                py,
-                "expected a single mapping item".to_string(),
-            ));
         }
-        let key = self.construct_from_events(py)?;
-        self._parse_next_event(py)?;
-        let value = self.construct_from_events(py)?;
-        self._parse_next_event(py)?;
-        if !matches!(
-            self.parsed_event.as_ref().map(|e| &e.data),
-            Some(EventData::MappingEnd)
-        ) {
-            return Err(exception::constructor_error(
-                py,
-                "expected a single mapping item".to_string(),
-            ));
+        if !merge.is_empty()
+            && let NodeData::Mapping(entries) = &mut self.nodes[node].data
+        {
+            merge.append(entries);
+            *entries = merge;
         }
-        self.parsed_event = None;
-        if let Some(mapping) = wrapper {
-            // The wrapper is a mapping node if referenced elsewhere by an alias.
-            mapping.set_item(&key, &value)?;
-        }
-        Ok(PyTuple::new(py, [key, value])?.into_any().unbind())
+        Ok(())
     }
 
-    fn finish_mappings(&mut self, py: Python) -> PyResult<()> {
-        if self.pending_mappings.is_empty() {
-            return Ok(());
+    fn mapping_entries(&self, node: NodeId) -> Vec<(NodeId, NodeId)> {
+        match &self.nodes[node].data {
+            NodeData::Mapping(entries) => entries.clone(),
+            _ => Vec::new(),
         }
-        let pending = std::mem::take(&mut self.pending_mappings);
-        let indices: HashMap<usize, usize, FxBuildHasher> = pending
-            .iter()
-            .enumerate()
-            .map(|(i, mapping)| (mapping.dict.as_ptr() as usize, i))
-            .collect();
-        let mut visited = vec![false; pending.len()];
-        // Parents are appended after their children. Flatten parents first, as
-        // PyYAML does, and break recursive merge edges at the explicit entries.
-        for i in (0..pending.len()).rev() {
-            finish_mapping(py, i, &pending, &indices, &mut visited)?;
+    }
+
+    /// PyYAML's `construct_yaml_omap` / `construct_yaml_pairs`.
+    fn construct_pairs(
+        &mut self,
+        py: Python,
+        node: NodeId,
+        what: &str,
+        pairs: &Bound<'_, PyList>,
+    ) -> PyResult<()> {
+        let NodeData::Sequence(items) = &self.nodes[node].data else {
+            let found = self.nodes[node].data.kind();
+            return Err(exception::constructor_error(
+                py,
+                format!("while constructing {what}: expected a sequence, but found {found}"),
+            ));
+        };
+        for subnode in items.clone() {
+            let (key_node, value_node) = match &self.nodes[subnode].data {
+                NodeData::Mapping(entries) if entries.len() == 1 => entries[0],
+                NodeData::Mapping(entries) => {
+                    return Err(exception::constructor_error(
+                        py,
+                        format!(
+                            "while constructing {what}: expected a single mapping item, but found {} items",
+                            entries.len()
+                        ),
+                    ));
+                }
+                data => {
+                    return Err(exception::constructor_error(
+                        py,
+                        format!(
+                            "while constructing {what}: expected a mapping of length 1, but found {}",
+                            data.kind()
+                        ),
+                    ));
+                }
+            };
+            let key = self.construct_object(py, key_node)?;
+            let value = self.construct_object(py, value_node)?;
+            pairs.append(PyTuple::new(py, [key, value])?)?;
         }
         Ok(())
     }
 }
 
-/// Rebuild only mappings which contain merges, preserving insertion order and
-/// alias identity. Explicit entries override all merged entries.
-fn finish_mapping(
-    py: Python,
-    index: usize,
-    pending: &[PendingMapping],
-    indices: &HashMap<usize, usize, FxBuildHasher>,
-    visited: &mut [bool],
-) -> PyResult<()> {
-    if visited[index] {
+/// Raises PyYAML's `UnicodeDecodeError` for a tag whose URI escapes are not
+/// valid UTF-8. libyaml passes such octets through, and PyYAML decodes the tag
+/// when composing the node, after checking its anchor.
+fn check_tag_utf8(py: Python, tag: Option<&str>) -> PyResult<()> {
+    let Some(tag) = tag.filter(|tag| tag.contains(INVALID_UTF8_ESCAPE)) else {
         return Ok(());
+    };
+    let bytes = PyBytes::new(py, &tag_octets(tag));
+    bytes.call_method1("decode", ("utf-8",))?;
+    unreachable!("libyaml-safer marks only octets that are not UTF-8")
+}
+
+/// The octets libyaml would give for a tag marked by libyaml-safer: each
+/// marker is followed by one escaped sequence, whose width comes from its
+/// leading octet.
+fn tag_octets(tag: &str) -> Vec<u8> {
+    let mut octets = Vec::with_capacity(tag.len());
+    let mut rest = tag;
+    while let Some(start) = rest.find(INVALID_UTF8_ESCAPE) {
+        octets.extend_from_slice(&rest.as_bytes()[..start]);
+        rest = &rest[start + INVALID_UTF8_ESCAPE.len_utf8()..];
+        let octet_at = |rest: &str, i: usize| {
+            u8::from_str_radix(&rest[i * 3 + 1..i * 3 + 3], 16).expect("escaped octet")
+        };
+        let lead = octet_at(rest, 0);
+        let width = match lead {
+            b if b & 0xe0 == 0xc0 => 2,
+            b if b & 0xf0 == 0xe0 => 3,
+            _ => 4,
+        };
+        octets.extend((0..width).map(|i| octet_at(rest, i)));
+        rest = &rest[width * 3..];
     }
-    visited[index] = true;
-    let mapping = &pending[index];
-    let mut merged: Option<Bound<'_, PyDict>> = None;
-    for source in &mapping.sources {
-        if let Some(&source_index) = indices.get(&(source.as_ptr() as usize)) {
-            finish_mapping(py, source_index, pending, indices, visited)?;
-        }
-        let source = source.bind(py).cast::<PyDict>()?;
-        if let Some(merged) = &merged {
-            merged.update(source.as_mapping())?;
-        } else {
-            merged = Some(source.copy()?);
-        }
+    octets.extend_from_slice(rest.as_bytes());
+    octets
+}
+
+/// A tag string, borrowing the standard tags so they need no allocation.
+fn known_tag(tag: String) -> Cow<'static, str> {
+    const STANDARD: [&str; 14] = [
+        crate::TAG_NULL,
+        crate::TAG_BOOL,
+        crate::TAG_INT,
+        crate::TAG_FLOAT,
+        crate::TAG_STR,
+        crate::TAG_BINARY,
+        crate::TAG_TIMESTAMP,
+        crate::TAG_SEQ,
+        crate::TAG_MAP,
+        crate::TAG_SET,
+        crate::TAG_OMAP,
+        crate::TAG_PAIRS,
+        crate::TAG_MERGE,
+        crate::TAG_VALUE,
+    ];
+    match STANDARD.iter().find(|standard| **standard == tag) {
+        Some(standard) => Cow::Borrowed(standard),
+        None => Cow::Owned(tag),
     }
-    let merged = merged.expect("pending mappings have at least one merge source");
-    let dict = mapping.dict.bind(py);
-    merged.update(dict.as_mapping())?;
-    dict.clear();
-    dict.update(merged.as_mapping())?;
-    if let Some(set) = &mapping.set {
-        for key in dict.keys().iter() {
-            set.bind(py).add(key)?;
-        }
+}
+
+/// A collection's tag: no tag or `!` means the default for its kind.
+fn collection_tag(tag: Option<String>, default: &'static str) -> Cow<'static, str> {
+    match tag {
+        None => Cow::Borrowed(default),
+        Some(tag) if tag == "!" => Cow::Borrowed(default),
+        Some(tag) => known_tag(tag),
     }
-    Ok(())
 }
 
 static ISO_DATETIME: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
@@ -812,44 +824,36 @@ fn construct_python_scalar(
     Ok(constructor.bind(py).call1((value,))?.unbind())
 }
 
-fn merge_node_error(py: Python) -> PyErr {
-    exception::constructor_error(
+fn unknown_tag_message(tag: &str) -> String {
+    format!("could not determine a constructor for the tag '{}'", tag)
+}
+
+fn single_document_error(py: Python) -> PyErr {
+    exception::composer_error(
         py,
-        format!(
-            "could not determine a constructor for the tag '{}'",
-            crate::TAG_MERGE
-        ),
+        "expected a single document in the stream, but found another document".to_string(),
     )
 }
 
-/// Check if the current event is a merge key: plain scalar "<<", an explicit
-/// merge tag, or an alias to an anchored merge key.
-fn is_merge_key(event: &Option<Event>, merge_anchors: &HashSet<String, FxBuildHasher>) -> bool {
-    if let Some(Event {
-        data: EventData::Alias { anchor },
-        ..
-    }) = event
-    {
-        return merge_anchors.contains(anchor);
-    }
-    if let Some(Event {
-        data:
-            EventData::Scalar {
-                value,
-                plain_implicit,
-                tag,
-                ..
-            },
-        ..
-    }) = event
-    {
-        if let Some(t) = tag {
-            // Explicit merge tag, or non-specific "!" on plain "<<"
-            return t == crate::TAG_MERGE || (t == "!" && *plain_implicit && value == "<<");
-        }
-        return *plain_implicit && value == "<<";
-    }
-    false
+/// The PyYAML exception class for a libyaml-safer error, by the stage that
+/// raised it (PyYAML raises `ParserError` for structural errors, for example).
+fn parse_error(py: Python, error: &libyaml_safer::Error) -> PyErr {
+    let class = match error.kind() {
+        // I/O errors only come from `Input`: bytes that did not decode.
+        ErrorKind::Reader | ErrorKind::Io => "ReaderError",
+        ErrorKind::Parser => "ParserError",
+        ErrorKind::Composer => "ComposerError",
+        ErrorKind::Scanner | ErrorKind::Emitter => "ScannerError",
+    };
+    let message = match error.kind() {
+        ErrorKind::Io => format!("Reader error: {error}"),
+        _ => format!("{error}"),
+    };
+    exception::yaml_error(py, class, message)
+}
+
+fn expected_scalar_error(py: Python, found: &str) -> PyErr {
+    exception::constructor_error(py, format!("expected a scalar node, but found {}", found))
 }
 
 /// Construct a Python bool from a scalar value without allocation
@@ -891,13 +895,21 @@ fn construct_int_direct(py: Python, value: &str) -> PyResult<Py<PyAny>> {
     construct_int_fallback(py, value)
 }
 
+/// Mirrors PyYAML's `construct_yaml_int`: strip underscores, strip one sign,
+/// then dispatch on prefix in the same order (a leading `0` means octal even if
+/// the value contains `:`), with Python's `int()` as the fallback.
 fn construct_int_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
+    let cleaned;
+    let value = if value.contains('_') {
+        cleaned = value.replace('_', "");
+        cleaned.as_str()
+    } else {
+        value
+    };
     let bytes = value.as_bytes();
     if bytes.is_empty() {
-        return Err(exception::constructor_error(
-            py,
-            "invalid integer: empty value".to_string(),
-        ));
+        // PyYAML indexes value[0] of the empty string.
+        return Err(PyIndexError::new_err("string index out of range"));
     }
 
     let (sign, remaining) = match bytes[0] {
@@ -906,6 +918,10 @@ fn construct_int_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
         _ => (1i64, value),
     };
 
+    if remaining.is_empty() {
+        // PyYAML indexes value[0] after stripping the sign.
+        return Err(PyIndexError::new_err("string index out of range"));
+    }
     let result = if remaining == "0" {
         0i64
     } else if let Some(bin) = remaining.strip_prefix("0b") {
@@ -918,7 +934,7 @@ fn construct_int_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
             Ok(v) => v,
             Err(()) => return construct_bigint_with_base(py, sign, hex, 16),
         }
-    } else if remaining.starts_with('0') && !remaining.contains(':') && remaining.len() > 1 {
+    } else if remaining.starts_with('0') {
         match parse_int_skip_underscores(remaining, 8) {
             Ok(v) => v,
             Err(()) => return construct_bigint_with_base(py, sign, remaining, 8),
@@ -931,24 +947,13 @@ fn construct_int_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
     } else {
         match parse_int_skip_underscores(remaining, 10) {
             Ok(v) => v,
-            Err(()) => {
-                // Overflow or parse failure — fall back to Python int() for big integers
-                return construct_bigint_via_python(py, value);
-            }
+            // Overflow or parse failure: PyYAML calls int() on the unsigned
+            // remainder, which also accepts e.g. surrounding whitespace.
+            Err(()) => return construct_bigint_with_base(py, sign, remaining, 10),
         }
     };
 
     Ok(PyInt::new(py, sign * result).into_any().unbind())
-}
-
-/// Construct a Python big integer by calling Python's int() builtin
-fn construct_bigint_via_python(py: Python, value: &str) -> PyResult<Py<PyAny>> {
-    // YAML 1.1 allows underscores anywhere (e.g. "1__000"), but Python's int()
-    // rejects consecutive underscores, so strip them before passing to Python.
-    let cleaned: String = value.chars().filter(|&c| c != '_').collect();
-    let builtins = py.import("builtins")?;
-    let result = builtins.call_method1("int", (&cleaned,))?;
-    Ok(result.unbind())
 }
 
 /// Construct a Python big integer from digits in a given base (for octal/hex/binary overflow).
@@ -999,25 +1004,25 @@ fn construct_float_direct(py: Python, value: &str) -> PyResult<Py<PyAny>> {
 
 static NAN: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
+/// Mirrors PyYAML's `construct_yaml_float`: strip underscores, lowercase,
+/// strip one sign, then `.inf` / `.nan` / sexagesimal / `float()`. Pieces Rust
+/// cannot parse go to Python's `float()`, so accepted forms and errors match.
 fn construct_float_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
-    let bytes = value.as_bytes();
-    if bytes.is_empty() {
-        return Err(exception::constructor_error(
-            py,
-            "invalid float: empty value".to_string(),
-        ));
-    }
-
-    let (sign, remaining) = match bytes[0] {
-        b'-' => (-1.0f64, &value[1..]),
-        b'+' => (1.0f64, &value[1..]),
-        _ => (1.0f64, value),
+    let value = value.replace('_', "").to_lowercase();
+    let Some(first) = value.chars().next() else {
+        return Err(PyIndexError::new_err("string index out of range"));
+    };
+    let sign = if first == '-' { -1.0 } else { 1.0 };
+    let remaining = if matches!(first, '-' | '+') {
+        &value[1..]
+    } else {
+        value.as_str()
     };
 
-    if remaining.eq_ignore_ascii_case(".inf") {
+    if remaining == ".inf" {
         return Ok(PyFloat::new(py, sign * f64::INFINITY).into_any().unbind());
     }
-    if remaining.eq_ignore_ascii_case(".nan") {
+    if remaining == ".nan" {
         // PyYAML returns one shared NaN object, so repeated `.nan` mapping keys
         // collapse via dict's identity check; mirror that.
         let nan = NAN.get_or_init(py, || PyFloat::new(py, f64::NAN).into_any().unbind());
@@ -1025,15 +1030,44 @@ fn construct_float_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
     }
 
     let result = if remaining.contains(':') {
-        parse_sexagesimal_float(remaining).map_err(|_| {
-            exception::constructor_error(py, format!("invalid sexagesimal float: {}", value))
-        })?
+        // PyYAML converts every part first (left to right, so the first bad
+        // part raises ValueError before any OverflowError), then sums them
+        // least significant first. Its base is an exact Python int, rounded to
+        // a float for each multiplication (which raises OverflowError once it
+        // no longer fits).
+        let digits = remaining
+            .split(':')
+            .map(|part| python_float(py, part))
+            .collect::<PyResult<Vec<f64>>>()?;
+        let mut result = 0.0;
+        let mut base = Some(1u128);
+        for (power, digit) in digits.into_iter().rev().enumerate() {
+            let base_f = match base {
+                Some(b) => b as f64,
+                None => PyInt::new(py, 60)
+                    .pow(power as u32, None::<u32>)?
+                    .call_method0("__float__")?
+                    .extract::<f64>()?,
+            };
+            result += digit * base_f;
+            base = base.and_then(|b| b.checked_mul(60));
+        }
+        result
     } else {
-        parse_float_skip_underscores(remaining)
-            .map_err(|_| exception::constructor_error(py, format!("invalid float: {}", value)))?
+        python_float(py, remaining)?
     };
-
     Ok(PyFloat::new(py, sign * result).into_any().unbind())
+}
+
+/// Python's `float(s)`, using Rust's parser when it accepts `s`.
+fn python_float(py: Python, s: &str) -> PyResult<f64> {
+    if let Ok(v) = s.parse::<f64>() {
+        return Ok(v);
+    }
+    py.import("builtins")?
+        .getattr("float")?
+        .call1((s,))?
+        .extract::<f64>()
 }
 
 // --- Zero-allocation parsing helpers ---
@@ -1075,41 +1109,6 @@ fn parse_sexagesimal_int(s: &str) -> Result<i64, ()> {
             .ok_or(())?
             .checked_add(segment)
             .ok_or(())?;
-    }
-    Ok(result)
-}
-
-/// Parse float string, skipping '_' characters, without heap allocation for typical values.
-fn parse_float_skip_underscores(s: &str) -> Result<f64, ()> {
-    // Fast path: no underscores
-    if !s.contains('_') {
-        return s.parse::<f64>().map_err(|_| ());
-    }
-    // Stack buffer for typical float strings
-    let mut buf = [0u8; 64];
-    let mut len = 0;
-    for b in s.bytes() {
-        if b == b'_' {
-            continue;
-        }
-        if len >= buf.len() {
-            // Fallback to heap for very long strings
-            let cleaned: String = s.chars().filter(|&c| c != '_').collect();
-            return cleaned.parse::<f64>().map_err(|_| ());
-        }
-        buf[len] = b;
-        len += 1;
-    }
-    let cleaned = std::str::from_utf8(&buf[..len]).map_err(|_| ())?;
-    cleaned.parse::<f64>().map_err(|_| ())
-}
-
-/// Parse sexagesimal float (e.g. "1:30.5" = 90.5), skipping underscores in each segment.
-fn parse_sexagesimal_float(s: &str) -> Result<f64, ()> {
-    let mut result: f64 = 0.0;
-    for part in s.split(':') {
-        let segment = parse_float_skip_underscores(part)?;
-        result = result * 60.0 + segment;
     }
     Ok(result)
 }

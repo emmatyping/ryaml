@@ -13,13 +13,24 @@ fi
 cd -- "$fuzz_root"
 mkdir -p target/fuzz/artifacts
 export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:allocator_may_return_null=1}"
+# ASan only looks for an unversioned `llvm-symbolizer` on PATH; distro packages
+# often install it as `llvm-symbolizer-NN`. Without one, stack traces are raw
+# addresses.
+if [[ -z "${ASAN_SYMBOLIZER_PATH:-}" ]]; then
+    for candidate in llvm-symbolizer $(compgen -c llvm-symbolizer- | sort -t- -k3 -rn); do
+        if candidate="$(command -v "$candidate")"; then
+            export ASAN_SYMBOLIZER_PATH="$candidate"
+            break
+        fi
+    done
+fi
 fuzz_preload="$fuzz_runtime${LD_PRELOAD:+:$LD_PRELOAD}"
 # libFuzzer's -fork/-merge modes re-run fuzz/run.py via its shebang
 # (/usr/bin/env python3), so put the fuzzing interpreter first on PATH.
 export PATH="$(dirname -- "$fuzz_python"):$PATH"
 
 if [[ $# -eq 0 ]]; then
-    set -- fuzz/corpus fuzz/seed -fork=8 -max_len=2048
+    set -- fuzz/corpus fuzz/seed -fork=8 -max_len=2048 -dict=fuzz/yaml.dict -use_value_profile=1
 fi
 
 # Atheris's bundled ASan runtime predates LLVM's fix for kernels with

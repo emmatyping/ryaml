@@ -1,5 +1,6 @@
 mod dumper;
 mod exception;
+mod input;
 mod loader;
 mod mark;
 mod nodes;
@@ -19,6 +20,7 @@ const TAG_OMAP: &str = "tag:yaml.org,2002:omap";
 const TAG_PAIRS: &str = "tag:yaml.org,2002:pairs";
 const TAG_MERGE: &str = "tag:yaml.org,2002:merge";
 const TAG_VALUE: &str = "tag:yaml.org,2002:value";
+const TAG_YAML: &str = "tag:yaml.org,2002:yaml";
 
 #[pyo3::pymodule(gil_used = false)]
 mod _ryaml {
@@ -28,6 +30,7 @@ mod _ryaml {
     use pyo3::types::PyList;
 
     use crate::dumper::register_dumper;
+    use crate::input::Source;
     use crate::loader::register_loader;
     use crate::mark::register_mark;
     use crate::nodes::register_nodes;
@@ -54,16 +57,17 @@ mod _ryaml {
     use crate::nodes::PyMappingNode;
 
     #[pyfunction]
-    fn loads(py: Python, str: String) -> PyResult<Option<Py<PyAny>>> {
-        RSafeLoader::new(str).get_single_data(py)
+    fn loads(py: Python, str: Source) -> PyResult<Option<Py<PyAny>>> {
+        RSafeLoader::from_input(str.into_input()).get_single_data(py)
     }
 
     #[pyfunction]
-    fn loads_all(py: Python, str: String) -> PyResult<Option<Py<PyAny>>> {
-        if str.is_empty() {
+    fn loads_all(py: Python, str: Source) -> PyResult<Option<Py<PyAny>>> {
+        let input = str.into_input();
+        if input.is_empty() {
             Ok(Some(Python::None(py)))
         } else {
-            let mut loader = RSafeLoader::new(str);
+            let mut loader = RSafeLoader::from_input(input);
             let mut docs = Vec::new();
             while loader.check_data(py)? {
                 docs.push(loader.get_data(py)?)

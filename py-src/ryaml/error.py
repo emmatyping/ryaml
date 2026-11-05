@@ -79,6 +79,13 @@ if _HAS_YAML:
             else:
                 _PyReaderError.__init__(self, *args, **kwargs)
 
+        def __str__(self):
+            # PyYAML's __str__ formats the 5-arg form; a message from Rust has
+            # no character/position to format.
+            if self.character is None:
+                return str(self.reason)
+            return _PyReaderError.__str__(self)
+
 else:
     class ScannerError(_MarkedErrorMixin, InvalidYamlError):
         pass

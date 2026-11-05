@@ -14,6 +14,13 @@ pub fn resolve_scalar_tag(value: &str, plain_implicit: bool) -> &'static str {
     if !plain_implicit {
         return DEFAULT_SCALAR_TAG;
     }
+    // PyYAML's resolver regexes end in `$`, which also matches just before a
+    // final newline. Only a non-plain scalar tagged `!` can end with one (e.g.
+    // `! |` block scalars); a lone "\n" has no resolvers (none start with it).
+    let value = match value.strip_suffix('\n') {
+        Some(stripped) if !stripped.is_empty() => stripped,
+        _ => value,
+    };
 
     match value {
         "" | "~" | "null" | "Null" | "NULL" => crate::TAG_NULL,
@@ -23,6 +30,8 @@ pub fn resolve_scalar_tag(value: &str, plain_implicit: bool) -> &'static str {
         | ".nan" | ".NaN" | ".NAN" => crate::TAG_FLOAT,
         "<<" => crate::TAG_MERGE,
         "=" => crate::TAG_VALUE,
+        // Only reachable through `!`: these are indicators in plain scalars.
+        "!" | "&" | "*" => crate::TAG_YAML,
         _ => {
             if is_int(value) {
                 crate::TAG_INT

@@ -32,14 +32,12 @@ __all__ = [
 ]
 
 
-def _read_file(fp: IO[AnyStr]) -> str:
+def _read_file(fp: IO[AnyStr]) -> str | bytes:
     data = fp.read()
     if isinstance(data, str):
         return data
-    elif isinstance(data, bytes):
-        return data.decode("utf8")
-    else:
-        return bytes(data).decode("utf8")
+    # Decoded in Rust: a UTF-16 BOM selects UTF-16, otherwise UTF-8.
+    return bytes(data)
 
 
 def load(fp: IO[AnyStr]) -> Any:
