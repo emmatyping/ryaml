@@ -179,7 +179,7 @@ timezones = st.one_of(
 )
 dates = st.one_of(st.dates(), st.datetimes(timezones=timezones))
 scalars = st.one_of(
-    strings, integers, floats, st.booleans(), st.none(), st.binary(max_size=70), dates,
+    strings, integers, floats, st.booleans(), st.none(), st.binary(max_size=200), dates,
     # Values PyYAML's SafeRepresenter does not represent.
     pick(UNREPRESENTABLE),
 )
@@ -211,7 +211,11 @@ def documents(draw):
             items = draw(pick([list, list, list, ListSubclass]))()
             shared.append(items)
             items.extend(value(depth + 1) for _ in range(draw(st.integers(0, 5))))
-            return tuple(items) if draw(st.integers(0, 7)) == 0 else items
+            if draw(st.integers(0, 7)) == 0:
+                # Non-empty tuples are anchored when shared too.
+                items = tuple(items)
+                shared.append(items)
+            return items
         if kind <= 10:
             mapping = draw(pick(
                 [dict, dict, dict, dict, collections.OrderedDict, DictSubclass]))()
@@ -221,7 +225,10 @@ def documents(draw):
             return mapping
         if kind == 11:
             members = draw(st.sets(keys, max_size=4))
-            return frozenset(members) if draw(st.integers(0, 5)) == 0 else members
+            if draw(st.integers(0, 5)) == 0:
+                return frozenset(members)
+            shared.append(members)
+            return members
         date = draw(dates)
         shared.append(date)  # dates are anchored when shared, unlike str
         return date
