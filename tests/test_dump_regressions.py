@@ -194,3 +194,12 @@ def test_sets_are_represented_as_mappings(reference, value, options):
     # PyYAML's represent_set builds {member: None} and calls represent_mapping,
     # so members are sorted and the flow style is chosen like a mapping's.
     assert_same_dump(reference, [value], **options)
+
+
+@pytest.mark.parametrize("value", [
+    "a\n b", "a\n\n b", "a\n\tb", "a\nb", "a\n\nb", "a\n", "a\n\n", "a b\n  c\nd",
+])
+def test_folded_scalar_line_breaks(reference, value):
+    # libyaml adds a blank line before a break only when the text after the
+    # run of breaks is not blank (it looks at the first non-break character).
+    assert_same_dump(reference, [value], default_style=">")
