@@ -786,6 +786,10 @@ impl RSafeLoader {
             EventData::MappingStart { anchor, tag, .. } => self
                 .scan_mapping(py, anchor, tag, false)?
                 .ok_or_else(|| expected_scalar_error(py, "mapping")),
+            EventData::SequenceStart { anchor, .. } => {
+                self.reserve_failed_anchor(py, anchor)?;
+                Err(expected_scalar_error(py, "sequence"))
+            }
             _ => Err(expected_scalar_error(py, "sequence")),
         }
     }
@@ -1071,6 +1075,13 @@ impl RSafeLoader {
                 ));
             }
             EventData::MappingStart { anchor, tag, .. } => (anchor, tag),
+            EventData::Scalar { anchor, .. } | EventData::SequenceStart { anchor, .. } => {
+                self.reserve_failed_anchor(py, anchor)?;
+                return Err(exception::constructor_error(
+                    py,
+                    "expected a mapping of length 1".to_string(),
+                ));
+            }
             _ => {
                 return Err(exception::constructor_error(
                     py,

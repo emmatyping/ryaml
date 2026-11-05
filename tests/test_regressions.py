@@ -585,6 +585,11 @@ def test_anchored_pair_entry_unhashable_key_alias(load, reference, source, error
     ("&e !o {a: *e}", yaml.constructor.ConstructorError),
     ("&m !!str {a: *m}", yaml.constructor.ConstructorError),
     ("&s !!set [*s]", yaml.constructor.ConstructorError),
+    ("!!pairs\n- &entry\n- *entry", yaml.constructor.ConstructorError),
+    ("!!pairs [&e [*e]]", yaml.constructor.ConstructorError),
+    ("!!pairs [&e x, &e y]", yaml.composer.ComposerError),
+    ("!!str {=: &s [*s]}", yaml.constructor.ConstructorError),
+    ("[!!str {=: &s [1]}, &s 2]", yaml.composer.ComposerError),
     ("[&e !o [1], &e 2]", yaml.composer.ComposerError),
     ("&e !o [1, *u]", yaml.composer.ComposerError),
 ])
