@@ -33,11 +33,9 @@ def approx_equal(a, b, rel_tol=1e-9, _seen=None):
         if pair in _seen:
             return True
         _seen.add(pair)
-        # Compare sorted by repr since keys might be floats
-        a_items = sorted(a.items(), key=repr)
-        b_items = sorted(b.items(), key=repr)
+        # In order: PyYAML preserves mapping key order, so ryaml must too.
         return all(approx_equal(ak, bk, rel_tol, _seen) and approx_equal(av, bv, rel_tol, _seen)
-                    for (ak, av), (bk, bv) in zip(a_items, b_items))
+                    for (ak, av), (bk, bv) in zip(a.items(), b.items()))
     if isinstance(a, (set, frozenset)):
         # Set equality checks identity first, and each library has its own NaN
         # object, so compare NaN members by count rather than by value.
@@ -80,6 +78,16 @@ def compare(text):
         f"  ryaml:  {ryaml_exc  or ryaml_val!r}\n"
         f"  input:  {text!r}"
     )
+
+    if both_failed:
+        # ryaml's exceptions subclass PyYAML's (e.g. ScannerError), so callers
+        # catching PyYAML's class still catch ryaml's.
+        assert issubclass(ryaml_exc, pyyaml_exc), (
+            f"Different exceptions:\n"
+            f"  pyyaml: {pyyaml_exc}\n"
+            f"  ryaml:  {ryaml_exc}\n"
+            f"  input:  {text!r}"
+        )
 
     if both_succeeded:
         assert approx_equal(pyyaml_val, ryaml_val), (
@@ -128,6 +136,9 @@ def test_any_bytes(data):
 def fuzz_yaml(data):
     # Corpus entries are YAML files, not Hypothesis's encoded choice streams.
     compare(data.decode("utf-8", errors="replace"))
+    # Also pass the raw bytes, so encoding detection (UTF-16 BOMs etc.) and
+    # invalid UTF-8 are compared too.
+    compare(data)
 
 
 atheris.Setup(sys.argv, fuzz_yaml)
