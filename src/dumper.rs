@@ -553,8 +553,7 @@ impl RSafeDumper {
         data: &Bound<'_, PyAny>,
         alias_key: Option<usize>,
     ) -> PyResult<NodeId> {
-        let items = data.cast::<PyDict>()?.items();
-        self.represent_mapping(py, crate::TAG_MAP, items, alias_key)
+        self.represent_mapping(py, crate::TAG_MAP, data.cast::<PyDict>()?, alias_key)
     }
 
     /// PyYAML's `represent_set`: a mapping of the members to None.
@@ -568,7 +567,7 @@ impl RSafeDumper {
         for item in data.try_iter()? {
             value.set_item(item?, py.None())?;
         }
-        self.represent_mapping(py, crate::TAG_SET, value.items(), alias_key)
+        self.represent_mapping(py, crate::TAG_SET, &value, alias_key)
     }
 
     /// PyYAML's `represent_mapping`, for dicts and sets.
@@ -576,7 +575,7 @@ impl RSafeDumper {
         &mut self,
         py: Python,
         tag: &'static str,
-        items: Bound<'_, PyList>,
+        mapping: &Bound<'_, PyDict>,
         alias_key: Option<usize>,
     ) -> PyResult<NodeId> {
         let node = self.register(
@@ -587,13 +586,12 @@ impl RSafeDumper {
                 flow_style: None,
             },
         );
-        let items = self.mapping_items(py, items)?;
+        let items = self.mapping_items(py, mapping)?;
         let mut best_style = true;
         self.level += 1;
-        for item in items.iter() {
-            let (k, v) = item.extract::<(Bound<'_, PyAny>, Bound<'_, PyAny>)>()?;
-            let key_node = self.represent_data(py, &k)?;
-            let val_node = self.represent_data(py, &v)?;
+        for (k, v) in &items {
+            let key_node = self.represent_data(py, k)?;
+            let val_node = self.represent_data(py, v)?;
             best_style &= self.is_plain_scalar(key_node) && self.is_plain_scalar(val_node);
             // Added at once, like PyYAML (see `represent_list`).
             if let RepNode::Mapping { value, .. } = &mut self.nodes[node] {
@@ -610,19 +608,55 @@ impl RSafeDumper {
 
     // ── Helpers ──
 
-    /// PyYAML's `represent_mapping`: the (key, value) items, sorted with
-    /// Python's `sorted` when `sort_keys` is set, or left in order if that
-    /// raises `TypeError` (keys that cannot be compared).
+    /// PyYAML's `represent_mapping`: the (key, value) items, sorted like
+    /// `sorted(mapping.items())` when `sort_keys` is set, or left in order if
+    /// that raises `TypeError` (keys that cannot be compared). Keys that are
+    /// all exact `str` are sorted here by their UTF-8 bytes, which is Python's
+    /// code point order (dict keys are distinct, so values never compare).
     fn mapping_items<'py>(
         &self,
         py: Python<'py>,
-        items: Bound<'py, PyList>,
-    ) -> PyResult<Bound<'py, PyList>> {
-        if !self.sort_keys {
+        mapping: &Bound<'py, PyDict>,
+    ) -> PyResult<Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)>> {
+        let items: Vec<_> = mapping.iter().collect();
+        if !self.sort_keys || items.len() < 2 {
             return Ok(items);
         }
-        match py.import("builtins")?.getattr("sorted")?.call1((&items,)) {
-            Ok(sorted) => Ok(sorted.cast_into::<PyList>()?),
+        let mut order = Vec::with_capacity(items.len());
+        for (index, (key, _)) in items.iter().enumerate() {
+            let text = if key.is_exact_instance_of::<PyString>() {
+                // Lone surrogates have no UTF-8: leave those to Python.
+                key.cast::<PyString>()?.to_str().ok()
+            } else {
+                None
+            };
+            match text {
+                Some(text) => order.push((text, index)),
+                None => return self.sort_items_in_python(py, items),
+            }
+        }
+        order.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let order: Vec<usize> = order.into_iter().map(|(_, index)| index).collect();
+        let mut items: Vec<_> = items.into_iter().map(Some).collect();
+        Ok(order
+            .into_iter()
+            .map(|index| items[index].take().expect("each index once"))
+            .collect())
+    }
+
+    /// `sorted(items)` in Python, keeping the order on `TypeError`.
+    fn sort_items_in_python<'py>(
+        &self,
+        py: Python<'py>,
+        items: Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)>,
+    ) -> PyResult<Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)>> {
+        let list = PyList::new(py, items.iter().map(|(k, v)| (k, v)))?;
+        match py.import("builtins")?.getattr("sorted")?.call1((&list,)) {
+            Ok(sorted) => sorted
+                .cast_into::<PyList>()?
+                .iter()
+                .map(|item| item.extract::<(Bound<'py, PyAny>, Bound<'py, PyAny>)>())
+                .collect(),
             Err(e) if e.is_instance_of::<pyo3::exceptions::PyTypeError>(py) => Ok(items),
             Err(e) => Err(e),
         }
