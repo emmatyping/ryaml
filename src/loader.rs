@@ -205,12 +205,16 @@ impl RSafeLoader {
         Ok(())
     }
 
-    fn check_new_anchor(&self, py: Python, name: &str) -> PyResult<()> {
-        if self.anchors.contains_key(name)
+    /// Whether `name` was defined earlier in the document, in any form.
+    fn is_known_anchor(&self, name: &str) -> bool {
+        self.anchors.contains_key(name)
             || self.merge_anchors.contains(name)
             || self.deferred_scalars.contains_key(name)
             || self.skipped_anchors.contains(name)
-        {
+    }
+
+    fn check_new_anchor(&self, py: Python, name: &str) -> PyResult<()> {
+        if self.is_known_anchor(name) {
             return Err(exception::composer_error(
                 py,
                 format!("found duplicate anchor '{}'", name),
@@ -689,6 +693,13 @@ impl RSafeLoader {
                     depth += 1;
                 }
                 EventData::SequenceEnd | EventData::MappingEnd => depth -= 1,
+                // The composer resolves every alias, constructed or not.
+                EventData::Alias { anchor } if !self.is_known_anchor(&anchor) => {
+                    return Err(exception::composer_error(
+                        py,
+                        format!("found undefined alias '{}'", anchor),
+                    ));
+                }
                 _ => {}
             }
             if depth == 0 {

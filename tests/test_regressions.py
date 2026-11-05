@@ -378,3 +378,26 @@ def test_scalar_tag_on_mapping_alias_constructs_lazily(load, reference, source, 
         reference(source)
     with pytest.raises(error):
         load(source)
+
+
+@pytest.mark.parametrize("source", [
+    pytest.param("!!str\n*1:\n=:", id="fuzz-alias-key"),
+    pytest.param("!!str {a: *u, =: x}", id="alias-value"),
+    pytest.param("!!str {a: [1, {b: *u}], =: x}", id="nested"),
+    pytest.param("!!str {=: x, a: *u}", id="after-value-key"),
+])
+def test_scalar_tag_on_mapping_undefined_alias(load, reference, source):
+    # PyYAML's composer resolves aliases even in entries it never constructs.
+    with pytest.raises(yaml.composer.ComposerError):
+        reference(source)
+    with pytest.raises(yaml.composer.ComposerError):
+        load(source)
+
+
+@pytest.mark.parametrize("source", [
+    pytest.param("- &k 1\n- !!str {a: *k, =: x}\n", id="earlier-anchor"),
+    pytest.param("- !!str {a: &k [1, *k], =: x}\n", id="recursive-skipped"),
+    pytest.param("- !!str {a: &k [1], b: *k, =: x}\n", id="skipped-collection"),
+])
+def test_scalar_tag_on_mapping_defined_alias_in_skipped_entry(load, reference, source):
+    assert_same(load(source), reference(source))
