@@ -1,7 +1,9 @@
 //! Full RSafeDumper implementation: emitter + serializer + SafeRepresenter + resolver.
 //! All in Rust, matching the RSafeLoader pattern.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+use rustc_hash::FxBuildHasher;
 
 use base64::Engine as _;
 use libyaml_safer::{
@@ -44,6 +46,22 @@ enum RepNode {
 }
 
 type NodeId = usize;
+
+/// The serializer's record of a node (PyYAML's `anchors` and
+/// `serialized_nodes`).
+#[derive(Clone, Copy, Default)]
+struct NodeState {
+    anchor: Anchor,
+    serialized: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+enum Anchor {
+    #[default]
+    Unseen,
+    Seen,
+    Named(u32),
+}
 
 /// Where the emitter's output goes. Like PyYAML's CEmitter, whose libyaml
 /// output handler writes every flush to the stream (at each document end, and
@@ -173,9 +191,11 @@ pub struct RSafeDumper {
     document_end_implicit: bool,
 
     // Serializer state (reset per document)
-    serialized_nodes: HashSet<usize>,
-    anchors: HashMap<usize, Option<String>>,
-    last_alias_id: i32,
+    /// Per node of the document being serialized: whether the anchor pass
+    /// saw it (and its anchor number once seen twice), and whether it was
+    /// written yet.
+    node_states: Vec<NodeState>,
+    last_alias_id: u32,
 
     // Representer config
     default_style: Option<char>,
@@ -183,7 +203,7 @@ pub struct RSafeDumper {
     sort_keys: bool,
 
     // Representer state (reset per represent() call)
-    represented_objects: HashMap<usize, NodeId>,
+    represented_objects: HashMap<usize, NodeId, FxBuildHasher>,
     /// Nodes of the document being represented.
     nodes: Vec<RepNode>,
     object_keeper: Vec<Py<PyAny>>,
@@ -310,13 +330,12 @@ impl RSafeDumper {
             version,
             tags,
             document_end_implicit: !explicit_end.0,
-            serialized_nodes: HashSet::new(),
-            anchors: HashMap::new(),
+            node_states: Vec::new(),
             last_alias_id: 0,
             default_style: default_style_char,
             default_flow_style: default_flow_style.map(|style| style.0),
             sort_keys: sort_keys.0,
-            represented_objects: HashMap::new(),
+            represented_objects: HashMap::with_hasher(FxBuildHasher),
             nodes: Vec::new(),
             object_keeper: Vec::new(),
             level: 0,
@@ -733,14 +752,15 @@ impl RSafeDumper {
             Event::document_start(version, &tags, self.document_start_implicit),
         )?;
 
+        self.node_states.clear();
+        self.node_states
+            .resize(self.nodes.len(), NodeState::default());
         self.anchor_node(py, node, 0)?;
         self.serialize_node(py, node, 0)?;
 
         self.emit(py, Event::document_end(self.document_end_implicit))?;
 
         // Reset serializer state
-        self.serialized_nodes.clear();
-        self.anchors.clear();
         self.last_alias_id = 0;
         Ok(())
     }
@@ -753,15 +773,16 @@ impl RSafeDumper {
         // Nodes of a document are at most MAX_DEPTH deep, but nodes kept from
         // a failed document can be reused deeper in a later one.
         check_depth(depth)?;
-        if let Some(anchor) = self.anchors.get_mut(&node) {
-            // Seen before with None → assign anchor name
-            if anchor.is_none() {
+        match self.node_states[node].anchor {
+            Anchor::Unseen => self.node_states[node].anchor = Anchor::Seen,
+            Anchor::Seen => {
+                // Reached twice: it gets the next anchor (PyYAML's id001, ...).
                 self.last_alias_id += 1;
-                *anchor = Some(format!("id{:03}", self.last_alias_id));
+                self.node_states[node].anchor = Anchor::Named(self.last_alias_id);
+                return Ok(());
             }
-            return Ok(());
+            Anchor::Named(_) => return Ok(()),
         }
-        self.anchors.insert(node, None);
         for index in 0.. {
             match &self.nodes[node] {
                 RepNode::Sequence { value, .. } if index < value.len() => {
@@ -785,15 +806,18 @@ impl RSafeDumper {
 
     fn serialize_node_inner(&mut self, py: Python, node: NodeId, depth: usize) -> PyResult<()> {
         check_depth(depth)?;
-        let anchor = self.anchors.get(&node).cloned().flatten();
+        let anchor = match self.node_states[node].anchor {
+            Anchor::Named(id) => Some(format!("id{id:03}")),
+            _ => None,
+        };
 
-        if self.serialized_nodes.contains(&node) {
+        if self.node_states[node].serialized {
             // Emit alias
             let anchor_str = anchor.as_deref().unwrap_or("");
             self.emit(py, Event::alias(anchor_str))?;
             return Ok(());
         }
-        self.serialized_nodes.insert(node);
+        self.node_states[node].serialized = true;
 
         let anchor_ref = anchor.as_deref();
 
@@ -958,13 +982,12 @@ pub fn dumps_to_string(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<String> {
         version: None,
         tags: None,
         document_end_implicit: true,
-        serialized_nodes: HashSet::new(),
-        anchors: HashMap::new(),
+        node_states: Vec::new(),
         last_alias_id: 0,
         default_style: None,
         default_flow_style: Some(false),
         sort_keys: false,
-        represented_objects: HashMap::new(),
+        represented_objects: HashMap::with_hasher(FxBuildHasher),
         nodes: Vec::new(),
         object_keeper: Vec::new(),
         level: 0,
