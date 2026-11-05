@@ -1,5 +1,14 @@
-//! Module implement pyyaml compatibility layer for ryaml via libyaml
-//! Implements RLoader, which can load YAML 1.1
+//! PyYAML-compatible loading for ryaml (YAML 1.1).
+//!
+//! Like PyYAML, each document is loaded in two phases. The composer turns
+//! parser events into a node graph (resolving tags, registering anchors and
+//! raising composer errors), then the constructor builds Python objects from it
+//! in PyYAML's order: scalars at once, collections created empty and filled
+//! later from a queue (PyYAML's generator-based `state_generators`). Matching
+//! both phases keeps results and errors identical to PyYAML's SafeLoader.
+
+use std::borrow::Cow;
+use std::collections::{HashMap, VecDeque};
 
 use base64::Engine as _;
 use libyaml_safer::{ErrorKind, Event, EventData, Parser};
@@ -11,60 +20,63 @@ use pyo3::types::{
     PyTzInfo,
 };
 use rustc_hash::FxBuildHasher;
-use std::collections::{HashMap, HashSet};
 
 use crate::exception;
 use crate::input::{Input, Source};
 use crate::resolver;
 
-/// Only mappings with merges need a second construction step. Ordinary mappings
-/// are constructed directly without allocating a node graph.
-struct PendingMapping {
-    dict: Py<PyDict>,
-    sources: Vec<Py<PyAny>>,
-    set: Option<Py<PySet>>,
+type NodeId = usize;
+
+/// A composed node, as in PyYAML's `yaml.nodes`.
+struct Node {
+    /// Resolved tag. Standard tags are static, so most nodes do not allocate.
+    tag: Cow<'static, str>,
+    /// Anchored, so aliases can reach it more than once.
+    anchored: bool,
+    data: NodeData,
+}
+
+enum NodeData {
+    Scalar {
+        value: String,
+        /// The tag was resolved implicitly (no tag, or `!`). ryaml's timestamp
+        /// constructor uses this to take a fast path for the YAML grammar.
+        implicit: bool,
+    },
+    Sequence(Vec<NodeId>),
+    /// Key/value pairs in document order. `flatten_mapping` rewrites them.
+    Mapping(Vec<(NodeId, NodeId)>),
+}
+
+impl NodeData {
+    /// PyYAML's `node.id`, used in error messages.
+    fn kind(&self) -> &'static str {
+        match self {
+            NodeData::Scalar { .. } => "scalar",
+            NodeData::Sequence(_) => "sequence",
+            NodeData::Mapping(_) => "mapping",
+        }
+    }
 }
 
 #[pyclass(name = "_RSafeLoader", subclass)]
 pub struct RSafeLoader {
-    /// Parser over an in-memory string passed by Python
     parser: Parser<Input>,
-    /// Event used by internal parser
+    /// The next event, if it has been parsed but not used yet.
     parsed_event: Option<Event>,
-    /// Anchors mapping anchor name to constructed Python object
-    anchors: HashMap<String, Py<PyAny>, FxBuildHasher>,
-    /// Anchors placed on a `<<` merge key. PyYAML keeps these as `merge`-tagged
-    /// nodes: an alias to one acts as a merge key in key position and is a
-    /// ConstructorError anywhere else.
-    merge_anchors: HashSet<String, FxBuildHasher>,
-    /// Anchored nodes that ryaml used without constructing them as PyYAML would
-    /// (a merge source or pair entry whose tag was ignored, a pair entry with an
-    /// unhashable key), with the ConstructorError message PyYAML raises when an
-    /// alias uses the node as an ordinary value.
-    value_alias_errors: HashMap<String, String, FxBuildHasher>,
-    /// Anchored !!omap / !!pairs merge sources: `anchors` holds the tuple list an
-    /// alias gets as a value, this holds the mappings an alias merges.
-    merge_source_lists: HashMap<String, Py<PyAny>, FxBuildHasher>,
-    /// Raw text of anchored scalars, for an alias used as the `=` value of a
-    /// mapping that is constructed as a scalar (see `mapping_value_scalar`).
-    scalar_anchor_values: HashMap<String, String, FxBuildHasher>,
-    /// Anchored scalars inside skipped entries (see `skip_node`): PyYAML composes
-    /// them but constructs them only when an alias uses them, so keep the tag,
-    /// raw text and implicit flag until then.
-    deferred_scalars: HashMap<String, (Option<String>, String, bool), FxBuildHasher>,
-    /// Anchored collections inside skipped entries. They count for duplicate
-    /// anchors, but cannot be constructed afterwards.
-    skipped_anchors: HashSet<String, FxBuildHasher>,
-    /// Anchors of mappings currently being constructed as scalars (see
-    /// `construct_mapping_as_scalar`), innermost last.
-    scalar_mappings_in_progress: Vec<String>,
-    pending_mappings: Vec<PendingMapping>,
-    // Sets are represented by mapping nodes in YAML and can be merge sources.
-    set_mappings: HashMap<usize, (Py<PySet>, Py<PyDict>), FxBuildHasher>,
-    /// Anchored !!omap / !!pairs lists (by object) and the single-entry
-    /// mappings PyYAML would merge if an alias to them is a merge source.
-    pairs_mappings: HashMap<usize, Py<PyList>, FxBuildHasher>,
-    anchored_mapping_lengths: HashMap<usize, usize, FxBuildHasher>,
+    /// Nodes of the document being loaded.
+    nodes: Vec<Node>,
+    /// Composer anchors: name to node.
+    anchors: HashMap<String, NodeId, FxBuildHasher>,
+    /// Constructed object of each node (PyYAML's `constructed_objects`). Every
+    /// node needs one: besides aliases, merges copy entries that point to
+    /// unanchored nodes, including the mapping being filled.
+    objects: Vec<Option<Py<PyAny>>>,
+    /// The document has a `<<` key. Without one, only anchored nodes can be
+    /// reached twice, so other objects need not be remembered.
+    has_merge: bool,
+    /// Collections created empty and still to be filled, in PyYAML's order.
+    pending: VecDeque<(NodeId, Py<PyAny>)>,
 }
 
 #[pymethods]
@@ -100,1210 +112,536 @@ impl RSafeLoader {
     /// Get the next document as a Python object
     pub fn get_data(&mut self, py: Python) -> PyResult<Option<Py<PyAny>>> {
         if self.check_node(py)? {
-            return self.construct_document(py);
+            let root = self.compose_document(py)?;
+            return self.construct_document(py, root).map(Some);
         }
         Ok(None)
     }
 
     /// Get a single document as a Python object
     pub fn get_single_data(&mut self, py: Python) -> PyResult<Option<Py<PyAny>>> {
-        // Eat stream start event
-        self._parse_next_event(py)?;
+        // PyYAML's get_single_node: drop STREAM-START, compose a document if
+        // there is one, and check the stream ends before constructing anything.
+        self.parse_next_event(py)?;
         self.parsed_event = None;
-
-        // Get document
-        self._parse_next_event(py)?;
-        let document = if !matches!(
-            &self.parsed_event,
-            Some(Event {
-                data: EventData::StreamEnd,
-                ..
-            })
-        ) {
-            match self.construct_document(py) {
-                Ok(document) => document,
-                // PyYAML's get_single_node also checks for the end of the
-                // stream before constructing, so that error wins too.
-                Err(err) if !is_compose_error(py, &err) => {
-                    return Err(match self._parse_next_event(py) {
-                        Err(parse_err) => parse_err,
-                        Ok(()) if !self.at_stream_end() => single_document_error(py),
-                        Ok(()) => err,
-                    });
-                }
-                Err(err) => return Err(err),
-            }
-        } else {
+        self.parse_next_event(py)?;
+        let root = if self.at(|data| matches!(data, EventData::StreamEnd)) {
             None
+        } else {
+            Some(self.compose_document(py)?)
         };
-
-        // Make sure there are no more documents
-        self._parse_next_event(py)?;
-        if !matches!(
-            &self.parsed_event,
-            Some(Event {
-                data: EventData::StreamEnd,
-                ..
-            })
-        ) {
+        self.parse_next_event(py)?;
+        if !self.at(|data| matches!(data, EventData::StreamEnd)) {
             return Err(single_document_error(py));
         }
-
-        Ok(document)
+        match root {
+            Some(root) => self.construct_document(py, root).map(Some),
+            None => Ok(None),
+        }
     }
 
     pub fn dispose(&self) {}
 }
 
+/// Parsing and composing (PyYAML's `Composer`).
 impl RSafeLoader {
-    fn check_node(&mut self, py: Python) -> PyResult<bool> {
-        self._parse_next_event(py)?;
-        if matches!(
-            &self.parsed_event,
-            Some(Event {
-                data: EventData::StreamStart { .. },
-                ..
-            })
-        ) {
-            self.parsed_event = None;
-            self._parse_next_event(py)?;
+    pub fn from_input(input: Input) -> Self {
+        let mut parser = Parser::new();
+        parser.set_input(input);
+        Self {
+            parser,
+            parsed_event: None,
+            nodes: Vec::new(),
+            anchors: HashMap::with_hasher(FxBuildHasher),
+            objects: Vec::new(),
+            has_merge: false,
+            pending: VecDeque::new(),
         }
-        if matches!(
-            &self.parsed_event,
-            Some(Event {
-                data: EventData::StreamEnd,
-                ..
-            })
-        ) {
-            return Ok(false);
-        }
-        Ok(true)
     }
 
-    /// Parse the next event if needed
-    fn _parse_next_event(&mut self, py: Python) -> PyResult<()> {
+    fn parse_next_event(&mut self, py: Python) -> PyResult<()> {
         if self.parsed_event.is_none() {
             match self.parser.parse() {
-                Ok(event) => {
-                    self.parsed_event = Some(event);
-                }
+                Ok(event) => self.parsed_event = Some(event),
                 Err(e) => return Err(parse_error(py, &e)),
             }
         }
         Ok(())
     }
 
-    /// Register an anchor, rejecting duplicates (pyyaml ComposerError behavior).
-    fn register_anchor(&mut self, py: Python, name: String, value: Py<PyAny>) -> PyResult<()> {
-        self.check_new_anchor(py, &name)?;
-        self.anchors.insert(name, value);
-        Ok(())
+    fn at(&self, test: impl Fn(&EventData) -> bool) -> bool {
+        self.parsed_event.as_ref().is_some_and(|e| test(&e.data))
     }
 
-    fn register_merge_anchor(&mut self, py: Python, name: String) -> PyResult<()> {
-        self.check_new_anchor(py, &name)?;
-        self.merge_anchors.insert(name);
-        Ok(())
+    fn check_node(&mut self, py: Python) -> PyResult<bool> {
+        self.parse_next_event(py)?;
+        if self.at(|data| matches!(data, EventData::StreamStart { .. })) {
+            self.parsed_event = None;
+            self.parse_next_event(py)?;
+        }
+        Ok(!self.at(|data| matches!(data, EventData::StreamEnd)))
     }
 
-    /// Whether `name` was defined earlier in the document, in any form.
-    fn is_known_anchor(&self, name: &str) -> bool {
-        self.anchors.contains_key(name)
-            || self.merge_anchors.contains(name)
-            || self.deferred_scalars.contains_key(name)
-            || self.skipped_anchors.contains(name)
+    /// Compose the document at the current DOCUMENT-START event.
+    fn compose_document(&mut self, py: Python) -> PyResult<NodeId> {
+        self.parsed_event = None;
+        self.nodes.clear();
+        self.anchors.clear();
+        self.has_merge = false;
+        let root = self.compose_node(py)?;
+        // Drop the DOCUMENT-END event.
+        self.parse_next_event(py)?;
+        self.parsed_event = None;
+        self.anchors.clear();
+        Ok(root)
     }
 
-    /// A node that fails to construct still holds its anchor (PyYAML's composer
-    /// registered it first), so a duplicate is still an error and aliases to it
-    /// inside the rest of the document are not "undefined".
-    fn reserve_failed_anchor(&mut self, py: Python, anchor: Option<String>) -> PyResult<()> {
+    /// PyYAML's `compose_node`, with an explicit stack instead of recursion so
+    /// deeply nested input cannot overflow the native stack.
+    fn compose_node(&mut self, py: Python) -> PyResult<NodeId> {
+        // Open collections, with a mapping's key waiting for its value.
+        let mut open: Vec<(NodeId, Option<NodeId>)> = Vec::new();
+        loop {
+            self.parse_next_event(py)?;
+            let event = self.parsed_event.take().expect("event parsed above");
+            let complete = match event.data {
+                EventData::Alias { anchor } => match self.anchors.get(&anchor) {
+                    Some(&node) => Some(node),
+                    None => {
+                        return Err(exception::composer_error(
+                            py,
+                            format!("found undefined alias '{anchor}'"),
+                        ));
+                    }
+                },
+                EventData::Scalar {
+                    anchor,
+                    tag,
+                    value,
+                    plain_implicit,
+                    ..
+                } => {
+                    self.check_anchor(py, anchor.as_deref())?;
+                    let implicit = tag.as_deref().is_none_or(|t| t == "!");
+                    let tag = if implicit {
+                        Cow::Borrowed(resolver::resolve_scalar_tag(&value, plain_implicit))
+                    } else {
+                        known_tag(tag.expect("explicit tag"))
+                    };
+                    let node = self.add_node(anchor, tag, NodeData::Scalar { value, implicit });
+                    Some(node)
+                }
+                EventData::SequenceStart { anchor, tag, .. } => {
+                    self.check_anchor(py, anchor.as_deref())?;
+                    let tag = collection_tag(tag, crate::TAG_SEQ);
+                    let node = self.add_node(anchor, tag, NodeData::Sequence(Vec::new()));
+                    open.push((node, None));
+                    None
+                }
+                EventData::MappingStart { anchor, tag, .. } => {
+                    self.check_anchor(py, anchor.as_deref())?;
+                    let tag = collection_tag(tag, crate::TAG_MAP);
+                    let node = self.add_node(anchor, tag, NodeData::Mapping(Vec::new()));
+                    open.push((node, None));
+                    None
+                }
+                EventData::SequenceEnd | EventData::MappingEnd => {
+                    Some(open.pop().expect("end event closes an open collection").0)
+                }
+                other => {
+                    return Err(exception::composer_error(
+                        py,
+                        format!("unexpected event: {other:?}"),
+                    ));
+                }
+            };
+            let Some(node) = complete else { continue };
+            let Some((parent, key)) = open.last_mut() else {
+                return Ok(node);
+            };
+            match &mut self.nodes[*parent].data {
+                NodeData::Sequence(items) => items.push(node),
+                NodeData::Mapping(entries) => match key.take() {
+                    None => *key = Some(node),
+                    Some(key) => entries.push((key, node)),
+                },
+                NodeData::Scalar { .. } => unreachable!("scalars are never open"),
+            }
+        }
+    }
+
+    fn check_anchor(&self, py: Python, anchor: Option<&str>) -> PyResult<()> {
+        match anchor {
+            Some(anchor) if self.anchors.contains_key(anchor) => Err(exception::composer_error(
+                py,
+                format!("found duplicate anchor '{anchor}'"),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    fn add_node(
+        &mut self,
+        anchor: Option<String>,
+        tag: Cow<'static, str>,
+        data: NodeData,
+    ) -> NodeId {
+        let node = self.nodes.len();
+        self.has_merge |= tag == crate::TAG_MERGE;
+        self.nodes.push(Node {
+            tag,
+            anchored: anchor.is_some(),
+            data,
+        });
         if let Some(anchor) = anchor {
-            self.check_new_anchor(py, &anchor)?;
-            self.skipped_anchors.insert(anchor);
+            self.anchors.insert(anchor, node);
+        }
+        node
+    }
+}
+
+/// Constructing (PyYAML's `SafeConstructor`).
+impl RSafeLoader {
+    /// PyYAML's `construct_document`: construct the root, then fill collections
+    /// in the order they were created.
+    fn construct_document(&mut self, py: Python, root: NodeId) -> PyResult<Py<PyAny>> {
+        self.objects.clear();
+        self.objects.resize_with(self.nodes.len(), || None);
+        self.pending.clear();
+        let result = self.construct_object(py, root).and_then(|data| {
+            while let Some((node, object)) = self.pending.pop_front() {
+                self.fill_collection(py, node, object.bind(py))?;
+            }
+            Ok(data)
+        });
+        self.objects.clear();
+        self.pending.clear();
+        self.nodes.clear();
+        result
+    }
+
+    /// PyYAML's `construct_object`: each node is constructed once. Collections
+    /// are created empty here and filled later (`fill_collection`).
+    fn construct_object(&mut self, py: Python, node: NodeId) -> PyResult<Py<PyAny>> {
+        if let Some(object) = &self.objects[node] {
+            return Ok(object.clone_ref(py));
+        }
+        let remember = self.has_merge || self.nodes[node].anchored;
+        let object = match self.nodes[node].tag.as_ref() {
+            crate::TAG_SEQ | crate::TAG_OMAP | crate::TAG_PAIRS => PyList::empty(py).into_any(),
+            crate::TAG_MAP => PyDict::new(py).into_any(),
+            crate::TAG_SET => PySet::empty(py)?.into_any(),
+            _ => {
+                let object = self.construct_scalar_object(py, node)?;
+                if remember {
+                    self.objects[node] = Some(object.clone_ref(py));
+                }
+                return Ok(object);
+            }
+        };
+        let object = object.unbind();
+        self.pending.push_back((node, object.clone_ref(py)));
+        if remember {
+            self.objects[node] = Some(object.clone_ref(py));
+        }
+        Ok(object)
+    }
+
+    /// The constructors for scalar tags, and the undefined-tag error.
+    fn construct_scalar_object(&mut self, py: Python, node: NodeId) -> PyResult<Py<PyAny>> {
+        let tag = self.nodes[node].tag.as_ref();
+        if !matches!(
+            tag,
+            crate::TAG_NULL
+                | crate::TAG_BOOL
+                | crate::TAG_INT
+                | crate::TAG_FLOAT
+                | crate::TAG_BINARY
+                | crate::TAG_TIMESTAMP
+                | crate::TAG_STR
+        ) {
+            return Err(exception::constructor_error(py, unknown_tag_message(tag)));
+        }
+        let value = self.construct_scalar(py, node)?;
+        Ok(match self.nodes[node].tag.as_ref() {
+            crate::TAG_NULL => py.None(),
+            crate::TAG_BOOL => construct_bool_direct(py, value)?,
+            crate::TAG_INT => construct_int_direct(py, value)?,
+            crate::TAG_FLOAT => construct_float_direct(py, value)?,
+            crate::TAG_BINARY => construct_binary(py, value)?,
+            crate::TAG_TIMESTAMP => match &self.nodes[node].data {
+                NodeData::Scalar { implicit, .. } => construct_timestamp(py, value, *implicit)?,
+                // PyYAML matches its timestamp regex against node.value, which
+                // for a mapping is its list of entries.
+                _ => {
+                    return Err(PyTypeError::new_err(
+                        "expected string or bytes-like object, got 'list'",
+                    ));
+                }
+            },
+            _ => PyString::new(py, value).into_any().unbind(),
+        })
+    }
+
+    /// PyYAML's `SafeConstructor.construct_scalar`: a scalar's text, or for a
+    /// mapping the text of its first `=` (value) key's value, recursively.
+    fn construct_scalar(&self, py: Python, mut node: NodeId) -> PyResult<&str> {
+        for _ in 0..=self.nodes.len() {
+            match &self.nodes[node].data {
+                NodeData::Scalar { value, .. } => return Ok(value),
+                NodeData::Mapping(entries) => {
+                    let value_key = entries
+                        .iter()
+                        .find(|(key, _)| self.nodes[*key].tag == crate::TAG_VALUE);
+                    match value_key {
+                        Some(&(_, value)) => node = value,
+                        None => return Err(expected_scalar_error(py, "mapping")),
+                    }
+                }
+                NodeData::Sequence(_) => return Err(expected_scalar_error(py, "sequence")),
+            }
+        }
+        // A `=` chain back to a mapping already visited: PyYAML recurses forever.
+        Err(PyRecursionError::new_err(
+            "maximum recursion depth exceeded",
+        ))
+    }
+
+    /// The deferred part of a collection constructor (after PyYAML's `yield`).
+    fn fill_collection(
+        &mut self,
+        py: Python,
+        node: NodeId,
+        object: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        match self.nodes[node].tag.as_ref() {
+            crate::TAG_SEQ => {
+                let NodeData::Sequence(items) = &self.nodes[node].data else {
+                    let found = self.nodes[node].data.kind();
+                    return Err(exception::constructor_error(
+                        py,
+                        format!("expected a sequence node, but found {found}"),
+                    ));
+                };
+                let list = object.cast::<PyList>()?;
+                for index in 0..items.len() {
+                    let NodeData::Sequence(items) = &self.nodes[node].data else {
+                        unreachable!()
+                    };
+                    let item = self.construct_object(py, items[index])?;
+                    list.append(item)?;
+                }
+            }
+            crate::TAG_MAP => {
+                let dict = object.cast::<PyDict>()?;
+                self.construct_mapping(py, node, |key, value| dict.set_item(key, value))?;
+            }
+            crate::TAG_SET => {
+                let set = object.cast::<PySet>()?;
+                self.construct_mapping(py, node, |key, _| set.add(key))?;
+            }
+            tag => {
+                let pairs = object.cast::<PyList>()?;
+                let what = if tag == crate::TAG_OMAP {
+                    "an ordered map"
+                } else {
+                    "pairs"
+                };
+                self.construct_pairs(py, node, what, pairs)?;
+            }
         }
         Ok(())
     }
 
-    fn check_new_anchor(&self, py: Python, name: &str) -> PyResult<()> {
-        if self.is_known_anchor(name) {
-            return Err(exception::composer_error(
+    /// PyYAML's `SafeConstructor.construct_mapping`: flatten merges, then
+    /// construct each key and value in order.
+    fn construct_mapping(
+        &mut self,
+        py: Python,
+        node: NodeId,
+        mut insert: impl FnMut(&Bound<'_, PyAny>, &Bound<'_, PyAny>) -> PyResult<()>,
+    ) -> PyResult<()> {
+        if !matches!(self.nodes[node].data, NodeData::Mapping(_)) {
+            let found = self.nodes[node].data.kind();
+            return Err(exception::constructor_error(
                 py,
-                format!("found duplicate anchor '{}'", name),
+                format!("expected a mapping node, but found {found}"),
             ));
         }
-        Ok(())
-    }
-
-    fn at_stream_end(&self) -> bool {
-        matches!(
-            &self.parsed_event,
-            Some(Event {
-                data: EventData::StreamEnd,
-                ..
-            })
-        )
-    }
-
-    /// PyYAML composes a whole document before constructing it, so a parse or
-    /// composer error anywhere in it wins over a construction error raised
-    /// earlier. After a construction error, read the rest of the document and
-    /// return the first such error, or `err` if there is none.
-    fn first_compose_error(&mut self, py: Python, err: PyErr) -> PyErr {
-        if is_compose_error(py, &err) {
-            return err;
-        }
-        loop {
-            let event = match self.parsed_event.take() {
-                Some(event) => event,
-                None => match self.parser.parse() {
-                    Ok(event) => event,
-                    Err(e) => return parse_error(py, &e),
-                },
-            };
-            let anchor = match event.data {
-                EventData::DocumentEnd { .. } | EventData::StreamEnd => return err,
-                EventData::Alias { anchor } => {
-                    if !self.is_known_anchor(&anchor) {
-                        return exception::composer_error(
-                            py,
-                            format!("found undefined alias '{}'", anchor),
-                        );
-                    }
-                    continue;
-                }
-                EventData::Scalar { anchor, .. }
-                | EventData::SequenceStart { anchor, .. }
-                | EventData::MappingStart { anchor, .. } => anchor,
-                _ => None,
-            };
-            if let Some(anchor) = anchor {
-                if let Err(dup) = self.check_new_anchor(py, &anchor) {
-                    return dup;
-                }
-                self.skipped_anchors.insert(anchor);
-            }
-        }
-    }
-
-    /// Construct a document directly from events
-    fn construct_document(&mut self, py: Python) -> PyResult<Option<Py<PyAny>>> {
-        // Eat document start event
-        self.parsed_event = None;
-
-        // Construct the root object directly from events
-        self._parse_next_event(py)?;
-        let result = match self.construct_from_events(py) {
-            Ok(result) => result,
-            Err(err) => return Err(self.first_compose_error(py, err)),
-        };
-
-        // Eat document end event
-        self._parse_next_event(py)?;
-        self.parsed_event = None;
-
-        // Resolve merges after all explicit entries, including ancestor entries,
-        // exist. Preserve the objects already referenced by aliases.
-        self.finish_mappings(py)?;
-
-        // Clear anchors for next document
-        self.anchors.clear();
-        self.merge_anchors.clear();
-        self.value_alias_errors.clear();
-        self.merge_source_lists.clear();
-        self.scalar_anchor_values.clear();
-        self.deferred_scalars.clear();
-        self.skipped_anchors.clear();
-        self.scalar_mappings_in_progress.clear();
-        self.set_mappings.clear();
-        self.pairs_mappings.clear();
-        self.anchored_mapping_lengths.clear();
-
-        Ok(Some(result))
-    }
-
-    /// Core single-pass constructor: consume the current event and produce a Python object
-    fn construct_from_events(&mut self, py: Python) -> PyResult<Py<PyAny>> {
-        let event = self.parsed_event.take().unwrap();
-        match event.data {
-            EventData::Alias { anchor } => {
-                if let Some(message) = self.value_alias_errors.get(&anchor) {
-                    Err(exception::constructor_error(py, message.clone()))
-                } else if let Some(obj) = self.anchors.get(&anchor) {
-                    Ok(obj.clone_ref(py))
-                } else if let Some((tag, value, implicit)) = self.deferred_scalars.remove(&anchor) {
-                    // First use of a composed-but-unconstructed scalar: construct
-                    // it now (with its own errors, as PyYAML) and cache it.
-                    let obj = self.construct_scalar_direct(py, None, tag, value, implicit)?;
-                    self.anchors.insert(anchor, obj.clone_ref(py));
-                    Ok(obj)
-                } else if self.merge_anchors.contains(&anchor) {
-                    Err(merge_node_error(py))
-                } else {
-                    Err(exception::composer_error(
-                        py,
-                        format!("found undefined alias '{}'", anchor),
-                    ))
-                }
-            }
-            EventData::Scalar {
-                anchor,
-                tag,
-                value,
-                plain_implicit,
-                ..
-            } => self.construct_scalar_direct(py, anchor, tag, value, plain_implicit),
-            EventData::SequenceStart { anchor, tag, .. } => {
-                self.construct_sequence_direct(py, anchor, tag)
-            }
-            EventData::MappingStart { anchor, tag, .. } => {
-                self.construct_mapping_direct(py, anchor, tag)
-            }
-            _ => Err(exception::composer_error(
-                py,
-                format!("unexpected event: {:?}", event.data),
-            )),
-        }
-    }
-
-    /// Construct a Python object directly from a scalar event
-    fn construct_scalar_direct(
-        &mut self,
-        py: Python,
-        anchor: Option<String>,
-        tag: Option<String>,
-        value: String,
-        plain_implicit: bool,
-    ) -> PyResult<Py<PyAny>> {
-        // Resolve tag inline — &'static str, no allocation for common case
-        // "!" is the non-specific tag — resolve as if untagged
-        let resolved_tag: &str = if let Some(ref t) = tag {
-            if t == "!" {
-                resolver::resolve_scalar_tag(&value, plain_implicit)
-            } else {
-                t.as_str()
-            }
-        } else {
-            resolver::resolve_scalar_tag(&value, plain_implicit)
-        };
-
-        // PyYAML's composer registers (and checks) the anchor before the
-        // constructor runs, so a duplicate wins over a construction error and a
-        // node that fails to construct still holds its anchor.
-        if let Some(anchor_name) = &anchor {
-            self.check_new_anchor(py, anchor_name)?;
-        }
-        let result = (|| -> PyResult<Py<PyAny>> {
-            Ok(match resolved_tag {
-                crate::TAG_NULL => py.None(),
-                crate::TAG_BOOL => construct_bool_direct(py, &value)?,
-                crate::TAG_INT => construct_int_direct(py, &value)?,
-                crate::TAG_FLOAT => construct_float_direct(py, &value)?,
-                crate::TAG_TIMESTAMP => {
-                    construct_timestamp(py, &value, tag.as_deref().is_none_or(|tag| tag == "!"))?
-                }
-                crate::TAG_BINARY => construct_binary(py, &value)?,
-                crate::TAG_STR => PyString::new(py, &value).into_any().unbind(),
-                _ => {
-                    return Err(exception::constructor_error(
-                        py,
-                        format!(
-                            "could not determine a constructor for the tag '{}'",
-                            resolved_tag
-                        ),
-                    ));
-                }
-            })
-        })();
-        let result = match result {
-            Ok(result) => result,
-            Err(err) => {
-                if let Some(anchor_name) = anchor {
-                    self.skipped_anchors.insert(anchor_name);
-                }
-                return Err(err);
-            }
-        };
-
-        if let Some(anchor_name) = anchor {
-            self.scalar_anchor_values.insert(anchor_name.clone(), value);
-            self.register_anchor(py, anchor_name, result.clone_ref(py))?;
-        }
-
-        Ok(result)
-    }
-
-    /// Construct a Python list directly from sequence events
-    fn construct_sequence_direct(
-        &mut self,
-        py: Python,
-        anchor: Option<String>,
-        tag: Option<String>,
-    ) -> PyResult<Py<PyAny>> {
-        // Reject unknown tags (pyyaml SafeConstructor behavior)
-        if let Some(ref t) = tag
-            && !matches!(
-                t.as_str(),
-                "!" | crate::TAG_SEQ | crate::TAG_OMAP | crate::TAG_PAIRS
-            )
+        self.flatten_mapping(py, node)?;
+        let mut index = 0;
+        while let NodeData::Mapping(entries) = &self.nodes[node].data
+            && let Some(&(key_node, value_node)) = entries.get(index)
         {
-            self.reserve_failed_anchor(py, anchor)?;
-            return Err(exception::constructor_error(py, unknown_tag_message(t)));
-        }
-        let pairs = matches!(tag.as_deref(), Some(crate::TAG_OMAP | crate::TAG_PAIRS));
-        let list = PyList::empty(py);
-        let list_obj: Py<PyAny> = list.clone().unbind().into_any();
-
-        // Store in anchors BEFORE recursing (handles circular references)
-        let anchored_pairs = pairs && anchor.is_some();
-        if let Some(anchor_name) = anchor {
-            self.register_anchor(py, anchor_name, list_obj.clone_ref(py))?;
-        }
-
-        // Consume child events until SequenceEnd
-        loop {
-            self._parse_next_event(py)?;
-            if matches!(
-                &self.parsed_event,
-                Some(Event {
-                    data: EventData::SequenceEnd,
-                    ..
-                })
-            ) {
-                break;
-            }
-            let item = if pairs {
-                self.construct_pair_entry(py)?
-            } else {
-                self.construct_from_events(py)?
-            };
-            list.append(item)?;
-        }
-
-        self.parsed_event = None;
-        if anchored_pairs {
-            // PyYAML merges the node, a sequence of single-entry mappings, so an
-            // alias used as a merge source gets those mappings, not the tuples.
-            let mappings = PyList::empty(py);
-            let all_hashable = list.iter().all(|entry| {
-                let mapping = PyDict::new(py);
-                entry
-                    .cast::<PyTuple>()
-                    .ok()
-                    .and_then(|t| {
-                        mapping
-                            .set_item(t.get_item(0).ok()?, t.get_item(1).ok()?)
-                            .ok()
-                    })
-                    .and_then(|()| mappings.append(mapping).ok())
-                    .is_some()
-            });
-            if all_hashable {
-                self.pairs_mappings
-                    .insert(list.as_ptr() as usize, mappings.unbind());
-            }
-        }
-        Ok(list_obj)
-    }
-
-    /// Construct a Python dict directly from mapping events, with inline merge key handling
-    fn construct_mapping_direct(
-        &mut self,
-        py: Python,
-        anchor: Option<String>,
-        tag: Option<String>,
-    ) -> PyResult<Py<PyAny>> {
-        let record_length = anchor.is_some();
-        let mut length = 0;
-        let is_set = tag.as_deref() == Some(crate::TAG_SET);
-        if let Some(t) = tag.as_deref()
-            && is_scalar_tag(t)
-        {
-            return self.construct_mapping_as_scalar(py, anchor, tag.unwrap());
-        }
-        // Reject unknown tags (pyyaml SafeConstructor behavior)
-        if let Some(ref t) = tag
-            && t != "!"
-            && t != crate::TAG_MAP
-            && t != crate::TAG_SET
-        {
-            self.reserve_failed_anchor(py, anchor)?;
-            return Err(exception::constructor_error(py, unknown_tag_message(t)));
-        }
-
-        let dict = PyDict::new(py);
-        let set = if is_set {
-            Some(PySet::empty(py)?)
-        } else {
-            None
-        };
-        let dict_obj: Py<PyAny> = match &set {
-            Some(set) => set.clone().into_any().unbind(),
-            None => dict.clone().into_any().unbind(),
-        };
-
-        // Store in anchors BEFORE recursing (handles circular references)
-        if let Some(anchor_name) = anchor {
-            self.register_anchor(py, anchor_name, dict_obj.clone_ref(py))?;
-        }
-
-        if let Some(set) = &set {
-            self.set_mappings.insert(
-                dict_obj.as_ptr() as usize,
-                (set.clone().unbind(), dict.clone().unbind()),
-            );
-        }
-        let mut merge_sources: Vec<Py<PyAny>> = Vec::new();
-
-        loop {
-            self._parse_next_event(py)?;
-            if matches!(
-                &self.parsed_event,
-                Some(Event {
-                    data: EventData::MappingEnd,
-                    ..
-                })
-            ) {
-                break;
-            }
-
-            length += 1;
-            // Check if the key is a merge key BEFORE constructing it
-            let is_merge = is_merge_key(&self.parsed_event, &self.merge_anchors);
-
-            if is_merge {
-                // Consume the merge key event without constructing, but keep
-                // its anchor so duplicates and later aliases behave like PyYAML.
-                if let Some(Event {
-                    data:
-                        EventData::Scalar {
-                            anchor: Some(anchor),
-                            ..
-                        },
-                    ..
-                }) = self.parsed_event.take()
-                {
-                    self.register_merge_anchor(py, anchor)?;
-                }
-
-                // Parse the value
-                self._parse_next_event(py)?;
-                let mut value = self.construct_merge_value(py)?;
-                if let Some((_, mapping)) = self.set_mappings.get(&(value.as_ptr() as usize)) {
-                    value = mapping.clone_ref(py).into_any();
-                }
-
-                // Collect merge source(s) — must be a mapping or list of mappings
-                if value.downcast_bound::<PyDict>(py).is_ok() {
-                    merge_sources.push(value);
-                } else if value.downcast_bound::<PyList>(py).is_ok() {
-                    // Expanded in `finish_mapping`: the list may be an alias to
-                    // a sequence still under construction (a recursive merge).
-                    merge_sources.push(value);
-                } else {
-                    return Err(exception::constructor_error(
-                        py,
-                        "expected a mapping or list of mappings for merging, but found non-mapping"
-                            .to_string(),
-                    ));
-                }
-                continue;
-            }
-
-            // Rewrite value tag to str (pyyaml's flatten_mapping behavior)
-            if let Some(Event {
-                data:
-                    EventData::Scalar {
-                        ref mut tag,
-                        ref value,
-                        plain_implicit,
-                        ..
-                    },
-                ..
-            }) = self.parsed_event
-                && is_value_key(tag.as_deref(), value, plain_implicit)
+            index += 1;
+            let key = self.construct_object(py, key_node)?;
+            let key = key.bind(py);
+            if key.is_instance_of::<PyList>()
+                || key.is_instance_of::<PyDict>()
+                || key.is_instance_of::<PySet>()
             {
-                *tag = Some(crate::TAG_STR.to_string());
-            }
-
-            let key = self.construct_from_events(py)?;
-
-            // Parse the value
-            self._parse_next_event(py)?;
-            let value = self.construct_from_events(py)?;
-
-            // Reject unhashable keys (dicts, lists) like pyyaml
-            if key.bind(py).hash().is_err() {
                 return Err(exception::constructor_error(
                     py,
                     "found unhashable key".to_string(),
                 ));
             }
-            dict.set_item(&key, value)?;
-        }
-
-        if record_length {
-            self.anchored_mapping_lengths
-                .insert(dict_obj.as_ptr() as usize, length);
-        }
-        if !merge_sources.is_empty() {
-            self.pending_mappings.push(PendingMapping {
-                dict: dict.clone().unbind(),
-                sources: merge_sources,
-                set: set.map(Bound::unbind),
-            });
-        } else if let Some(set) = set {
-            for key in dict.keys().iter() {
-                set.add(key)?;
-            }
-        }
-
-        self.parsed_event = None;
-        Ok(dict_obj)
-    }
-
-    /// A scalar tag on a mapping: PyYAML's `SafeConstructor.construct_scalar`
-    /// uses the raw value of the mapping's first `=` (value) key, so
-    /// `!!int {=: 5}` is 5. The mapping's other entries are never constructed.
-    fn construct_mapping_as_scalar(
-        &mut self,
-        py: Python,
-        anchor: Option<String>,
-        tag: String,
-    ) -> PyResult<Py<PyAny>> {
-        // PyYAML's composer registers the anchor before the mapping's entries,
-        // so they can neither reuse it nor see it as undefined.
-        if let Some(anchor) = &anchor {
-            self.check_new_anchor(py, anchor)?;
-            self.skipped_anchors.insert(anchor.clone());
-            self.scalar_mappings_in_progress.push(anchor.clone());
-        }
-        let value = self.mapping_value_scalar(py, false);
-        if anchor.is_some() {
-            self.scalar_mappings_in_progress.pop();
-        }
-        let Some(value) = value? else {
-            return Err(expected_scalar_error(py, "mapping"));
-        };
-        if tag == crate::TAG_TIMESTAMP {
-            // PyYAML matches its timestamp regex against the node's entry list.
-            return Err(PyTypeError::new_err(
-                "expected string or bytes-like object, got 'list'",
-            ));
-        }
-        // The anchor stays reserved on the errors above, as PyYAML's composer
-        // registered it; construct_scalar_direct registers it properly.
-        if let Some(anchor) = &anchor {
-            self.skipped_anchors.remove(anchor);
-        }
-        self.construct_scalar_direct(py, anchor, Some(tag), value, false)
-    }
-
-    /// Consume the rest of a mapping (its start event already taken) and return
-    /// the raw scalar text of its first `=` key's value, if it has one.
-    ///
-    /// When `skipping` (the mapping is inside an entry PyYAML never constructs),
-    /// a `=` value that is not a plain scalar is only checked, not resolved:
-    /// resolving it could fail (e.g. an alias back into a mapping still being
-    /// built) where PyYAML does nothing. Its result is then unknown (`None`).
-    fn mapping_value_scalar(&mut self, py: Python, skipping: bool) -> PyResult<Option<String>> {
-        let mut found = None;
-        let mut value_seen = false;
-        loop {
-            self._parse_next_event(py)?;
-            let is_value = match &self.parsed_event {
-                Some(Event {
-                    data: EventData::MappingEnd,
-                    ..
-                }) => break,
-                Some(Event {
-                    data:
-                        EventData::Scalar {
-                            tag,
-                            value,
-                            plain_implicit,
-                            ..
-                        },
-                    ..
-                }) => is_value_key(tag.as_deref(), value, *plain_implicit),
-                _ => false,
-            };
-            self.skip_node(py)?;
-            self._parse_next_event(py)?;
-            let scalar = matches!(
-                &self.parsed_event,
-                Some(Event {
-                    data: EventData::Scalar { .. },
-                    ..
-                })
-            );
-            if is_value && !value_seen && (scalar || !skipping) {
-                found = Some(self.node_scalar_value(py)?);
-            } else {
-                self.skip_node(py)?;
-            }
-            value_seen |= is_value;
-        }
-        self.parsed_event = None;
-        Ok(found)
-    }
-
-    /// The raw scalar text of the current node, following `=` keys through
-    /// mappings like PyYAML's `construct_scalar`.
-    fn node_scalar_value(&mut self, py: Python) -> PyResult<String> {
-        let event = self.parsed_event.take().unwrap();
-        match event.data {
-            EventData::Scalar {
-                anchor,
-                tag,
-                value,
-                plain_implicit,
-                ..
-            } => {
-                if let Some(anchor) = anchor {
-                    self.defer_scalar(py, anchor, tag, value.clone(), plain_implicit)?;
-                }
-                Ok(value)
-            }
-            EventData::Alias { anchor } => match self.scalar_anchor_values.get(&anchor) {
-                Some(value) => Ok(value.clone()),
-                // PyYAML's construct_scalar follows the alias back into the
-                // mapping it is constructing, forever.
-                None if self.scalar_mappings_in_progress.contains(&anchor) => Err(
-                    PyRecursionError::new_err("maximum recursion depth exceeded"),
-                ),
-                None if self.anchors.contains_key(&anchor)
-                    || self.skipped_anchors.contains(&anchor) =>
-                {
-                    Err(expected_scalar_error(py, "collection"))
-                }
-                None => Err(exception::composer_error(
-                    py,
-                    format!("found undefined alias '{}'", anchor),
-                )),
-            },
-            EventData::MappingStart { anchor, tag, .. } => self
-                .scan_mapping(py, anchor, tag, false)?
-                .ok_or_else(|| expected_scalar_error(py, "mapping")),
-            EventData::SequenceStart { anchor, .. } => {
-                self.reserve_failed_anchor(py, anchor)?;
-                Err(expected_scalar_error(py, "sequence"))
-            }
-            _ => Err(expected_scalar_error(py, "sequence")),
-        }
-    }
-
-    /// Consume the current node without constructing it. PyYAML still composes
-    /// it, so every anchor inside is checked for duplicates and recorded, and
-    /// every alias must refer to an earlier anchor.
-    fn skip_node(&mut self, py: Python) -> PyResult<()> {
-        match self.parsed_event.take().unwrap().data {
-            EventData::Scalar {
-                anchor: Some(anchor),
-                tag,
-                value,
-                plain_implicit,
-                ..
-            } => self.defer_scalar(py, anchor, tag, value, plain_implicit)?,
-            EventData::Alias { anchor } if !self.is_known_anchor(&anchor) => {
-                return Err(exception::composer_error(
-                    py,
-                    format!("found undefined alias '{}'", anchor),
-                ));
-            }
-            EventData::SequenceStart { anchor, .. } => {
-                if let Some(anchor) = anchor {
-                    self.check_new_anchor(py, &anchor)?;
-                    self.skipped_anchors.insert(anchor);
-                }
-                loop {
-                    self._parse_next_event(py)?;
-                    if matches!(
-                        &self.parsed_event,
-                        Some(Event {
-                            data: EventData::SequenceEnd,
-                            ..
-                        })
-                    ) {
-                        self.parsed_event = None;
-                        break;
-                    }
-                    self.skip_node(py)?;
-                }
-            }
-            EventData::MappingStart { anchor, tag, .. } => {
-                self.scan_mapping(py, anchor, tag, true)?;
-            }
-            _ => {}
+            let value = self.construct_object(py, value_node)?;
+            insert(key, value.bind(py))?;
         }
         Ok(())
     }
 
-    /// Read a mapping (its start event already taken) without constructing it,
-    /// returning the raw text of its `=` value like `mapping_value_scalar`. Its
-    /// anchor is registered first, as PyYAML's composer does; afterwards an
-    /// alias to it constructs lazily if it has a scalar tag and a `=` value
-    /// (what PyYAML would build), and is otherwise a skipped collection.
-    fn scan_mapping(
-        &mut self,
-        py: Python,
-        anchor: Option<String>,
-        tag: Option<String>,
-        skipping: bool,
-    ) -> PyResult<Option<String>> {
-        let Some(anchor) = anchor else {
-            return self.mapping_value_scalar(py, skipping);
-        };
-        self.check_new_anchor(py, &anchor)?;
-        self.skipped_anchors.insert(anchor.clone());
-        self.scalar_mappings_in_progress.push(anchor.clone());
-        let value = self.mapping_value_scalar(py, skipping);
-        self.scalar_mappings_in_progress.pop();
-        let value = value?;
-        if let Some(value) = &value {
-            // An alias in another `=` value follows this mapping's `=` key.
-            self.scalar_anchor_values
-                .insert(anchor.clone(), value.clone());
-            if let Some(t) = tag.as_deref()
-                && is_scalar_tag(t)
-                && t != crate::TAG_TIMESTAMP
-            {
-                self.skipped_anchors.remove(&anchor);
-                self.deferred_scalars
-                    .insert(anchor, (tag, value.clone(), false));
-            }
-        }
-        Ok(value)
-    }
-
-    fn defer_scalar(
-        &mut self,
-        py: Python,
-        anchor: String,
-        tag: Option<String>,
-        value: String,
-        plain_implicit: bool,
-    ) -> PyResult<()> {
-        self.check_new_anchor(py, &anchor)?;
-        self.scalar_anchor_values
-            .insert(anchor.clone(), value.clone());
-        self.deferred_scalars
-            .insert(anchor, (tag, value, plain_implicit));
-        Ok(())
-    }
-
-    /// Construct the value of a `<<` key. PyYAML merges by node kind and never
-    /// constructs the merge value, or the mappings in a merge sequence, by tag.
-    fn construct_merge_value(&mut self, py: Python) -> PyResult<Py<PyAny>> {
-        if let Some(Event {
-            data: EventData::Alias { anchor },
-            ..
-        }) = &self.parsed_event
-        {
-            if let Some(obj) = self
-                .merge_source_lists
-                .get(anchor)
-                .or_else(|| self.anchors.get(anchor))
-            {
-                let obj = obj.clone_ref(py);
-                self.parsed_event = None;
-                return Ok(obj);
-            }
-        }
-        // PyYAML rejects a scalar merge value by node kind, never constructing it.
-        if matches!(
-            &self.parsed_event,
-            Some(Event {
-                data: EventData::Scalar { .. },
-                ..
-            })
-        ) {
-            let anchor = match self.parsed_event.take().map(|e| e.data) {
-                Some(EventData::Scalar { anchor, .. }) => anchor,
-                _ => None,
-            };
-            self.reserve_failed_anchor(py, anchor)?;
-            return Err(exception::constructor_error(
-                py,
-                "expected a mapping or list of mappings for merging, but found scalar".to_string(),
-            ));
-        }
-        let stripped = self.untag_merge_source(true);
-        let pairs = matches!(
-            stripped.as_deref(),
-            Some(crate::TAG_OMAP | crate::TAG_PAIRS)
-        );
-        if !matches!(
-            &self.parsed_event,
-            Some(Event {
-                data: EventData::SequenceStart { .. },
-                ..
-            })
-        ) {
-            return self.construct_from_events(py);
-        }
-        let Some(Event {
-            data: EventData::SequenceStart { anchor, .. },
-            ..
-        }) = self.parsed_event.take()
-        else {
-            unreachable!()
-        };
-        let list = PyList::empty(py);
-        if let Some(anchor) = &anchor {
-            self.register_anchor(py, anchor.clone(), list.clone().into_any().unbind())?;
-        }
+    /// PyYAML's `flatten_mapping`: replace `<<` entries with the entries of the
+    /// mappings they merge (earlier merges and explicit entries win), and turn
+    /// `=` keys into plain strings. Like PyYAML it rewrites the node itself.
+    fn flatten_mapping(&mut self, py: Python, node: NodeId) -> PyResult<()> {
+        let mut merge: Vec<(NodeId, NodeId)> = Vec::new();
+        let mut index = 0;
         loop {
-            self._parse_next_event(py)?;
-            if matches!(
-                &self.parsed_event,
-                Some(Event {
-                    data: EventData::SequenceEnd,
-                    ..
-                })
-            ) {
+            let NodeData::Mapping(entries) = &self.nodes[node].data else {
+                return Ok(());
+            };
+            let Some(&(key_node, value_node)) = entries.get(index) else {
                 break;
-            }
-            let item = self.construct_merge_value_item(py)?;
-            list.append(item)?;
-        }
-        self.parsed_event = None;
-        if pairs && let Some(anchor) = anchor {
-            // An alias used as another merge source merges these mappings, but
-            // one used as a value gets the !!omap / !!pairs list PyYAML would
-            // construct from the same node (or its error).
-            self.merge_source_lists
-                .insert(anchor.clone(), list.clone().into_any().unbind());
-            let entries = PyList::empty(py);
-            for item in list.iter() {
-                match item.cast::<PyDict>() {
-                    Ok(mapping) if mapping.len() == 1 => {
-                        let (key, value) = mapping.iter().next().unwrap();
-                        entries.append(PyTuple::new(py, [key, value])?)?;
-                    }
-                    _ => {
-                        self.value_alias_errors
-                            .insert(anchor, unknown_tag_message(&stripped.unwrap()));
-                        return Ok(list.into_any().unbind());
-                    }
-                }
-            }
-            self.anchors.insert(anchor, entries.into_any().unbind());
-        }
-        Ok(list.into_any().unbind())
-    }
-
-    fn construct_merge_value_item(&mut self, py: Python) -> PyResult<Py<PyAny>> {
-        if let Some(Event {
-            data: EventData::Alias { anchor },
-            ..
-        }) = &self.parsed_event
-        {
-            if let Some(obj) = self.anchors.get(anchor) {
-                let obj = obj.clone_ref(py);
-                self.parsed_event = None;
-                return Ok(obj);
-            }
-        }
-        // Items of a merge sequence must be mappings; PyYAML rejects others by
-        // node kind without constructing them.
-        let found = match &self.parsed_event {
-            Some(Event {
-                data: EventData::Scalar { .. },
-                ..
-            }) => Some("scalar"),
-            Some(Event {
-                data: EventData::SequenceStart { .. },
-                ..
-            }) => Some("sequence"),
-            _ => None,
-        };
-        if let Some(found) = found {
-            let anchor = match self.parsed_event.take().map(|e| e.data) {
-                Some(
-                    EventData::Scalar { anchor, .. } | EventData::SequenceStart { anchor, .. },
-                ) => anchor,
-                _ => None,
             };
-            self.reserve_failed_anchor(py, anchor)?;
-            return Err(exception::constructor_error(
-                py,
-                format!("expected a mapping for merging, but found {found}"),
-            ));
+            match self.nodes[key_node].tag.as_ref() {
+                crate::TAG_MERGE => {
+                    // Removed before recursing, which also ends merge cycles.
+                    if let NodeData::Mapping(entries) = &mut self.nodes[node].data {
+                        entries.remove(index);
+                    }
+                    match &self.nodes[value_node].data {
+                        NodeData::Mapping(_) => {
+                            self.flatten_mapping(py, value_node)?;
+                            merge.extend(self.mapping_entries(value_node));
+                        }
+                        NodeData::Sequence(items) => {
+                            let mut submerge = Vec::new();
+                            for subnode in items.clone() {
+                                if !matches!(self.nodes[subnode].data, NodeData::Mapping(_)) {
+                                    let found = self.nodes[subnode].data.kind();
+                                    return Err(exception::constructor_error(
+                                        py,
+                                        format!(
+                                            "expected a mapping for merging, but found {found}"
+                                        ),
+                                    ));
+                                }
+                                self.flatten_mapping(py, subnode)?;
+                                submerge.push(self.mapping_entries(subnode));
+                            }
+                            for entries in submerge.into_iter().rev() {
+                                merge.extend(entries);
+                            }
+                        }
+                        NodeData::Scalar { .. } => {
+                            return Err(exception::constructor_error(
+                                py,
+                                "expected a mapping or list of mappings for merging, but found scalar"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+                crate::TAG_VALUE => {
+                    self.nodes[key_node].tag = Cow::Borrowed(crate::TAG_STR);
+                    index += 1;
+                }
+                _ => index += 1,
+            }
         }
-        self.untag_merge_source(false);
-        self.construct_from_events(py)
-    }
-
-    /// Drop a merge source's tag if constructing by it would reject the node or
-    /// change its shape, so it is merged as a plain mapping or sequence.
-    fn untag_merge_source(&mut self, allow_sequence: bool) -> Option<String> {
-        let (anchor, tag, sequence) = match &mut self.parsed_event {
-            Some(Event {
-                data: EventData::MappingStart { anchor, tag, .. },
-                ..
-            }) if tag
-                .as_deref()
-                .is_some_and(|t| !matches!(t, "!" | crate::TAG_MAP | crate::TAG_SET)) =>
-            {
-                (anchor, tag, false)
-            }
-            Some(Event {
-                data: EventData::SequenceStart { anchor, tag, .. },
-                ..
-            }) if allow_sequence
-                && tag
-                    .as_deref()
-                    .is_some_and(|t| !matches!(t, "!" | crate::TAG_SEQ)) =>
-            {
-                (anchor, tag, true)
-            }
-            _ => return None,
-        };
-        let tag = tag.take().unwrap();
-        // Aliases to !!omap / !!pairs sequences are handled by
-        // `construct_merge_value`, which builds the list PyYAML would.
-        if let Some(anchor) = anchor
-            && !(sequence && matches!(tag.as_str(), crate::TAG_OMAP | crate::TAG_PAIRS))
+        if !merge.is_empty()
+            && let NodeData::Mapping(entries) = &mut self.nodes[node].data
         {
-            self.value_alias_errors
-                .insert(anchor.clone(), unknown_tag_message(&tag));
+            merge.append(entries);
+            *entries = merge;
         }
-        Some(tag)
+        Ok(())
     }
 
-    /// !!omap / !!pairs entries are raw single-entry mappings, not constructed
-    /// dicts: their keys may be unhashable, and duplicate entries must be rejected
-    /// before a dict could collapse them.
-    fn construct_pair_entry(&mut self, py: Python) -> PyResult<Py<PyAny>> {
-        let event = self.parsed_event.take().unwrap();
-        let anchor = match event.data {
-            EventData::Alias { anchor } => {
-                if self.merge_anchors.contains(&anchor)
-                    || self.deferred_scalars.contains_key(&anchor)
-                {
-                    return Err(exception::constructor_error(
-                        py,
-                        "expected a mapping of length 1".to_string(),
-                    ));
-                }
-                let value = self.anchors.get(&anchor).ok_or_else(|| {
-                    exception::composer_error(py, format!("found undefined alias '{}'", anchor))
-                })?;
-                if self
-                    .anchored_mapping_lengths
-                    .get(&(value.as_ptr() as usize))
-                    .is_some_and(|&n| n != 1)
-                {
-                    return Err(exception::constructor_error(
-                        py,
-                        "expected a single mapping item".to_string(),
-                    ));
-                }
-                let value =
-                    if let Some((_, mapping)) = self.set_mappings.get(&(value.as_ptr() as usize)) {
-                        mapping.bind(py).clone().into_any()
-                    } else {
-                        value.bind(py).clone()
-                    };
-                if let Ok(mapping) = value.cast::<PyDict>()
-                    && mapping.len() == 1
-                {
-                    let (key, value) = mapping.iter().next().unwrap();
-                    return Ok(PyTuple::new(py, [key, value])?.into_any().unbind());
-                }
-                return Err(exception::constructor_error(
-                    py,
-                    "expected a single mapping item".to_string(),
-                ));
-            }
-            EventData::MappingStart { anchor, tag, .. } => (anchor, tag),
-            EventData::Scalar { anchor, .. } | EventData::SequenceStart { anchor, .. } => {
-                self.reserve_failed_anchor(py, anchor)?;
-                return Err(exception::constructor_error(
-                    py,
-                    "expected a mapping of length 1".to_string(),
-                ));
-            }
-            _ => {
-                return Err(exception::constructor_error(
-                    py,
-                    "expected a mapping of length 1".to_string(),
-                ));
-            }
-        };
-        let (anchor, tag) = anchor;
-        let wrapper = if let Some(anchor) = &anchor {
-            let mapping = PyDict::new(py);
-            self.register_anchor(py, anchor.clone(), mapping.clone().into_any().unbind())?;
-            Some(mapping)
-        } else {
-            None
-        };
-        self._parse_next_event(py)?;
-        if matches!(
-            self.parsed_event.as_ref().map(|e| &e.data),
-            Some(EventData::MappingEnd)
-        ) {
-            return Err(exception::constructor_error(
-                py,
-                "expected a single mapping item".to_string(),
-            ));
+    fn mapping_entries(&self, node: NodeId) -> Vec<(NodeId, NodeId)> {
+        match &self.nodes[node].data {
+            NodeData::Mapping(entries) => entries.clone(),
+            _ => Vec::new(),
         }
-        let key = self.construct_from_events(py)?;
-        self._parse_next_event(py)?;
-        let value = self.construct_from_events(py)?;
-        self._parse_next_event(py)?;
-        if !matches!(
-            self.parsed_event.as_ref().map(|e| &e.data),
-            Some(EventData::MappingEnd)
-        ) {
-            return Err(exception::constructor_error(
-                py,
-                "expected a single mapping item".to_string(),
-            ));
-        }
-        self.parsed_event = None;
-        if let (Some(mapping), Some(anchor)) = (wrapper, anchor) {
-            // The wrapper is a mapping node if referenced elsewhere by an alias.
-            // A pair key may be unhashable; PyYAML only fails if an alias then
-            // uses the entry as a mapping (or set).
-            if mapping.set_item(&key, &value).is_err() {
-                self.anchors.remove(&anchor);
-                self.skipped_anchors.insert(anchor.clone());
-                self.value_alias_errors
-                    .insert(anchor, "found unhashable key".to_string());
-                return Ok(PyTuple::new(py, [key, value])?.into_any().unbind());
-            }
-            // PyYAML reads the entry by node kind and ignores its tag, but an
-            // alias used as a value is constructed by that tag.
-            match tag.as_deref() {
-                None | Some("!") | Some(crate::TAG_MAP) => {}
-                Some(crate::TAG_SET) => {
-                    let set = PySet::new(py, [&key])?;
-                    self.set_mappings.insert(
-                        set.as_ptr() as usize,
-                        (set.clone().unbind(), mapping.clone().unbind()),
-                    );
-                    self.anchors.insert(anchor, set.into_any().unbind());
-                }
-                Some(t) => {
-                    self.value_alias_errors
-                        .insert(anchor, unknown_tag_message(t));
-                }
-            }
-        }
-        Ok(PyTuple::new(py, [key, value])?.into_any().unbind())
     }
 
-    fn finish_mappings(&mut self, py: Python) -> PyResult<()> {
-        if self.pending_mappings.is_empty() {
-            return Ok(());
-        }
-        let pending = std::mem::take(&mut self.pending_mappings);
-        let indices: HashMap<usize, usize, FxBuildHasher> = pending
-            .iter()
-            .enumerate()
-            .map(|(i, mapping)| (mapping.dict.as_ptr() as usize, i))
-            .collect();
-        let ctx = MergeContext {
-            pending: &pending,
-            indices: &indices,
-            set_mappings: &self.set_mappings,
-            pairs_mappings: &self.pairs_mappings,
+    /// PyYAML's `construct_yaml_omap` / `construct_yaml_pairs`.
+    fn construct_pairs(
+        &mut self,
+        py: Python,
+        node: NodeId,
+        what: &str,
+        pairs: &Bound<'_, PyList>,
+    ) -> PyResult<()> {
+        let NodeData::Sequence(items) = &self.nodes[node].data else {
+            let found = self.nodes[node].data.kind();
+            return Err(exception::constructor_error(
+                py,
+                format!("while constructing {what}: expected a sequence, but found {found}"),
+            ));
         };
-        let mut visited = vec![false; pending.len()];
-        // Parents are appended after their children. Flatten parents first, as
-        // PyYAML does, and break recursive merge edges at the explicit entries.
-        for i in (0..pending.len()).rev() {
-            finish_mapping(py, i, &ctx, &mut visited)?;
+        for subnode in items.clone() {
+            let (key_node, value_node) = match &self.nodes[subnode].data {
+                NodeData::Mapping(entries) if entries.len() == 1 => entries[0],
+                NodeData::Mapping(entries) => {
+                    return Err(exception::constructor_error(
+                        py,
+                        format!(
+                            "while constructing {what}: expected a single mapping item, but found {} items",
+                            entries.len()
+                        ),
+                    ));
+                }
+                data => {
+                    return Err(exception::constructor_error(
+                        py,
+                        format!(
+                            "while constructing {what}: expected a mapping of length 1, but found {}",
+                            data.kind()
+                        ),
+                    ));
+                }
+            };
+            let key = self.construct_object(py, key_node)?;
+            let value = self.construct_object(py, value_node)?;
+            pairs.append(PyTuple::new(py, [key, value])?)?;
         }
         Ok(())
     }
 }
 
-/// Read-only lookups for flattening merges at the end of a document.
-struct MergeContext<'a> {
-    pending: &'a [PendingMapping],
-    /// Pending mapping index by dict object.
-    indices: &'a HashMap<usize, usize, FxBuildHasher>,
-    /// !!set objects and the dicts they were built from.
-    set_mappings: &'a HashMap<usize, (Py<PySet>, Py<PyDict>), FxBuildHasher>,
-    /// !!omap / !!pairs lists and their single-entry mappings.
-    pairs_mappings: &'a HashMap<usize, Py<PyList>, FxBuildHasher>,
+/// A tag string, borrowing the standard tags so they need no allocation.
+fn known_tag(tag: String) -> Cow<'static, str> {
+    const STANDARD: [&str; 14] = [
+        crate::TAG_NULL,
+        crate::TAG_BOOL,
+        crate::TAG_INT,
+        crate::TAG_FLOAT,
+        crate::TAG_STR,
+        crate::TAG_BINARY,
+        crate::TAG_TIMESTAMP,
+        crate::TAG_SEQ,
+        crate::TAG_MAP,
+        crate::TAG_SET,
+        crate::TAG_OMAP,
+        crate::TAG_PAIRS,
+        crate::TAG_MERGE,
+        crate::TAG_VALUE,
+    ];
+    match STANDARD.iter().find(|standard| **standard == tag) {
+        Some(standard) => Cow::Borrowed(standard),
+        None => Cow::Owned(tag),
+    }
 }
 
-/// Rebuild only mappings which contain merges, preserving insertion order and
-/// alias identity. Explicit entries override all merged entries.
-fn finish_mapping(
-    py: Python,
-    index: usize,
-    ctx: &MergeContext,
-    visited: &mut [bool],
-) -> PyResult<()> {
-    if visited[index] {
-        return Ok(());
+/// A collection's tag: no tag or `!` means the default for its kind.
+fn collection_tag(tag: Option<String>, default: &'static str) -> Cow<'static, str> {
+    match tag {
+        None => Cow::Borrowed(default),
+        Some(tag) if tag == "!" => Cow::Borrowed(default),
+        Some(tag) => known_tag(tag),
     }
-    visited[index] = true;
-    let mapping = &ctx.pending[index];
-    let mut merged: Option<Bound<'_, PyDict>> = None;
-    for source in &mapping.sources {
-        let source = source.bind(py);
-        let Ok(mut list) = source.cast::<PyList>().cloned() else {
-            merge_source(py, source, &mut merged, ctx, visited)?;
-            continue;
-        };
-        if let Some(mappings) = ctx.pairs_mappings.get(&(list.as_ptr() as usize)) {
-            list = mappings.bind(py).clone();
-        }
-        // A merge sequence is flattened in reverse so its first mapping wins,
-        // while later << entries still win overall.
-        let items: Vec<_> = list.iter().collect();
-        for item in items.into_iter().rev() {
-            let item = match ctx.set_mappings.get(&(item.as_ptr() as usize)) {
-                Some((_, mapping)) => mapping.bind(py).clone().into_any(),
-                None => item,
-            };
-            if !item.is_instance_of::<PyDict>() {
-                return Err(exception::constructor_error(
-                    py,
-                    "expected a mapping for merging, but found non-mapping".to_string(),
-                ));
-            }
-            merge_source(py, &item, &mut merged, ctx, visited)?;
-        }
-    }
-    let dict = mapping.dict.bind(py);
-    if let Some(merged) = merged {
-        merged.update(dict.as_mapping())?;
-        dict.clear();
-        dict.update(merged.as_mapping())?;
-    }
-    // Only empty merge sequences leave `merged` unset: nothing to merge.
-    if let Some(set) = &mapping.set {
-        for key in dict.keys().iter() {
-            set.bind(py).add(key)?;
-        }
-    }
-    Ok(())
-}
-
-fn merge_source<'py>(
-    py: Python<'py>,
-    source: &Bound<'py, PyAny>,
-    merged: &mut Option<Bound<'py, PyDict>>,
-    ctx: &MergeContext,
-    visited: &mut [bool],
-) -> PyResult<()> {
-    if let Some(&source_index) = ctx.indices.get(&(source.as_ptr() as usize)) {
-        finish_mapping(py, source_index, ctx, visited)?;
-    }
-    let source = source.cast::<PyDict>()?;
-    match merged {
-        Some(merged) => merged.update(source.as_mapping())?,
-        None => *merged = Some(source.copy()?),
-    }
-    Ok(())
 }
 
 static ISO_DATETIME: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
@@ -1454,23 +792,6 @@ fn single_document_error(py: Python) -> PyErr {
     )
 }
 
-/// Whether `err` comes from reading or composing (PyYAML's first phase) rather
-/// than from constructing Python objects.
-fn is_compose_error(py: Python, err: &PyErr) -> bool {
-    let Ok(module) = py.import("ryaml.error") else {
-        return false;
-    };
-    [
-        "ReaderError",
-        "ScannerError",
-        "ParserError",
-        "ComposerError",
-    ]
-    .iter()
-    .filter_map(|name| module.getattr(*name).ok())
-    .any(|class| err.value(py).is_instance(&class).unwrap_or(false))
-}
-
 /// The PyYAML exception class for a libyaml-safer error, by the stage that
 /// raised it (PyYAML raises `ParserError` for structural errors, for example).
 fn parse_error(py: Python, error: &libyaml_safer::Error) -> PyErr {
@@ -1488,68 +809,8 @@ fn parse_error(py: Python, error: &libyaml_safer::Error) -> PyErr {
     exception::yaml_error(py, class, message)
 }
 
-/// Tags whose constructors take a scalar node.
-fn is_scalar_tag(tag: &str) -> bool {
-    matches!(
-        tag,
-        crate::TAG_NULL
-            | crate::TAG_BOOL
-            | crate::TAG_INT
-            | crate::TAG_FLOAT
-            | crate::TAG_BINARY
-            | crate::TAG_TIMESTAMP
-            | crate::TAG_STR
-    )
-}
-
-/// A `=` mapping key, which PyYAML resolves to the `value` tag.
-fn is_value_key(tag: Option<&str>, value: &str, plain_implicit: bool) -> bool {
-    tag == Some(crate::TAG_VALUE)
-        || (matches!(tag, None | Some("!")) && plain_implicit && value == "=")
-}
-
 fn expected_scalar_error(py: Python, found: &str) -> PyErr {
     exception::constructor_error(py, format!("expected a scalar node, but found {}", found))
-}
-
-fn merge_node_error(py: Python) -> PyErr {
-    exception::constructor_error(
-        py,
-        format!(
-            "could not determine a constructor for the tag '{}'",
-            crate::TAG_MERGE
-        ),
-    )
-}
-
-/// Check if the current event is a merge key: plain scalar "<<", an explicit
-/// merge tag, or an alias to an anchored merge key.
-fn is_merge_key(event: &Option<Event>, merge_anchors: &HashSet<String, FxBuildHasher>) -> bool {
-    if let Some(Event {
-        data: EventData::Alias { anchor },
-        ..
-    }) = event
-    {
-        return merge_anchors.contains(anchor);
-    }
-    if let Some(Event {
-        data:
-            EventData::Scalar {
-                value,
-                plain_implicit,
-                tag,
-                ..
-            },
-        ..
-    }) = event
-    {
-        if let Some(t) = tag {
-            // Explicit merge tag, or non-specific "!" on plain "<<"
-            return t == crate::TAG_MERGE || (t == "!" && *plain_implicit && value == "<<");
-        }
-        return *plain_implicit && value == "<<";
-    }
-    false
 }
 
 /// Construct a Python bool from a scalar value without allocation
@@ -1802,29 +1063,6 @@ fn parse_sexagesimal_int(s: &str) -> Result<i64, ()> {
             .ok_or(())?;
     }
     Ok(result)
-}
-
-impl RSafeLoader {
-    pub fn from_input(input: Input) -> Self {
-        let mut parser = Parser::new();
-        parser.set_input(input);
-        Self {
-            parser,
-            parsed_event: None,
-            anchors: HashMap::with_hasher(FxBuildHasher),
-            merge_anchors: HashSet::with_hasher(FxBuildHasher),
-            value_alias_errors: HashMap::with_hasher(FxBuildHasher),
-            merge_source_lists: HashMap::with_hasher(FxBuildHasher),
-            scalar_anchor_values: HashMap::with_hasher(FxBuildHasher),
-            deferred_scalars: HashMap::with_hasher(FxBuildHasher),
-            skipped_anchors: HashSet::with_hasher(FxBuildHasher),
-            scalar_mappings_in_progress: Vec::new(),
-            pending_mappings: Vec::new(),
-            set_mappings: HashMap::with_hasher(FxBuildHasher),
-            pairs_mappings: HashMap::with_hasher(FxBuildHasher),
-            anchored_mapping_lengths: HashMap::with_hasher(FxBuildHasher),
-        }
-    }
 }
 
 pub fn register_loader(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {

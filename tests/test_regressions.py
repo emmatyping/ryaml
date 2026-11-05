@@ -739,3 +739,50 @@ def test_merge_scalar_rejected_without_constructing(load, reference, source, err
         with pytest.raises(error) as info:
             loader(source)
         assert type(info.value).__name__ == error.__name__
+
+
+@pytest.mark.parametrize(("source", "error"), [
+    ("- g: !p\n- !!bool", KeyError),
+    ("[[!!int x], !!bool maybe]", KeyError),
+    ("{a: [!!int x], b: !!bool maybe}", KeyError),
+    ("{a: !!int x, <<: 1}", yaml.constructor.ConstructorError),
+    ("[{<<: 1}, !!int x]", ValueError),
+])
+def test_construction_order_matches_pyyaml(load, reference, source, error):
+    # PyYAML composes the document, then constructs scalars at once and fills
+    # collections later from a queue (and flattens merges before a mapping's
+    # entries), so with several errors the shallower one is raised.
+    for loader in (reference, load):
+        with pytest.raises(error) as info:
+            loader(source)
+        assert type(info.value).__name__ == error.__name__
+
+
+@pytest.mark.parametrize("source", [
+    pytest.param("- !!str {a: &k [1], =: x}\n- *k\n", id="alias-to-collection-in-skipped-entry"),
+    pytest.param("&a {<<: *a, b: 1}", id="self-merge"),
+    pytest.param("&a [{<<: *a}]", id="merge-own-sequence"),
+    pytest.param("a: &a {b: {<<: *a}, c: 1}", id="merge-copies-unanchored-node"),
+])
+def test_two_phase_loading(load, reference, source):
+    assert repr(load(source)) == repr(reference(source))
+
+
+@pytest.mark.parametrize(("source", "error"), [
+    ("- !!str {a: !!timestamp &t {=: 2001-01-01}, =: q}\n- *t\n", TypeError),
+    ("- &o !!str {b: !!int &i {=: *o}, =: q}\n- *i\n", ValueError),
+])
+def test_two_phase_loading_errors(load, reference, source, error):
+    for loader in (reference, load):
+        with pytest.raises(error):
+            loader(source)
+
+
+def test_deep_nesting_does_not_crash():
+    # Composing uses an explicit stack and collections are filled from a
+    # queue, so nesting depth no longer recurses on the native stack.
+    depth = 50_000
+    value = ryaml.loads("[" * depth + "]" * depth)
+    for _ in range(depth - 1):
+        value = value[0]
+    assert value == []
