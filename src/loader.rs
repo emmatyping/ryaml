@@ -910,6 +910,24 @@ impl RSafeLoader {
                 return Ok(obj);
             }
         }
+        // PyYAML rejects a scalar merge value by node kind, never constructing it.
+        if matches!(
+            &self.parsed_event,
+            Some(Event {
+                data: EventData::Scalar { .. },
+                ..
+            })
+        ) {
+            let anchor = match self.parsed_event.take().map(|e| e.data) {
+                Some(EventData::Scalar { anchor, .. }) => anchor,
+                _ => None,
+            };
+            self.reserve_failed_anchor(py, anchor)?;
+            return Err(exception::constructor_error(
+                py,
+                "expected a mapping or list of mappings for merging, but found scalar".to_string(),
+            ));
+        }
         let stripped = self.untag_merge_source(true);
         let pairs = matches!(
             stripped.as_deref(),
@@ -986,6 +1004,32 @@ impl RSafeLoader {
                 self.parsed_event = None;
                 return Ok(obj);
             }
+        }
+        // Items of a merge sequence must be mappings; PyYAML rejects others by
+        // node kind without constructing them.
+        let found = match &self.parsed_event {
+            Some(Event {
+                data: EventData::Scalar { .. },
+                ..
+            }) => Some("scalar"),
+            Some(Event {
+                data: EventData::SequenceStart { .. },
+                ..
+            }) => Some("sequence"),
+            _ => None,
+        };
+        if let Some(found) = found {
+            let anchor = match self.parsed_event.take().map(|e| e.data) {
+                Some(
+                    EventData::Scalar { anchor, .. } | EventData::SequenceStart { anchor, .. },
+                ) => anchor,
+                _ => None,
+            };
+            self.reserve_failed_anchor(py, anchor)?;
+            return Err(exception::constructor_error(
+                py,
+                format!("expected a mapping for merging, but found {found}"),
+            ));
         }
         self.untag_merge_source(false);
         self.construct_from_events(py)

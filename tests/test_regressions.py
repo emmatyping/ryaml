@@ -722,3 +722,20 @@ def test_decode_errors_follow_libyaml_chunks(data):
     expected = outcome(lambda d: list(yaml.load_all(d, Loader=yaml.CSafeLoader)))
     assert outcome(lambda d: list(yaml.load_all(d, Loader=ryaml.RSafeLoader))) == expected
     assert outcome(ryaml.loads_all) == expected
+
+
+@pytest.mark.parametrize(("source", "error"), [
+    ("<<: !!timestamp", yaml.constructor.ConstructorError),
+    ("<<: !!int x", yaml.constructor.ConstructorError),
+    ("<<: [!!int x]", yaml.constructor.ConstructorError),
+    ("<<: [[!!int x]]", yaml.constructor.ConstructorError),
+    ("<<: &s !!int x\nb: *s", yaml.constructor.ConstructorError),
+    ("<<: [&q x, &q y]", yaml.composer.ComposerError),
+])
+def test_merge_scalar_rejected_without_constructing(load, reference, source, error):
+    # PyYAML rejects a scalar (or sequence) merge source by node kind, before
+    # any constructor for it could fail.
+    for loader in (reference, load):
+        with pytest.raises(error) as info:
+            loader(source)
+        assert type(info.value).__name__ == error.__name__
