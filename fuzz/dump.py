@@ -56,6 +56,8 @@ SPECIAL_STRINGS = [
     # Around libyaml's printable ranges (it escapes everything past the BMP).
     "\u00bf\u00c0", "\ud7ff", "\ue000", "\uefff\uf000", "\ufffd", "\U00010000",
     "a\U0001f600 b", "\u0085", "\u00ad", "\u2028a", "\u3000",
+    # Code points the emitter checks for individually.
+    "\u7eff", "a\ufeffb",
 ]
 SPECIAL_FLOATS = [
     0.0, -0.0, 1.0, -1.0, 0.5, 0.1, 1e-7, 1e16, 1e17, 1e22, 123456789012345678.0,
