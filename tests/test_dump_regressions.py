@@ -92,3 +92,35 @@ def test_binary_like_base64_encodebytes(reference, value, options):
     # base64.encodebytes gives "" for no bytes and ends every line (76
     # characters) with a newline.
     assert_same_dump(reference, [value, {"k": value}], **options)
+
+
+def _recursive_list():
+    items = [1]
+    items.append(items)
+    return items
+
+
+def _recursive_dict():
+    mapping = {"a": 1}
+    mapping["self"] = mapping
+    return mapping
+
+
+def _shared():
+    shared = [1, 2]
+    return {"a": shared, "b": [shared, {"c": shared}]}
+
+
+@pytest.mark.parametrize("make", [
+    pytest.param(_recursive_list, id="list"),
+    pytest.param(_recursive_dict, id="dict"),
+    pytest.param(lambda: (_recursive_list(),), id="list-in-tuple"),
+    pytest.param(lambda: [_recursive_dict(), _recursive_list()], id="two-cycles"),
+    pytest.param(_shared, id="shared"),
+])
+@pytest.mark.parametrize("options", [{}, {"default_flow_style": True}],
+                         ids=["block", "flow"])
+def test_recursive_and_shared_data_use_aliases(reference, make, options):
+    # PyYAML records a collection's node before representing its items, so
+    # data that contains itself is written with an anchor and an alias.
+    assert_same_dump(reference, [make()], **options)

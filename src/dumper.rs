@@ -2,7 +2,6 @@
 //! All in Rust, matching the RSafeLoader pattern.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use base64::Engine as _;
 use libyaml_safer::{Emitter, Encoding, Event, MappingStyle, ScalarStyle, SequenceStyle};
@@ -15,26 +14,30 @@ use pyo3::types::{
 use crate::exception;
 use crate::resolver;
 
-/// Internal representation node used by the representer/serializer.
-/// Uses Rc for alias detection via pointer identity.
+/// A represented node (PyYAML's `yaml.nodes`), kept in `RSafeDumper::nodes`.
+/// Children are indices into it, so a collection can be registered before its
+/// children are represented and recursive data refers back to it, as in
+/// PyYAML's representer.
 #[derive(Debug)]
 enum RepNode {
     Scalar {
-        tag: String,
+        tag: &'static str,
         value: String,
         style: Option<char>,
     },
     Sequence {
-        tag: String,
-        value: Vec<Arc<RepNode>>,
+        tag: &'static str,
+        value: Vec<NodeId>,
         flow_style: Option<bool>,
     },
     Mapping {
-        tag: String,
-        value: Vec<(Arc<RepNode>, Arc<RepNode>)>,
+        tag: &'static str,
+        value: Vec<(NodeId, NodeId)>,
         flow_style: Option<bool>,
     },
 }
+
+type NodeId = usize;
 
 /// Wraps libyaml Emitter with a self-owned output buffer.
 ///
@@ -118,7 +121,9 @@ pub struct RSafeDumper {
     sort_keys: bool,
 
     // Representer state (reset per represent() call)
-    represented_objects: HashMap<usize, Arc<RepNode>>,
+    represented_objects: HashMap<usize, NodeId>,
+    /// Nodes of the document being represented.
+    nodes: Vec<RepNode>,
     object_keeper: Vec<Py<PyAny>>,
 }
 
@@ -203,6 +208,7 @@ impl RSafeDumper {
             default_flow_style,
             sort_keys,
             represented_objects: HashMap::new(),
+            nodes: Vec::new(),
             object_keeper: Vec::new(),
         })
     }
@@ -228,9 +234,10 @@ impl RSafeDumper {
 
     fn represent(&mut self, py: Python, data: Py<PyAny>) -> PyResult<()> {
         let node = self.represent_data(py, data.bind(py))?;
-        self.serialize(py, &node)?;
+        self.serialize(py, node)?;
         self.represented_objects.clear();
         self.object_keeper.clear();
+        self.nodes.clear();
         Ok(())
     }
 
@@ -280,14 +287,15 @@ impl RSafeDumper {
             || data.is_instance_of::<PyFloat>()
     }
 
-    fn represent_data(&mut self, py: Python, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
-        // Alias tracking
+    fn represent_data(&mut self, py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
+        // Alias tracking. Collections register their node before representing
+        // their items (see `register`), so recursive data finds it here.
         let alias_key = if self.ignore_aliases(py, data) {
             None
         } else {
             let key = data.as_ptr() as usize;
-            if let Some(node) = self.represented_objects.get(&key) {
-                return Ok(Arc::clone(node));
+            if let Some(&node) = self.represented_objects.get(&key) {
+                return Ok(node);
             }
             self.object_keeper.push(data.clone().unbind());
             Some(key)
@@ -313,11 +321,11 @@ impl RSafeDumper {
         } else if ty.is(datetime_type(py, "date")?) {
             self.represent_date(py, data)?
         } else if ty.is(py.get_type::<PyList>()) || ty.is(py.get_type::<PyTuple>()) {
-            self.represent_list(py, data)?
+            self.represent_list(py, data, alias_key)?
         } else if ty.is(py.get_type::<PyDict>()) {
-            self.represent_dict(py, data)?
+            self.represent_dict(py, data, alias_key)?
         } else if ty.is(py.get_type::<PySet>()) {
-            self.represent_set(py, data)?
+            self.represent_set(py, data, alias_key)?
         } else {
             return Err(exception::representer_error(
                 py,
@@ -326,28 +334,28 @@ impl RSafeDumper {
         };
 
         if let Some(key) = alias_key {
-            self.represented_objects.insert(key, Arc::clone(&node));
+            self.represented_objects.insert(key, node);
         }
 
         Ok(node)
     }
 
-    fn represent_none(&self) -> Arc<RepNode> {
+    fn represent_none(&mut self) -> NodeId {
         self.make_scalar(crate::TAG_NULL, "null", None)
     }
 
-    fn represent_bool(&self, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
+    fn represent_bool(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let b: bool = data.extract()?;
         let value = if b { "true" } else { "false" };
         Ok(self.make_scalar(crate::TAG_BOOL, value, None))
     }
 
-    fn represent_int(&self, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
+    fn represent_int(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let s = data.str()?.to_string();
         Ok(self.make_scalar(crate::TAG_INT, &s, None))
     }
 
-    fn represent_float(&self, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
+    fn represent_float(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let f: f64 = data.extract()?;
         let value = if f.is_nan() {
             ".nan".to_string()
@@ -366,12 +374,12 @@ impl RSafeDumper {
         Ok(self.make_scalar(crate::TAG_FLOAT, &value, None))
     }
 
-    fn represent_str(&self, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
+    fn represent_str(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let s: String = data.extract()?;
         Ok(self.make_scalar(crate::TAG_STR, &s, None))
     }
 
-    fn represent_binary(&self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
+    fn represent_binary(&mut self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let bytes: &[u8] = data.downcast::<PyBytes>()?.as_bytes();
         let encoded = base64::prelude::BASE64_STANDARD.encode(bytes);
 
@@ -386,44 +394,55 @@ impl RSafeDumper {
         Ok(self.make_scalar(crate::TAG_BINARY, &result, Some('|')))
     }
 
-    fn represent_date(&self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
+    fn represent_date(&mut self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let value: String = data.call_method0("isoformat")?.extract()?;
         Ok(self.make_scalar(crate::TAG_TIMESTAMP, &value, None))
     }
 
-    fn represent_datetime(&self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
+    fn represent_datetime(&mut self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let value: String = data.call_method1("isoformat", (" ",))?.extract()?;
         Ok(self.make_scalar(crate::TAG_TIMESTAMP, &value, None))
     }
 
-    fn represent_list(&mut self, py: Python, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
-        // Get iterator by calling __iter__
-        let iter_obj = data.call_method0("__iter__")?;
+    fn represent_list(
+        &mut self,
+        py: Python,
+        data: &Bound<'_, PyAny>,
+        alias_key: Option<usize>,
+    ) -> PyResult<NodeId> {
+        let node = self.register(
+            alias_key,
+            RepNode::Sequence {
+                tag: crate::TAG_SEQ,
+                value: Vec::new(),
+                flow_style: None,
+            },
+        );
         let mut items = Vec::new();
         let mut best_style = true;
-        loop {
-            match iter_obj.call_method0("__next__") {
-                Ok(item) => {
-                    let node = self.represent_data(py, &item)?;
-                    if !is_plain_scalar(&node) {
-                        best_style = false;
-                    }
-                    items.push(node);
-                }
-                Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => break,
-                Err(e) => return Err(e),
-            }
+        for item in data.try_iter()? {
+            let item = self.represent_data(py, &item?)?;
+            best_style &= self.is_plain_scalar(item);
+            items.push(item);
         }
-        let flow_style = self.choose_flow_style(best_style);
-        Ok(Arc::new(RepNode::Sequence {
-            tag: crate::TAG_SEQ.to_string(),
-            value: items,
-            flow_style,
-        }))
+        let flow = self.choose_flow_style(best_style);
+        if let RepNode::Sequence {
+            value, flow_style, ..
+        } = &mut self.nodes[node]
+        {
+            *value = items;
+            *flow_style = flow;
+        }
+        Ok(node)
     }
 
-    fn represent_dict(&mut self, py: Python, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
-        let dict = data.downcast::<PyDict>()?;
+    fn represent_dict(
+        &mut self,
+        py: Python,
+        data: &Bound<'_, PyAny>,
+        alias_key: Option<usize>,
+    ) -> PyResult<NodeId> {
+        let dict = data.cast::<PyDict>()?;
         let mut pairs: Vec<(Py<PyAny>, Py<PyAny>)> =
             dict.iter().map(|(k, v)| (k.unbind(), v.unbind())).collect();
 
@@ -432,56 +451,86 @@ impl RSafeDumper {
             let _ = try_sort_pairs(py, &mut pairs);
         }
 
+        let node = self.register(
+            alias_key,
+            RepNode::Mapping {
+                tag: crate::TAG_MAP,
+                value: Vec::new(),
+                flow_style: None,
+            },
+        );
         let mut items = Vec::new();
         let mut best_style = true;
         for (k, v) in &pairs {
             let key_node = self.represent_data(py, k.bind(py))?;
             let val_node = self.represent_data(py, v.bind(py))?;
-            if !is_plain_scalar(&key_node) || !is_plain_scalar(&val_node) {
-                best_style = false;
-            }
+            best_style &= self.is_plain_scalar(key_node) && self.is_plain_scalar(val_node);
             items.push((key_node, val_node));
         }
-        let flow_style = self.choose_flow_style(best_style);
-        Ok(Arc::new(RepNode::Mapping {
-            tag: crate::TAG_MAP.to_string(),
-            value: items,
-            flow_style,
-        }))
+        let flow = self.choose_flow_style(best_style);
+        if let RepNode::Mapping {
+            value, flow_style, ..
+        } = &mut self.nodes[node]
+        {
+            *value = items;
+            *flow_style = flow;
+        }
+        Ok(node)
     }
 
-    fn represent_set(&mut self, py: Python, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
-        // Get iterator by calling __iter__
-        let iter_obj = data.call_method0("__iter__")?;
+    fn represent_set(
+        &mut self,
+        py: Python,
+        data: &Bound<'_, PyAny>,
+        alias_key: Option<usize>,
+    ) -> PyResult<NodeId> {
+        let node = self.register(
+            alias_key,
+            RepNode::Mapping {
+                tag: crate::TAG_SET,
+                value: Vec::new(),
+                flow_style: Some(false),
+            },
+        );
         let mut items = Vec::new();
-        loop {
-            match iter_obj.call_method0("__next__") {
-                Ok(item) => {
-                    let key_node = self.represent_data(py, &item)?;
-                    // Create a fresh null node for each value (don't share Arc to avoid aliases)
-                    let null_node = self.represent_none();
-                    items.push((key_node, null_node));
-                }
-                Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => break,
-                Err(e) => return Err(e),
-            }
+        for item in data.try_iter()? {
+            let key_node = self.represent_data(py, &item?)?;
+            // A separate null node for each value, so they are not aliased.
+            let null_node = self.represent_none();
+            items.push((key_node, null_node));
         }
-        Ok(Arc::new(RepNode::Mapping {
-            tag: crate::TAG_SET.to_string(),
-            value: items,
-            flow_style: Some(false),
-        }))
+        if let RepNode::Mapping { value, .. } = &mut self.nodes[node] {
+            *value = items;
+        }
+        Ok(node)
     }
 
     // ── Helpers ──
 
-    fn make_scalar(&self, tag: &str, value: &str, style: Option<char>) -> Arc<RepNode> {
+    /// Add a collection node and record it as `alias_key`'s node before its
+    /// items are represented, like PyYAML's `represent_sequence` and
+    /// `represent_mapping`.
+    fn register(&mut self, alias_key: Option<usize>, node: RepNode) -> NodeId {
+        let id = self.nodes.len();
+        self.nodes.push(node);
+        if let Some(key) = alias_key {
+            self.represented_objects.insert(key, id);
+        }
+        id
+    }
+
+    fn is_plain_scalar(&self, node: NodeId) -> bool {
+        matches!(self.nodes[node], RepNode::Scalar { style: None, .. })
+    }
+
+    fn make_scalar(&mut self, tag: &'static str, value: &str, style: Option<char>) -> NodeId {
         let style = style.or(self.default_style);
-        Arc::new(RepNode::Scalar {
-            tag: tag.to_string(),
+        self.nodes.push(RepNode::Scalar {
+            tag,
             value: value.to_string(),
             style,
-        })
+        });
+        self.nodes.len() - 1
     }
 
     fn choose_flow_style(&self, best_style: bool) -> Option<bool> {
@@ -496,7 +545,7 @@ impl RSafeDumper {
 // ── Serializer ───────────────────────────────────────────────────────────────
 
 impl RSafeDumper {
-    fn serialize(&mut self, py: Python, node: &Arc<RepNode>) -> PyResult<()> {
+    fn serialize(&mut self, py: Python, node: NodeId) -> PyResult<()> {
         self.emitter
             .emit(Event::document_start(
                 None,
@@ -519,38 +568,36 @@ impl RSafeDumper {
         Ok(())
     }
 
-    fn anchor_node(&mut self, node: &Arc<RepNode>) {
-        let key = Arc::as_ptr(node) as usize;
-        if let Some(anchor) = self.anchors.get_mut(&key) {
+    fn anchor_node(&mut self, node: NodeId) {
+        if let Some(anchor) = self.anchors.get_mut(&node) {
             // Seen before with None → assign anchor name
             if anchor.is_none() {
                 self.last_alias_id += 1;
                 *anchor = Some(format!("id{:03}", self.last_alias_id));
             }
-        } else {
-            self.anchors.insert(key, None);
-            match node.as_ref() {
-                RepNode::Sequence { value, .. } => {
-                    for item in value {
-                        self.anchor_node(item);
-                    }
+            return;
+        }
+        self.anchors.insert(node, None);
+        for index in 0.. {
+            match &self.nodes[node] {
+                RepNode::Sequence { value, .. } if index < value.len() => {
+                    let item = value[index];
+                    self.anchor_node(item);
                 }
-                RepNode::Mapping { value, .. } => {
-                    for (k, v) in value {
-                        self.anchor_node(k);
-                        self.anchor_node(v);
-                    }
+                RepNode::Mapping { value, .. } if index < value.len() => {
+                    let (k, v) = value[index];
+                    self.anchor_node(k);
+                    self.anchor_node(v);
                 }
-                RepNode::Scalar { .. } => {}
+                _ => break,
             }
         }
     }
 
-    fn serialize_node(&mut self, py: Python, node: &Arc<RepNode>) -> PyResult<()> {
-        let key = Arc::as_ptr(node) as usize;
-        let anchor = self.anchors.get(&key).cloned().flatten();
+    fn serialize_node(&mut self, py: Python, node: NodeId) -> PyResult<()> {
+        let anchor = self.anchors.get(&node).cloned().flatten();
 
-        if self.serialized_nodes.contains(&key) {
+        if self.serialized_nodes.contains(&node) {
             // Emit alias
             let anchor_str = anchor.as_deref().unwrap_or("");
             self.emitter
@@ -558,49 +605,50 @@ impl RSafeDumper {
                 .map_err(|e| exception::emitter_error(py, e))?;
             return Ok(());
         }
-        self.serialized_nodes.insert(key);
+        self.serialized_nodes.insert(node);
 
         let anchor_ref = anchor.as_deref();
 
-        match node.as_ref() {
+        match &self.nodes[node] {
             RepNode::Scalar { tag, value, style } => {
                 let detected_tag = resolver::resolve_scalar_tag(value, true);
                 let default_tag = resolver::resolve_scalar_tag(value, false);
-                let plain_implicit = tag == detected_tag;
-                let quoted_implicit = tag == default_tag;
+                let plain_implicit = *tag == detected_tag;
+                let quoted_implicit = *tag == default_tag;
                 let scalar_style = char_to_scalar_style(*style);
 
+                let event = Event::scalar(
+                    anchor_ref,
+                    Some(tag),
+                    value,
+                    plain_implicit,
+                    quoted_implicit,
+                    scalar_style,
+                );
                 self.emitter
-                    .emit(Event::scalar(
-                        anchor_ref,
-                        Some(tag),
-                        value,
-                        plain_implicit,
-                        quoted_implicit,
-                        scalar_style,
-                    ))
+                    .emit(event)
                     .map_err(|e| exception::emitter_error(py, e))?;
             }
             RepNode::Sequence {
-                tag,
-                value,
-                flow_style,
+                tag, flow_style, ..
             } => {
-                let implicit = tag == resolver::DEFAULT_SEQUENCE_TAG;
+                let implicit = *tag == resolver::DEFAULT_SEQUENCE_TAG;
                 let style = match flow_style {
                     Some(true) => SequenceStyle::Flow,
                     Some(false) => SequenceStyle::Block,
                     None => SequenceStyle::Any,
                 };
+                let event = Event::sequence_start(anchor_ref, Some(tag), implicit, style);
                 self.emitter
-                    .emit(Event::sequence_start(
-                        anchor_ref,
-                        Some(tag),
-                        implicit,
-                        style,
-                    ))
+                    .emit(event)
                     .map_err(|e| exception::emitter_error(py, e))?;
-                for item in value {
+                for index in 0.. {
+                    let RepNode::Sequence { value, .. } = &self.nodes[node] else {
+                        unreachable!()
+                    };
+                    let Some(&item) = value.get(index) else {
+                        break;
+                    };
                     self.serialize_node(py, item)?;
                 }
                 self.emitter
@@ -608,20 +656,25 @@ impl RSafeDumper {
                     .map_err(|e| exception::emitter_error(py, e))?;
             }
             RepNode::Mapping {
-                tag,
-                value,
-                flow_style,
+                tag, flow_style, ..
             } => {
-                let implicit = tag == resolver::DEFAULT_MAPPING_TAG;
+                let implicit = *tag == resolver::DEFAULT_MAPPING_TAG;
                 let style = match flow_style {
                     Some(true) => MappingStyle::Flow,
                     Some(false) => MappingStyle::Block,
                     None => MappingStyle::Any,
                 };
+                let event = Event::mapping_start(anchor_ref, Some(tag), implicit, style);
                 self.emitter
-                    .emit(Event::mapping_start(anchor_ref, Some(tag), implicit, style))
+                    .emit(event)
                     .map_err(|e| exception::emitter_error(py, e))?;
-                for (k, v) in value {
+                for index in 0.. {
+                    let RepNode::Mapping { value, .. } = &self.nodes[node] else {
+                        unreachable!()
+                    };
+                    let Some(&(k, v)) = value.get(index) else {
+                        break;
+                    };
                     self.serialize_node(py, k)?;
                     self.serialize_node(py, v)?;
                 }
@@ -655,10 +708,6 @@ fn datetime_type<'py>(py: Python<'py>, name: &str) -> PyResult<&'py Bound<'py, P
                 .unbind())
         })?
         .bind(py))
-}
-
-fn is_plain_scalar(node: &Arc<RepNode>) -> bool {
-    matches!(node.as_ref(), RepNode::Scalar { style: None, .. })
 }
 
 fn char_to_scalar_style(style: Option<char>) -> ScalarStyle {
@@ -717,6 +766,7 @@ pub fn dumps_to_string(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<String> {
         default_flow_style: Some(false),
         sort_keys: false,
         represented_objects: HashMap::new(),
+        nodes: Vec::new(),
         object_keeper: Vec::new(),
     };
 
@@ -726,7 +776,7 @@ pub fn dumps_to_string(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<String> {
         .map_err(|e| exception::emitter_error(py, e))?;
 
     let node = dumper.represent_data(py, obj)?;
-    dumper.serialize(py, &node)?;
+    dumper.serialize(py, node)?;
 
     dumper
         .emitter
