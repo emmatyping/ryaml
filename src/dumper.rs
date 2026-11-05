@@ -141,7 +141,7 @@ impl RSafeDumper {
         width: Option<i32>,
         allow_unicode: Option<bool>,
         line_break: Option<&str>,
-        encoding: Option<&str>,
+        encoding: Option<Bound<'_, PyAny>>,
         explicit_start: Option<bool>,
         explicit_end: Option<bool>,
         version: Option<(i32, i32)>,
@@ -150,17 +150,16 @@ impl RSafeDumper {
     ) -> PyResult<Self> {
         let mut ew = EmitterWrapper::new();
 
-        // Configure emitter
-        let enc = match encoding {
-            None | Some("utf-8") | Some("utf8") => Encoding::Utf8,
-            Some("utf-16-le") | Some("utf-16le") => Encoding::Utf16Le,
-            Some("utf-16-be") | Some("utf-16be") => Encoding::Utf16Be,
-            Some(other) => {
-                return Err(exception::emitter_error(
-                    py,
-                    format!("unknown encoding: {other}"),
-                ));
-            }
+        // Like PyYAML's CEmitter: exactly "utf-16-le" or "utf-16-be" selects
+        // UTF-16, and any other encoding means UTF-8 bytes.
+        let enc = match encoding
+            .as_ref()
+            .and_then(|e| e.extract::<String>().ok())
+            .as_deref()
+        {
+            Some("utf-16-le") => Encoding::Utf16Le,
+            Some("utf-16-be") => Encoding::Utf16Be,
+            _ => Encoding::Utf8,
         };
         ew.configure(enc);
 

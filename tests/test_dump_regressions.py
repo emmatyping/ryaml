@@ -62,3 +62,13 @@ def test_only_exact_types_are_represented(reference, value):
     # SafeRepresenter looks up type(data) itself, so subclasses of the types
     # it represents are refused like any other object.
     assert_same_dump(reference, [value])
+
+
+@pytest.mark.parametrize("encoding", [
+    "utf-16-le", "utf-16-be", "utf-8", "utf8", "UTF-8", "utf-16", "utf-16le",
+    "UTF-16-LE", "latin-1", "",
+])
+def test_encodings_like_pyyaml(reference, encoding):
+    # Only "utf-16-le" and "utf-16-be" select UTF-16 (with a byte order
+    # mark); any other encoding gives UTF-8 bytes.
+    assert_same_dump(reference, [{"a": "\xe9"}, None, ["x"]], encoding=encoding)
