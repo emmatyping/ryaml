@@ -322,9 +322,9 @@ impl RSafeLoader {
         self.pending.clear();
         let result = self.construct_object(py, root).and_then(|data| {
             while let Some((node, object)) = self.pending.pop_front() {
-                self.fill_collection(py, node, object.bind(py))?;
+                self.fill_collection(py, node, &object.into_bound(py))?;
             }
-            Ok(data)
+            Ok(data.unbind())
         });
         self.objects.clear();
         self.pending.clear();
@@ -335,9 +335,13 @@ impl RSafeLoader {
 
     /// PyYAML's `construct_object`: each node is constructed once. Collections
     /// are created empty here and filled later (`fill_collection`).
-    fn construct_object(&mut self, py: Python, node: NodeId) -> PyResult<Py<PyAny>> {
+    fn construct_object<'py>(
+        &mut self,
+        py: Python<'py>,
+        node: NodeId,
+    ) -> PyResult<Bound<'py, PyAny>> {
         if let Some(object) = &self.objects[node] {
-            return Ok(object.clone_ref(py));
+            return Ok(object.bind(py).clone());
         }
         let remember = self.has_merge || self.nodes[node].anchored;
         let object = match self.nodes[node].tag {
@@ -345,17 +349,16 @@ impl RSafeLoader {
             Tag::Map => PyDict::new(py).into_any(),
             Tag::Set => PySet::empty(py)?.into_any(),
             _ => {
-                let object = self.construct_scalar_object(py, node)?;
+                let object = self.construct_scalar_object(py, node)?.into_bound(py);
                 if remember {
-                    self.objects[node] = Some(object.clone_ref(py));
+                    self.objects[node] = Some(object.clone().unbind());
                 }
                 return Ok(object);
             }
         };
-        let object = object.unbind();
-        self.pending.push_back((node, object.clone_ref(py)));
+        self.pending.push_back((node, object.clone().unbind()));
         if remember {
-            self.objects[node] = Some(object.clone_ref(py));
+            self.objects[node] = Some(object.clone().unbind());
         }
         Ok(object)
     }
@@ -485,7 +488,6 @@ impl RSafeLoader {
         {
             index += 1;
             let key = self.construct_object(py, key_node)?;
-            let key = key.bind(py);
             if key.is_instance_of::<PyList>()
                 || key.is_instance_of::<PyDict>()
                 || key.is_instance_of::<PySet>()
@@ -496,7 +498,7 @@ impl RSafeLoader {
                 ));
             }
             let value = self.construct_object(py, value_node)?;
-            insert(key, value.bind(py))?;
+            insert(&key, &value)?;
         }
         Ok(())
     }
