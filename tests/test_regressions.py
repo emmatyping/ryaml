@@ -593,3 +593,11 @@ def test_failed_collection_keeps_its_anchor(load, reference, source, error):
         with pytest.raises(error) as info:
             loader(source)
         assert type(info.value).__name__ == error.__name__
+
+
+def test_reader_error_from_rust_has_message():
+    # Raised from Rust with a plain message (control character), str() must
+    # work like any YAMLError.
+    with pytest.raises(yaml.reader.ReaderError) as info:
+        ryaml.loads("a: \x07")
+    assert "control characters are not allowed" in str(info.value)
