@@ -81,3 +81,14 @@ def test_encodings_like_pyyaml(reference, encoding):
 def test_floats_like_python_repr(reference, value):
     # PyYAML writes repr(value).lower(), adding ".0" before a bare exponent.
     assert_same_dump(reference, [value])
+
+
+@pytest.mark.parametrize("value", [
+    b"", b"a", b"\x00" * 57, b"\x00" * 58, bytes(range(256)),
+])
+@pytest.mark.parametrize("options", [{}, {"default_flow_style": True}, {"canonical": True}],
+                         ids=["block", "flow", "canonical"])
+def test_binary_like_base64_encodebytes(reference, value, options):
+    # base64.encodebytes gives "" for no bytes and ends every line (76
+    # characters) with a newline.
+    assert_same_dump(reference, [value, {"k": value}], **options)

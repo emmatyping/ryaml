@@ -375,15 +375,13 @@ impl RSafeDumper {
         let bytes: &[u8] = data.downcast::<PyBytes>()?.as_bytes();
         let encoded = base64::prelude::BASE64_STANDARD.encode(bytes);
 
-        // Add line breaks every 76 characters to match Python's base64.encodebytes()
-        let mut result = String::new();
-        for (i, ch) in encoded.chars().enumerate() {
-            if i > 0 && i % 76 == 0 {
-                result.push('\n');
-            }
-            result.push(ch);
+        // Python's base64.encodebytes: lines of at most 76 characters, each
+        // ending in a newline (so no bytes give an empty string).
+        let mut result = String::with_capacity(encoded.len() + encoded.len() / 76 + 1);
+        for line in encoded.as_bytes().chunks(76) {
+            result.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+            result.push('\n');
         }
-        result.push('\n');
 
         Ok(self.make_scalar(crate::TAG_BINARY, &result, Some('|')))
     }
