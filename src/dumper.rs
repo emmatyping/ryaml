@@ -260,6 +260,9 @@ pub struct RSafeDumper {
     object_keeper: Vec<Py<PyAny>>,
     /// Nesting depth of the value being represented (the root is 0).
     level: usize,
+    /// Representing the document found an object again, so some node may be
+    /// reached twice and need an anchor. Without, the anchor pass is skipped.
+    has_aliases: bool,
 }
 
 /// The deepest nesting ryaml represents and serializes; deeper data raises
@@ -391,6 +394,7 @@ impl RSafeDumper {
             nodes: Vec::new(),
             object_keeper: Vec::new(),
             level: 0,
+            has_aliases: false,
         })
     }
 
@@ -413,6 +417,7 @@ impl RSafeDumper {
 
     fn represent(&mut self, py: Python, data: Py<PyAny>) -> PyResult<()> {
         self.level = 0;
+        self.has_aliases = false;
         let node = self.represent_data(py, data.bind(py))?;
         self.serialize(py, node)?;
         self.represented_objects.clear();
@@ -469,6 +474,7 @@ impl RSafeDumper {
         } else {
             let key = data.as_ptr() as usize;
             if let Some(&node) = self.represented_objects.get(&key) {
+                self.has_aliases = true;
                 return Ok(node);
             }
             self.object_keeper.push(data.clone().unbind());
@@ -478,27 +484,28 @@ impl RSafeDumper {
         // SafeRepresenter dispatches on the exact type only (it registers no
         // multi-representers), so subclasses and other types are refused.
         let ty = data.get_type();
-        let node = if data.is_none() {
-            self.represent_none()
-        } else if ty.is(py.get_type::<PyBool>()) {
-            self.represent_bool(data)?
-        } else if ty.is(py.get_type::<PyInt>()) {
-            self.represent_int(data)?
-        } else if ty.is(py.get_type::<PyFloat>()) {
-            self.represent_float(data)?
-        } else if ty.is(py.get_type::<PyString>()) {
+        // Exact type checks (pointer comparisons), most common first.
+        let node = if data.is_exact_instance_of::<PyString>() {
             self.represent_str(data)?
-        } else if ty.is(py.get_type::<PyBytes>()) {
+        } else if data.is_exact_instance_of::<PyInt>() {
+            self.represent_int(data)?
+        } else if data.is_exact_instance_of::<PyDict>() {
+            self.represent_dict(py, data, alias_key)?
+        } else if data.is_exact_instance_of::<PyList>() || data.is_exact_instance_of::<PyTuple>() {
+            self.represent_list(py, data, alias_key)?
+        } else if data.is_none() {
+            self.represent_none()
+        } else if data.is_exact_instance_of::<PyFloat>() {
+            self.represent_float(data)?
+        } else if data.is_exact_instance_of::<PyBool>() {
+            self.represent_bool(data)?
+        } else if data.is_exact_instance_of::<PyBytes>() {
             self.represent_binary(py, data)?
         } else if ty.is(datetime_type(py, "datetime")?) {
             self.represent_datetime(py, data)?
         } else if ty.is(datetime_type(py, "date")?) {
             self.represent_date(py, data)?
-        } else if ty.is(py.get_type::<PyList>()) || ty.is(py.get_type::<PyTuple>()) {
-            self.represent_list(py, data, alias_key)?
-        } else if ty.is(py.get_type::<PyDict>()) {
-            self.represent_dict(py, data, alias_key)?
-        } else if ty.is(py.get_type::<PySet>()) {
+        } else if data.is_exact_instance_of::<PySet>() {
             self.represent_set(py, data, alias_key)?
         } else {
             return Err(exception::representer_error(
@@ -848,7 +855,9 @@ impl RSafeDumper {
         self.node_states.clear();
         self.node_states
             .resize(self.nodes.len(), NodeState::default());
-        self.anchor_node(py, node, 0)?;
+        if self.has_aliases {
+            self.anchor_node(py, node, 0)?;
+        }
         self.serialize_node(py, node, 0)?;
 
         self.emit(py, Event::document_end(self.document_end_implicit))?;
@@ -1195,6 +1204,7 @@ pub fn dumps_to_string(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<String> {
         nodes: Vec::new(),
         object_keeper: Vec::new(),
         level: 0,
+        has_aliases: false,
     };
 
     dumper
