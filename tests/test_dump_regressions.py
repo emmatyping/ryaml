@@ -124,3 +124,16 @@ def test_recursive_and_shared_data_use_aliases(reference, make, options):
     # PyYAML records a collection's node before representing its items, so
     # data that contains itself is written with an anchor and an alias.
     assert_same_dump(reference, [make()], **options)
+
+
+@pytest.mark.parametrize("docs", [
+    pytest.param(["\ud800"], id="alone"),
+    pytest.param([{"\udfff": 1}], id="key"),
+    pytest.param([["\ud800", collections.OrderedDict()]], id="before-unrepresentable"),
+    pytest.param([("\ud800", frozenset())], id="before-frozenset"),
+    pytest.param(["ok", ["\ud800"]], id="second-document"),
+])
+def test_lone_surrogates_fail_when_written(reference, docs):
+    # PyYAML's emitter encodes each str when it writes it, so a representer
+    # error anywhere in the document comes first.
+    assert_same_dump(reference, docs)

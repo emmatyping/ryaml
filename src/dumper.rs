@@ -22,7 +22,10 @@ use crate::resolver;
 enum RepNode {
     Scalar {
         tag: &'static str,
-        value: String,
+        /// The text, or the error converting a `str` to UTF-8 (a lone
+        /// surrogate), which PyYAML's emitter only raises when it writes the
+        /// scalar, after the whole document is represented.
+        value: PyResult<String>,
         style: Option<char>,
     },
     Sequence {
@@ -375,8 +378,8 @@ impl RSafeDumper {
     }
 
     fn represent_str(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
-        let s: String = data.extract()?;
-        Ok(self.make_scalar(crate::TAG_STR, &s, None))
+        let value = data.extract::<String>();
+        Ok(self.push_scalar(crate::TAG_STR, value, None))
     }
 
     fn represent_binary(&mut self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
@@ -524,12 +527,17 @@ impl RSafeDumper {
     }
 
     fn make_scalar(&mut self, tag: &'static str, value: &str, style: Option<char>) -> NodeId {
+        self.push_scalar(tag, Ok(value.to_string()), style)
+    }
+
+    fn push_scalar(
+        &mut self,
+        tag: &'static str,
+        value: PyResult<String>,
+        style: Option<char>,
+    ) -> NodeId {
         let style = style.or(self.default_style);
-        self.nodes.push(RepNode::Scalar {
-            tag,
-            value: value.to_string(),
-            style,
-        });
+        self.nodes.push(RepNode::Scalar { tag, value, style });
         self.nodes.len() - 1
     }
 
@@ -611,6 +619,7 @@ impl RSafeDumper {
 
         match &self.nodes[node] {
             RepNode::Scalar { tag, value, style } => {
+                let value = value.as_ref().map_err(|e| e.clone_ref(py))?;
                 let detected_tag = resolver::resolve_scalar_tag(value, true);
                 let default_tag = resolver::resolve_scalar_tag(value, false);
                 let plain_implicit = *tag == detected_tag;
