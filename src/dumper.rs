@@ -47,6 +47,7 @@ type NodeId = usize;
 /// A scalar's text.
 #[derive(Debug)]
 enum ScalarText {
+    Static(&'static str),
     Owned(String),
     /// A `str`, encoded as UTF-8 only when the scalar is written: like
     /// PyYAML's emitter, which raises the error for a lone surrogate then,
@@ -55,9 +56,22 @@ enum ScalarText {
     Str(Py<PyString>),
 }
 
+impl From<&'static str> for ScalarText {
+    fn from(text: &'static str) -> Self {
+        ScalarText::Static(text)
+    }
+}
+
+impl From<String> for ScalarText {
+    fn from(text: String) -> Self {
+        ScalarText::Owned(text)
+    }
+}
+
 impl ScalarText {
     fn text<'a>(&'a self, py: Python<'_>) -> PyResult<&'a str> {
         match self {
+            ScalarText::Static(text) => Ok(text),
             ScalarText::Owned(text) => Ok(text),
             ScalarText::Str(text) => {
                 let mut size: pyo3::ffi::Py_ssize_t = 0;
@@ -507,13 +521,17 @@ impl RSafeDumper {
     }
 
     fn represent_int(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
-        let s = data.str()?.to_string();
-        Ok(self.make_scalar(crate::TAG_INT, &s, None))
+        // str(data); ints that fit in an i64 are formatted here.
+        let value = match data.extract::<i64>() {
+            Ok(value) => value.to_string(),
+            Err(_) => data.str()?.to_string(),
+        };
+        Ok(self.make_scalar(crate::TAG_INT, value, None))
     }
 
     fn represent_float(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let value = yaml_float(data.extract::<f64>()?);
-        Ok(self.make_scalar(crate::TAG_FLOAT, &value, None))
+        Ok(self.make_scalar(crate::TAG_FLOAT, value, None))
     }
 
     fn represent_str(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
@@ -533,17 +551,17 @@ impl RSafeDumper {
             result.push('\n');
         }
 
-        Ok(self.make_scalar(crate::TAG_BINARY, &result, Some('|')))
+        Ok(self.make_scalar(crate::TAG_BINARY, result, Some('|')))
     }
 
     fn represent_date(&mut self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let value: String = data.call_method0("isoformat")?.extract()?;
-        Ok(self.make_scalar(crate::TAG_TIMESTAMP, &value, None))
+        Ok(self.make_scalar(crate::TAG_TIMESTAMP, value, None))
     }
 
     fn represent_datetime(&mut self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let value: String = data.call_method1("isoformat", (" ",))?.extract()?;
-        Ok(self.make_scalar(crate::TAG_TIMESTAMP, &value, None))
+        Ok(self.make_scalar(crate::TAG_TIMESTAMP, value, None))
     }
 
     fn represent_list(
@@ -711,8 +729,13 @@ impl RSafeDumper {
         matches!(self.nodes[node], RepNode::Scalar { style: None, .. })
     }
 
-    fn make_scalar(&mut self, tag: &'static str, value: &str, style: Option<char>) -> NodeId {
-        self.push_scalar(tag, ScalarText::Owned(value.to_string()), style)
+    fn make_scalar(
+        &mut self,
+        tag: &'static str,
+        value: impl Into<ScalarText>,
+        style: Option<char>,
+    ) -> NodeId {
+        self.push_scalar(tag, value.into(), style)
     }
 
     fn push_scalar(&mut self, tag: &'static str, value: ScalarText, style: Option<char>) -> NodeId {
