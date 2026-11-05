@@ -250,8 +250,11 @@ options = st.fixed_dictionaries({}, optional={
                       "latin-1", ""]),
     "explicit_start": pick([None, True, False]),
     "explicit_end": pick([None, True, False]),
-    "version": pick([None, (1, 1), (1, 2)]),
-    "tags": pick([None, {"!e!": "tag:example.com,2000:"}]),
+    "version": pick([None, (1, 1), (1, 2), (1, 0), (2, 0)]),
+    # Prefixes of the standard tags make the emitter shorten !!binary etc.
+    "tags": pick([None, {"!e!": "tag:example.com,2000:"},
+                  {"!y!": "tag:yaml.org,2002:", "!!": "tag:example.com,2000:"},
+                  {"!": "tag:yaml.org,2002:"}, {"!e!": "tag:yaml.org,2002:b"}]),
     "sort_keys": st.booleans(),
 })
 
