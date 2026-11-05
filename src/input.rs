@@ -22,7 +22,8 @@ impl Source {
     pub fn into_input(self) -> Input {
         match self {
             Source::Text(text) => {
-                let chunk_ends = utf8_chunk_ends(text.len());
+                let starts = utf8_chunk_starts(text.as_bytes(), text.len());
+                let chunk_ends = chunk_ends_below(&starts, text.len());
                 Input::new(text, chunk_ends, None)
             }
             Source::Bytes(bytes) => {
@@ -118,18 +119,66 @@ impl BufRead for Input {
     }
 }
 
-/// Chunk ends for UTF-8 text: every `RAW_CHUNK` bytes.
-fn utf8_chunk_ends(len: usize) -> Vec<usize> {
-    (1..=len / RAW_CHUNK)
-        .map(|k| k * RAW_CHUNK)
+/// The width libyaml gives a UTF-8 sequence from its lead byte (0: invalid).
+fn utf8_width(lead: u8) -> usize {
+    match lead {
+        b if b & 0x80 == 0x00 => 1,
+        b if b & 0xe0 == 0xc0 => 2,
+        b if b & 0xf0 == 0xe0 => 3,
+        b if b & 0xf8 == 0xf0 => 4,
+        _ => 0,
+    }
+}
+
+/// Byte offsets where libyaml's raw chunks start in valid UTF-8 `bytes`, up to
+/// `limit`. Each read fills the raw buffer to `RAW_CHUNK` bytes; a character
+/// cut off at the end of a chunk is carried into the next one, which therefore
+/// starts at that character.
+fn utf8_chunk_starts(bytes: &[u8], limit: usize) -> Vec<usize> {
+    let mut starts = vec![0];
+    let mut start = 0;
+    while start + RAW_CHUNK <= limit {
+        let end = start + RAW_CHUNK;
+        let mut lead = end - 1;
+        while lead > start && end - lead < 4 && bytes[lead] & 0xc0 == 0x80 {
+            lead -= 1;
+        }
+        start = if lead + utf8_width(bytes[lead]) > end {
+            lead
+        } else {
+            end
+        };
+        starts.push(start);
+    }
+    starts
+}
+
+/// Chunk ends (as text offsets) for UTF-8 text, from its chunk starts.
+fn chunk_ends_below(starts: &[usize], len: usize) -> Vec<usize> {
+    starts[1..]
+        .iter()
+        .copied()
         .filter(|&end| end < len)
         .collect()
 }
 
-/// Where the parser must be before an error at raw byte `offset` is reported,
-/// for UTF-8 text whose bytes are the raw bytes: the start of its chunk.
-fn utf8_chunk_start(offset: usize) -> usize {
-    offset / RAW_CHUNK * RAW_CHUNK
+/// When libyaml reports a bad sequence starting at raw byte `offset` that
+/// needs `need` bytes: once the parser reaches it if the bytes run past the
+/// chunk (or the input), as libyaml then waits for more; otherwise as soon as
+/// the chunk is read. `chunk` is the chunk's (start, text offset of start).
+fn reported_at(
+    offset: usize,
+    need: usize,
+    len: usize,
+    chunk: (usize, usize),
+    text_offset: usize,
+) -> usize {
+    let available_end = len.min(chunk.0 + RAW_CHUNK);
+    if need > 0 && offset + need > available_end {
+        text_offset
+    } else {
+        chunk.1
+    }
 }
 
 /// The longest decodable prefix of `bytes`, its chunk ends, and the error that
@@ -141,29 +190,35 @@ fn decode(bytes: &[u8]) -> (String, Vec<usize>, Option<DecodeError>) {
         decode_utf16_bytes(bytes, u16::from_be_bytes)
     } else {
         match std::str::from_utf8(bytes) {
-            Ok(text) => (text.to_owned(), utf8_chunk_ends(text.len()), None),
+            Ok(text) => {
+                let starts = utf8_chunk_starts(bytes, text.len());
+                (text.to_owned(), chunk_ends_below(&starts, text.len()), None)
+            }
             Err(err) => {
                 let offset = err.valid_up_to();
                 let prefix = std::str::from_utf8(&bytes[..offset])
                     .expect("valid_up_to marks a valid prefix")
                     .to_owned();
-                let error = match err.error_len() {
-                    Some(_) => DecodeError {
-                        message: format!(
-                            "invalid UTF-8 (offset {offset}, value {})",
-                            bytes[offset]
-                        ),
-                        reported_at: utf8_chunk_start(offset),
-                    },
-                    // An incomplete sequence at the end waits for more input,
-                    // so it is only reported once everything before it is used.
-                    None => DecodeError {
-                        message: format!("incomplete UTF-8 octet sequence (offset {offset})"),
-                        reported_at: prefix.len(),
-                    },
+                let starts = utf8_chunk_starts(bytes, offset);
+                let chunk_start = *starts.last().expect("at least one chunk");
+                let need = utf8_width(bytes[offset]);
+                let at = reported_at(
+                    offset,
+                    need,
+                    bytes.len(),
+                    (chunk_start, chunk_start),
+                    offset,
+                );
+                let message = if at == offset && need > 0 && offset + need > bytes.len() {
+                    format!("incomplete UTF-8 octet sequence (offset {offset})")
+                } else {
+                    format!("invalid UTF-8 (offset {offset}, value {})", bytes[offset])
                 };
-                let chunk_ends = utf8_chunk_ends(prefix.len());
-                (prefix, chunk_ends, Some(error))
+                let error = DecodeError {
+                    message,
+                    reported_at: at,
+                };
+                (prefix, chunk_ends_below(&starts, offset), Some(error))
             }
         }
     }
@@ -173,57 +228,52 @@ fn decode_utf16_bytes(
     bytes: &[u8],
     unit: fn([u8; 2]) -> u16,
 ) -> (String, Vec<usize>, Option<DecodeError>) {
-    let chunks = bytes.chunks_exact(2);
-    let odd_length = !chunks.remainder().is_empty();
-    let unit_count = bytes.len() / 2;
-    let units = chunks.map(|pair| unit([pair[0], pair[1]]));
-    let mut text = String::with_capacity(unit_count);
+    let units = bytes.chunks_exact(2).map(|pair| unit([pair[0], pair[1]]));
+    let mut text = String::with_capacity(bytes.len() / 2);
     let mut chunk_ends = Vec::new();
-    // Text offset at the start of each raw chunk, by chunk index.
-    let mut chunk_starts = vec![0];
+    // The current chunk: its first byte and the text offset there.
+    let mut chunk = (0, 0);
     let mut byte_offset = 0;
     for ch in decode_utf16(units) {
         match ch {
             Ok(ch) => {
-                // A character belongs to the chunk holding its last byte, as
-                // libyaml carries a split surrogate pair into the next chunk.
+                // A character cut off by the end of the chunk starts the next.
                 let end = byte_offset + ch.len_utf16() * 2;
-                while (end - 1) / RAW_CHUNK >= chunk_starts.len() {
+                if end > chunk.0 + RAW_CHUNK {
                     chunk_ends.push(text.len());
-                    chunk_starts.push(text.len());
+                    chunk = (byte_offset, text.len());
                 }
                 text.push(ch);
                 byte_offset = end;
             }
             Err(err) => {
                 let surrogate = err.unpaired_surrogate();
-                // A high surrogate as the very last unit is an incomplete pair,
-                // reported once everything before it is used; any other
-                // unpaired surrogate is invalid, reported with its chunk.
-                let at_end =
-                    (0xd800..0xdc00).contains(&surrogate) && byte_offset / 2 + 1 == unit_count;
-                let chunk = byte_offset / RAW_CHUNK;
-                let reported_at = if at_end {
-                    text.len()
+                if byte_offset >= chunk.0 + RAW_CHUNK {
+                    chunk_ends.push(text.len());
+                    chunk = (byte_offset, text.len());
+                }
+                // A high surrogate needs a following low one (4 bytes); a lone
+                // low surrogate is invalid on its own.
+                let need = if (0xd800..0xdc00).contains(&surrogate) {
+                    4
                 } else {
-                    chunk_starts.get(chunk).copied().unwrap_or(text.len())
+                    2
                 };
+                let at = reported_at(byte_offset, need, bytes.len(), chunk, text.len());
+                let incomplete = byte_offset + need > bytes.len();
                 let message = format!(
                     "{} UTF-16 surrogate (offset {byte_offset}, value {surrogate:#06x})",
-                    if at_end { "incomplete" } else { "invalid" },
+                    if incomplete { "incomplete" } else { "invalid" },
                 );
-                return (
-                    text,
-                    chunk_ends,
-                    Some(DecodeError {
-                        message,
-                        reported_at,
-                    }),
-                );
+                let error = DecodeError {
+                    message,
+                    reported_at: at,
+                };
+                return (text, chunk_ends, Some(error));
             }
         }
     }
-    let error = odd_length.then(|| DecodeError {
+    let error = (bytes.len() % 2 == 1).then(|| DecodeError {
         message: format!("incomplete UTF-16 character (offset {})", bytes.len() - 1),
         reported_at: text.len(),
     });

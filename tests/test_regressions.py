@@ -786,3 +786,31 @@ def test_deep_nesting_does_not_crash():
     for _ in range(depth - 1):
         value = value[0]
     assert value == []
+
+
+@pytest.mark.skipif(not hasattr(yaml, "CSafeLoader"),
+                    reason="PyYAML was built without LibYAML")
+@pytest.mark.parametrize("data", [
+    pytest.param(b",*ff\xe1r", id="fuzz-lead-needs-more-than-left"),
+    pytest.param(b",*ff\xe1rrr", id="lead-with-room-bad-continuation"),
+    pytest.param(b",*ff\xf0\x9f", id="four-byte-lead-two-left"),
+    pytest.param(_LE + "*F*<".encode("utf-16-le") + b"\x00\xd8x", id="utf16-high-surrogate-odd-end"),
+    pytest.param(b"*F*<" + b" " * (_K - 5) + b"\xe1rr" + b" " * 10, id="lead-at-chunk-end"),
+    pytest.param(b"*F*<" + b" " * (_K - 5) + "€".encode() + b" " * (_K - 3) + b"\xff ",
+                 id="chunk-boundary-shifted-by-carried-character"),
+    pytest.param("*F*<" + " " * (_K - 5) + "€" + " " * (_K - 2) + "\x07",
+                 id="str-chunk-boundary-shifted"),
+])
+def test_decode_errors_follow_libyaml_reader(data):
+    # libyaml waits for more input when a sequence's lead byte (or a high
+    # surrogate) needs more bytes than its chunk has, reporting the error only
+    # when the parser gets there, and carries such a character into the next
+    # chunk, which shifts later chunk boundaries.
+    def outcome(load):
+        try:
+            return repr(load(data))
+        except Exception as e:  # noqa: BLE001
+            return type(e).__name__
+    expected = outcome(lambda d: list(yaml.load_all(d, Loader=yaml.CSafeLoader)))
+    assert outcome(lambda d: list(yaml.load_all(d, Loader=ryaml.RSafeLoader))) == expected
+    assert outcome(ryaml.loads_all) == expected
