@@ -466,59 +466,57 @@ impl RSafeDumper {
         data: &Bound<'_, PyAny>,
         alias_key: Option<usize>,
     ) -> PyResult<NodeId> {
-        let pairs = self.mapping_items(py, data.cast::<PyDict>()?.items())?;
-
-        let node = self.register(
-            alias_key,
-            RepNode::Mapping {
-                tag: crate::TAG_MAP,
-                value: Vec::new(),
-                flow_style: None,
-            },
-        );
-        let mut items = Vec::new();
-        let mut best_style = true;
-        for pair in pairs.iter() {
-            let (k, v) = pair.extract::<(Bound<'_, PyAny>, Bound<'_, PyAny>)>()?;
-            let key_node = self.represent_data(py, &k)?;
-            let val_node = self.represent_data(py, &v)?;
-            best_style &= self.is_plain_scalar(key_node) && self.is_plain_scalar(val_node);
-            items.push((key_node, val_node));
-        }
-        let flow = self.choose_flow_style(best_style);
-        if let RepNode::Mapping {
-            value, flow_style, ..
-        } = &mut self.nodes[node]
-        {
-            *value = items;
-            *flow_style = flow;
-        }
-        Ok(node)
+        let items = data.cast::<PyDict>()?.items();
+        self.represent_mapping(py, crate::TAG_MAP, items, alias_key)
     }
 
+    /// PyYAML's `represent_set`: a mapping of the members to None.
     fn represent_set(
         &mut self,
         py: Python,
         data: &Bound<'_, PyAny>,
         alias_key: Option<usize>,
     ) -> PyResult<NodeId> {
+        let value = PyDict::new(py);
+        for item in data.try_iter()? {
+            value.set_item(item?, py.None())?;
+        }
+        self.represent_mapping(py, crate::TAG_SET, value.items(), alias_key)
+    }
+
+    /// PyYAML's `represent_mapping`, for dicts and sets.
+    fn represent_mapping(
+        &mut self,
+        py: Python,
+        tag: &'static str,
+        items: Bound<'_, PyList>,
+        alias_key: Option<usize>,
+    ) -> PyResult<NodeId> {
         let node = self.register(
             alias_key,
             RepNode::Mapping {
-                tag: crate::TAG_SET,
+                tag,
                 value: Vec::new(),
-                flow_style: Some(false),
+                flow_style: None,
             },
         );
-        let mut items = Vec::new();
-        for item in data.try_iter()? {
-            let key_node = self.represent_data(py, &item?)?;
-            // A separate null node for each value, so they are not aliased.
-            let null_node = self.represent_none();
-            items.push((key_node, null_node));
+        let items = self.mapping_items(py, items)?;
+        let mut pairs = Vec::new();
+        let mut best_style = true;
+        for item in items.iter() {
+            let (k, v) = item.extract::<(Bound<'_, PyAny>, Bound<'_, PyAny>)>()?;
+            let key_node = self.represent_data(py, &k)?;
+            let val_node = self.represent_data(py, &v)?;
+            best_style &= self.is_plain_scalar(key_node) && self.is_plain_scalar(val_node);
+            pairs.push((key_node, val_node));
         }
-        if let RepNode::Mapping { value, .. } = &mut self.nodes[node] {
-            *value = items;
+        let flow = self.choose_flow_style(best_style);
+        if let RepNode::Mapping {
+            value, flow_style, ..
+        } = &mut self.nodes[node]
+        {
+            *value = pairs;
+            *flow_style = flow;
         }
         Ok(node)
     }

@@ -179,3 +179,18 @@ def test_keys_sorted_like_python_sorted(reference, mapping, sort_keys):
     # PyYAML sorts the items with sorted() and keeps their order if that raises
     # TypeError; a partial sort would differ.
     assert_same_dump(reference, [mapping], sort_keys=sort_keys)
+
+
+@pytest.mark.parametrize("value", [
+    pytest.param({3, 1, 2}, id="ints"),
+    pytest.param({"s": {"b", "a"}}, id="nested"),
+    pytest.param({1, "a"}, id="unsortable"),
+    pytest.param(set(), id="empty"),
+])
+@pytest.mark.parametrize("options", [
+    {}, {"sort_keys": False}, {"default_flow_style": True}, {"default_flow_style": None},
+], ids=["sorted", "unsorted", "flow", "auto-flow"])
+def test_sets_are_represented_as_mappings(reference, value, options):
+    # PyYAML's represent_set builds {member: None} and calls represent_mapping,
+    # so members are sorted and the flow style is chosen like a mapping's.
+    assert_same_dump(reference, [value], **options)
