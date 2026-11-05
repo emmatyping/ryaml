@@ -565,3 +565,25 @@ def test_serializer_state_kept_after_a_failed_document(ops):
                 results.append(type(e).__name__)
         return results, stream.getvalue()
     assert run(ryaml.RSafeDumper) == run(yaml.CSafeDumper)
+
+
+@pytest.mark.skipif(not hasattr(yaml, "CSafeDumper"), reason="PyYAML was built without LibYAML")
+@pytest.mark.parametrize("explicit_end", [None, True])
+def test_failed_write_keeps_nodes_seen(explicit_end):
+    # Writing str to a BytesIO fails at document end; the kept state has the
+    # (reused) date seen once, so the next document writes it as an alias.
+    import datetime
+    import io
+
+    def run(dumper):
+        doc = datetime.datetime(1, 12, 10, 13, 8, 0, 115)
+        instance = dumper(io.BytesIO(), explicit_end=explicit_end)
+        results = []
+        for op in ("open", "represent", "represent", "open"):
+            try:
+                instance.represent(doc) if op == "represent" else getattr(instance, op)()
+                results.append(None)
+            except Exception as e:  # noqa: BLE001
+                results.append(type(e).__name__)
+        return results
+    assert run(ryaml.RSafeDumper) == run(yaml.CSafeDumper)

@@ -859,12 +859,21 @@ impl RSafeDumper {
         let carried_over = !self.node_states.is_empty();
         self.node_states
             .resize(self.nodes.len(), NodeState::default());
-        if self.has_aliases || carried_over {
+        let anchored = self.has_aliases || carried_over;
+        if anchored {
             self.anchor_node(py, node, 0)?;
         }
-        self.serialize_node(py, node, 0)?;
-
-        self.emit(py, Event::document_end(self.document_end_implicit))?;
+        let result = self
+            .serialize_node(py, node, 0)
+            .and_then(|()| self.emit(py, Event::document_end(self.document_end_implicit)));
+        if let Err(error) = result {
+            if !anchored {
+                // The kept state must be what the skipped anchor pass would
+                // have left: every node seen (none twice, so no anchors).
+                self.anchor_node(py, node, 0)?;
+            }
+            return Err(error);
+        }
 
         // Reset serializer state
         self.node_states.clear();
