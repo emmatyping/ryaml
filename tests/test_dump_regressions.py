@@ -469,3 +469,12 @@ def test_directives_checked_per_document(options):
             return "represent", type(e).__name__
         return "ok", None
     assert run(ryaml.RSafeDumper) == run(yaml.CSafeDumper)
+
+
+@pytest.mark.parametrize("value", ["\u7eff", "a\u7effb", "\ufeff", "a\ufeffb", "\u7eff\U000136ef"])
+@pytest.mark.parametrize("style", [None, "'", '"'])
+@pytest.mark.parametrize("allow_unicode", [True, False])
+def test_only_the_bom_is_escaped_as_a_bom(reference, value, style, allow_unicode):
+    # libyaml escapes U+FEFF in double-quoted scalars; U+7EFF (a CJK
+    # character) is ordinary text.
+    assert_same_dump(reference, [value], default_style=style, allow_unicode=allow_unicode)
