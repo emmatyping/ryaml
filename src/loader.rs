@@ -1,16 +1,29 @@
 //! Module implement pyyaml compatibility layer for ryaml via libyaml
 //! Implements RLoader, which can load YAML 1.1
 
+use base64::Engine as _;
 use libyaml_safer::{Event, EventData, Parser};
 use pyo3::exceptions::PyNotImplementedError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySet, PyString};
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{
+    PyBool, PyBytes, PyDate, PyDateTime, PyDict, PyFloat, PyInt, PyList, PySet, PyString, PyTuple,
+    PyTzInfo,
+};
 use rustc_hash::FxBuildHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
 use crate::exception;
 use crate::resolver;
+
+/// Only mappings with merges need a second construction step. Ordinary mappings
+/// are constructed directly without allocating a node graph.
+struct PendingMapping {
+    dict: Py<PyDict>,
+    sources: Vec<Py<PyAny>>,
+    set: Option<Py<PySet>>,
+}
 
 #[pyclass(name = "_RSafeLoader", subclass)]
 pub struct RSafeLoader {
@@ -20,6 +33,14 @@ pub struct RSafeLoader {
     parsed_event: Option<Event>,
     /// Anchors mapping anchor name to constructed Python object
     anchors: HashMap<String, Py<PyAny>, FxBuildHasher>,
+    /// Anchors placed on a `<<` merge key. PyYAML keeps these as `merge`-tagged
+    /// nodes: an alias to one acts as a merge key in key position and is a
+    /// ConstructorError anywhere else.
+    merge_anchors: HashSet<String, FxBuildHasher>,
+    pending_mappings: Vec<PendingMapping>,
+    // Sets are represented by mapping nodes in YAML and can be merge sources.
+    set_mappings: HashMap<usize, (Py<PySet>, Py<PyDict>), FxBuildHasher>,
+    anchored_mapping_lengths: HashMap<usize, usize, FxBuildHasher>,
 }
 
 #[pymethods]
@@ -32,6 +53,10 @@ impl RSafeLoader {
             parser,
             parsed_event: None,
             anchors: HashMap::with_hasher(FxBuildHasher),
+            merge_anchors: HashSet::with_hasher(FxBuildHasher),
+            pending_mappings: Vec::new(),
+            set_mappings: HashMap::with_hasher(FxBuildHasher),
+            anchored_mapping_lengths: HashMap::with_hasher(FxBuildHasher),
         }
     }
 
@@ -147,13 +172,24 @@ impl RSafeLoader {
 
     /// Register an anchor, rejecting duplicates (pyyaml ComposerError behavior).
     fn register_anchor(&mut self, py: Python, name: String, value: Py<PyAny>) -> PyResult<()> {
-        if self.anchors.contains_key(&name) {
+        self.check_new_anchor(py, &name)?;
+        self.anchors.insert(name, value);
+        Ok(())
+    }
+
+    fn register_merge_anchor(&mut self, py: Python, name: String) -> PyResult<()> {
+        self.check_new_anchor(py, &name)?;
+        self.merge_anchors.insert(name);
+        Ok(())
+    }
+
+    fn check_new_anchor(&self, py: Python, name: &str) -> PyResult<()> {
+        if self.anchors.contains_key(name) || self.merge_anchors.contains(name) {
             return Err(exception::composer_error(
                 py,
                 format!("found duplicate anchor '{}'", name),
             ));
         }
-        self.anchors.insert(name, value);
         Ok(())
     }
 
@@ -170,8 +206,15 @@ impl RSafeLoader {
         self._parse_next_event(py)?;
         self.parsed_event = None;
 
+        // Resolve merges after all explicit entries, including ancestor entries,
+        // exist. Preserve the objects already referenced by aliases.
+        self.finish_mappings(py)?;
+
         // Clear anchors for next document
         self.anchors.clear();
+        self.merge_anchors.clear();
+        self.set_mappings.clear();
+        self.anchored_mapping_lengths.clear();
 
         Ok(Some(result))
     }
@@ -183,6 +226,8 @@ impl RSafeLoader {
             EventData::Alias { anchor } => {
                 if let Some(obj) = self.anchors.get(&anchor) {
                     Ok(obj.clone_ref(py))
+                } else if self.merge_anchors.contains(&anchor) {
+                    Err(merge_node_error(py))
                 } else {
                     Err(exception::composer_error(
                         py,
@@ -236,9 +281,11 @@ impl RSafeLoader {
             crate::TAG_BOOL => construct_bool_direct(py, &value)?,
             crate::TAG_INT => construct_int_direct(py, &value)?,
             crate::TAG_FLOAT => construct_float_direct(py, &value)?,
-            crate::TAG_STR | crate::TAG_TIMESTAMP | crate::TAG_BINARY => {
-                PyString::new(py, &value).into_any().unbind()
+            crate::TAG_TIMESTAMP => {
+                construct_timestamp(py, &value, tag.as_deref().is_none_or(|tag| tag == "!"))?
             }
+            crate::TAG_BINARY => construct_binary(py, &value)?,
+            crate::TAG_STR => PyString::new(py, &value).into_any().unbind(),
             _ => {
                 return Err(exception::constructor_error(
                     py,
@@ -276,6 +323,7 @@ impl RSafeLoader {
                 format!("could not determine a constructor for the tag '{}'", t),
             ));
         }
+        let pairs = matches!(tag.as_deref(), Some(crate::TAG_OMAP | crate::TAG_PAIRS));
         let list = PyList::empty(py);
         let list_obj: Py<PyAny> = list.clone().unbind().into_any();
 
@@ -296,7 +344,11 @@ impl RSafeLoader {
             ) {
                 break;
             }
-            let item = self.construct_from_events(py)?;
+            let item = if pairs {
+                self.construct_pair_entry(py)?
+            } else {
+                self.construct_from_events(py)?
+            };
             list.append(item)?;
         }
 
@@ -311,13 +363,14 @@ impl RSafeLoader {
         anchor: Option<String>,
         tag: Option<String>,
     ) -> PyResult<Py<PyAny>> {
-        if tag.as_deref() == Some(crate::TAG_SET) {
-            return self.construct_set_direct(py, anchor);
-        }
+        let record_length = anchor.is_some();
+        let mut length = 0;
+        let is_set = tag.as_deref() == Some(crate::TAG_SET);
         // Reject unknown tags (pyyaml SafeConstructor behavior)
         if let Some(ref t) = tag
             && t != "!"
             && t != crate::TAG_MAP
+            && t != crate::TAG_SET
         {
             return Err(exception::constructor_error(
                 py,
@@ -326,13 +379,27 @@ impl RSafeLoader {
         }
 
         let dict = PyDict::new(py);
-        let dict_obj: Py<PyAny> = dict.clone().unbind().into_any();
+        let set = if is_set {
+            Some(PySet::empty(py)?)
+        } else {
+            None
+        };
+        let dict_obj: Py<PyAny> = match &set {
+            Some(set) => set.clone().into_any().unbind(),
+            None => dict.clone().into_any().unbind(),
+        };
 
         // Store in anchors BEFORE recursing (handles circular references)
         if let Some(anchor_name) = anchor {
             self.register_anchor(py, anchor_name, dict_obj.clone_ref(py))?;
         }
 
+        if let Some(set) = &set {
+            self.set_mappings.insert(
+                dict_obj.as_ptr() as usize,
+                (set.clone().unbind(), dict.clone().unbind()),
+            );
+        }
         let mut merge_sources: Vec<Py<PyAny>> = Vec::new();
 
         loop {
@@ -347,22 +414,46 @@ impl RSafeLoader {
                 break;
             }
 
+            length += 1;
             // Check if the key is a merge key BEFORE constructing it
-            let is_merge = is_merge_key(&self.parsed_event);
+            let is_merge = is_merge_key(&self.parsed_event, &self.merge_anchors);
 
             if is_merge {
-                // Consume the merge key event without constructing
-                self.parsed_event = None;
+                // Consume the merge key event without constructing, but keep
+                // its anchor so duplicates and later aliases behave like PyYAML.
+                if let Some(Event {
+                    data:
+                        EventData::Scalar {
+                            anchor: Some(anchor),
+                            ..
+                        },
+                    ..
+                }) = self.parsed_event.take()
+                {
+                    self.register_merge_anchor(py, anchor)?;
+                }
 
                 // Parse the value
                 self._parse_next_event(py)?;
-                let value = self.construct_from_events(py)?;
+                let mut value = self.construct_from_events(py)?;
+                if let Some((_, mapping)) = self.set_mappings.get(&(value.as_ptr() as usize)) {
+                    value = mapping.clone_ref(py).into_any();
+                }
 
                 // Collect merge source(s) — must be a mapping or list of mappings
                 if value.downcast_bound::<PyDict>(py).is_ok() {
                     merge_sources.push(value);
                 } else if let Ok(value_list) = value.downcast_bound::<PyList>(py) {
-                    for item in value_list.iter() {
+                    // Flatten each sequence in reverse order so its first
+                    // mapping wins, while later << entries still win overall.
+                    for item in value_list.iter().rev() {
+                        let item = if let Some((_, mapping)) =
+                            self.set_mappings.get(&(item.as_ptr() as usize))
+                        {
+                            mapping.bind(py).clone().into_any()
+                        } else {
+                            item
+                        };
                         if !item.is_instance_of::<PyDict>() {
                             return Err(exception::constructor_error(
                                 py,
@@ -416,16 +507,19 @@ impl RSafeLoader {
             dict.set_item(&key, value)?;
         }
 
-        // Apply merge sources: explicit keys take precedence, then first merge source wins
+        if record_length {
+            self.anchored_mapping_lengths
+                .insert(dict_obj.as_ptr() as usize, length);
+        }
         if !merge_sources.is_empty() {
-            for source in &merge_sources {
-                if let Ok(source_dict) = source.downcast_bound::<PyDict>(py) {
-                    for (k, v) in source_dict.iter() {
-                        if !dict.contains(&k)? {
-                            dict.set_item(&k, v)?;
-                        }
-                    }
-                }
+            self.pending_mappings.push(PendingMapping {
+                dict: dict.clone().unbind(),
+                sources: merge_sources,
+                set: set.map(Bound::unbind),
+            });
+        } else if let Some(set) = set {
+            for key in dict.keys().iter() {
+                set.add(key)?;
             }
         }
 
@@ -433,49 +527,311 @@ impl RSafeLoader {
         Ok(dict_obj)
     }
 
-    /// Construct a Python set from a !!set mapping
-    fn construct_set_direct(&mut self, py: Python, anchor: Option<String>) -> PyResult<Py<PyAny>> {
-        let pyset = PySet::empty(py)?;
-        let set_obj: Py<PyAny> = pyset.clone().unbind().into_any();
-
-        if let Some(anchor_name) = anchor {
-            self.register_anchor(py, anchor_name, set_obj.clone_ref(py))?;
-        }
-
-        loop {
-            self._parse_next_event(py)?;
-            if matches!(
-                &self.parsed_event,
-                Some(Event {
-                    data: EventData::MappingEnd,
-                    ..
-                })
-            ) {
-                break;
-            }
-
-            let key = self.construct_from_events(py)?;
-
-            // Consume the value (always null in a set)
-            self._parse_next_event(py)?;
-            let _value = self.construct_from_events(py)?;
-
-            if key.bind(py).hash().is_err() {
+    /// !!omap / !!pairs entries are raw single-entry mappings, not constructed
+    /// dicts: their keys may be unhashable, and duplicate entries must be rejected
+    /// before a dict could collapse them.
+    fn construct_pair_entry(&mut self, py: Python) -> PyResult<Py<PyAny>> {
+        let event = self.parsed_event.take().unwrap();
+        let anchor = match event.data {
+            EventData::Alias { anchor } => {
+                if self.merge_anchors.contains(&anchor) {
+                    return Err(exception::constructor_error(
+                        py,
+                        "expected a mapping of length 1".to_string(),
+                    ));
+                }
+                let value = self.anchors.get(&anchor).ok_or_else(|| {
+                    exception::composer_error(py, format!("found undefined alias '{}'", anchor))
+                })?;
+                if self
+                    .anchored_mapping_lengths
+                    .get(&(value.as_ptr() as usize))
+                    .is_some_and(|&n| n != 1)
+                {
+                    return Err(exception::constructor_error(
+                        py,
+                        "expected a single mapping item".to_string(),
+                    ));
+                }
+                let value =
+                    if let Some((_, mapping)) = self.set_mappings.get(&(value.as_ptr() as usize)) {
+                        mapping.bind(py).clone().into_any()
+                    } else {
+                        value.bind(py).clone()
+                    };
+                if let Ok(mapping) = value.cast::<PyDict>()
+                    && mapping.len() == 1
+                {
+                    let (key, value) = mapping.iter().next().unwrap();
+                    return Ok(PyTuple::new(py, [key, value])?.into_any().unbind());
+                }
                 return Err(exception::constructor_error(
                     py,
-                    "found unhashable key".to_string(),
+                    "expected a single mapping item".to_string(),
                 ));
             }
-            pyset.add(&key)?;
+            EventData::MappingStart { anchor, .. } => anchor,
+            _ => {
+                return Err(exception::constructor_error(
+                    py,
+                    "expected a mapping of length 1".to_string(),
+                ));
+            }
+        };
+        let wrapper = if let Some(anchor) = anchor {
+            let mapping = PyDict::new(py);
+            self.register_anchor(py, anchor, mapping.clone().into_any().unbind())?;
+            Some(mapping)
+        } else {
+            None
+        };
+        self._parse_next_event(py)?;
+        if matches!(
+            self.parsed_event.as_ref().map(|e| &e.data),
+            Some(EventData::MappingEnd)
+        ) {
+            return Err(exception::constructor_error(
+                py,
+                "expected a single mapping item".to_string(),
+            ));
         }
-
+        let key = self.construct_from_events(py)?;
+        self._parse_next_event(py)?;
+        let value = self.construct_from_events(py)?;
+        self._parse_next_event(py)?;
+        if !matches!(
+            self.parsed_event.as_ref().map(|e| &e.data),
+            Some(EventData::MappingEnd)
+        ) {
+            return Err(exception::constructor_error(
+                py,
+                "expected a single mapping item".to_string(),
+            ));
+        }
         self.parsed_event = None;
-        Ok(set_obj)
+        if let Some(mapping) = wrapper {
+            // The wrapper is a mapping node if referenced elsewhere by an alias.
+            mapping.set_item(&key, &value)?;
+        }
+        Ok(PyTuple::new(py, [key, value])?.into_any().unbind())
+    }
+
+    fn finish_mappings(&mut self, py: Python) -> PyResult<()> {
+        if self.pending_mappings.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending_mappings);
+        let indices: HashMap<usize, usize, FxBuildHasher> = pending
+            .iter()
+            .enumerate()
+            .map(|(i, mapping)| (mapping.dict.as_ptr() as usize, i))
+            .collect();
+        let mut visited = vec![false; pending.len()];
+        // Parents are appended after their children. Flatten parents first, as
+        // PyYAML does, and break recursive merge edges at the explicit entries.
+        for i in (0..pending.len()).rev() {
+            finish_mapping(py, i, &pending, &indices, &mut visited)?;
+        }
+        Ok(())
     }
 }
 
-/// Check if the current event is a merge key (plain scalar "<<" or explicit merge tag)
-fn is_merge_key(event: &Option<Event>) -> bool {
+/// Rebuild only mappings which contain merges, preserving insertion order and
+/// alias identity. Explicit entries override all merged entries.
+fn finish_mapping(
+    py: Python,
+    index: usize,
+    pending: &[PendingMapping],
+    indices: &HashMap<usize, usize, FxBuildHasher>,
+    visited: &mut [bool],
+) -> PyResult<()> {
+    if visited[index] {
+        return Ok(());
+    }
+    visited[index] = true;
+    let mapping = &pending[index];
+    let mut merged: Option<Bound<'_, PyDict>> = None;
+    for source in &mapping.sources {
+        if let Some(&source_index) = indices.get(&(source.as_ptr() as usize)) {
+            finish_mapping(py, source_index, pending, indices, visited)?;
+        }
+        let source = source.bind(py).cast::<PyDict>()?;
+        if let Some(merged) = &merged {
+            merged.update(source.as_mapping())?;
+        } else {
+            merged = Some(source.copy()?);
+        }
+    }
+    let merged = merged.expect("pending mappings have at least one merge source");
+    let dict = mapping.dict.bind(py);
+    merged.update(dict.as_mapping())?;
+    dict.clear();
+    dict.update(merged.as_mapping())?;
+    if let Some(set) = &mapping.set {
+        for key in dict.keys().iter() {
+            set.bind(py).add(key)?;
+        }
+    }
+    Ok(())
+}
+
+static ISO_DATETIME: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+fn construct_timestamp(py: Python, value: &str, implicit: bool) -> PyResult<Py<PyAny>> {
+    let b = value.as_bytes();
+    // Common date-only form: avoid regex/group parsing and Python helper calls.
+    if b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && (implicit
+            || b.iter()
+                .enumerate()
+                .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit()))
+    {
+        let pair = |i: usize| (b[i] - b'0') * 10 + b[i + 1] - b'0';
+        let year = i32::from(pair(0)) * 100 + i32::from(pair(2));
+        let month = pair(5);
+        let day = pair(8);
+        return Ok(PyDate::new(py, year, month, day)?.into_any().unbind());
+    }
+    // datetime's C implementation handles the common fixed-width ISO form.
+    // Check YAML's grammar first: fromisoformat also accepts non-YAML forms.
+    if b.len() >= 19
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[13] == b':'
+        && b[16] == b':'
+        && (implicit || resolver::is_timestamp(value))
+    {
+        if let Some(result) = construct_fixed_datetime(py, value)? {
+            return Ok(result);
+        }
+        let constructor = ISO_DATETIME.get_or_try_init(py, || -> PyResult<_> {
+            Ok(py
+                .import("datetime")?
+                .getattr("datetime")?
+                .getattr("fromisoformat")?
+                .unbind())
+        })?;
+        match constructor.bind(py).call1((value,)) {
+            Ok(result) => return Ok(result.unbind()),
+            // YAML also permits an empty fractional part, e.g. ...:00.Z.
+            Err(error) if error.is_instance_of::<pyo3::exceptions::PyValueError>(py) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    construct_python_scalar(py, &TIMESTAMP, "timestamp", value)
+}
+
+/// Construct fixed-width naive/UTC datetimes without a temporary Python string.
+/// The caller has already checked YAML's timestamp grammar and field positions.
+fn construct_fixed_datetime(py: Python, value: &str) -> PyResult<Option<Py<PyAny>>> {
+    let b = value.as_bytes();
+    // The grammar check already validated all digits. These positions distinguish
+    // two-digit days/hours with one separator from single-digit fields or extra
+    // whitespace that happen to put the colons at the same offsets.
+    if !b[9].is_ascii_digit() || !b[11].is_ascii_digit() || !b[12].is_ascii_digit() {
+        return Ok(None);
+    }
+    let pair = |i: usize| (b[i] - b'0') * 10 + b[i + 1] - b'0';
+    let mut end = 19;
+    let mut microsecond = 0;
+    if b.get(end) == Some(&b'.') {
+        end += 1;
+        let start = end;
+        while end < b.len() && b[end].is_ascii_digit() {
+            if end - start < 6 {
+                microsecond = microsecond * 10 + u32::from(b[end] - b'0');
+            }
+            end += 1;
+        }
+        for _ in (end - start)..6 {
+            microsecond *= 10;
+        }
+    }
+    let zone = match &value[end..] {
+        "" => None,
+        "Z" => Some(PyTzInfo::utc(py)?),
+        // Offset zones and whitespace before the zone use the general path.
+        _ => return Ok(None),
+    };
+    let year = i32::from(pair(0)) * 100 + i32::from(pair(2));
+    Ok(Some(
+        PyDateTime::new(
+            py,
+            year,
+            pair(5),
+            pair(8),
+            pair(11),
+            pair(14),
+            pair(17),
+            microsecond,
+            zone.as_deref(),
+        )?
+        .into_any()
+        .unbind(),
+    ))
+}
+
+static BASE64_DECODER: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+fn construct_binary(py: Python, value: &str) -> PyResult<Py<PyAny>> {
+    // Canonical base64 is decoded in Rust. Python's decoder handles the wider
+    // set of non-canonical inputs accepted by PyYAML (whitespace, extra chars,
+    // non-zero padding bits), and provides its error semantics.
+    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(value) {
+        return Ok(PyBytes::new(py, &decoded).into_any().unbind());
+    }
+    if !value.is_ascii() {
+        return construct_python_scalar(py, &BINARY, "binary", value);
+    }
+    let decoder = BASE64_DECODER.get_or_try_init(py, || -> PyResult<_> {
+        Ok(py.import("binascii")?.getattr("a2b_base64")?.unbind())
+    })?;
+    match decoder.bind(py).call1((value,)) {
+        Ok(result) => Ok(result.unbind()),
+        Err(error) if error.is_instance_of::<pyo3::exceptions::PyValueError>(py) => Err(
+            exception::constructor_error(py, format!("failed to decode base64 data: {}", error)),
+        ),
+        Err(error) => Err(error),
+    }
+}
+
+static TIMESTAMP: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static BINARY: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+fn construct_python_scalar(
+    py: Python,
+    cache: &PyOnceLock<Py<PyAny>>,
+    name: &str,
+    value: &str,
+) -> PyResult<Py<PyAny>> {
+    let constructor = cache.get_or_try_init(py, || -> PyResult<_> {
+        Ok(py.import("ryaml._scalars")?.getattr(name)?.unbind())
+    })?;
+    Ok(constructor.bind(py).call1((value,))?.unbind())
+}
+
+fn merge_node_error(py: Python) -> PyErr {
+    exception::constructor_error(
+        py,
+        format!(
+            "could not determine a constructor for the tag '{}'",
+            crate::TAG_MERGE
+        ),
+    )
+}
+
+/// Check if the current event is a merge key: plain scalar "<<", an explicit
+/// merge tag, or an alias to an anchored merge key.
+fn is_merge_key(event: &Option<Event>, merge_anchors: &HashSet<String, FxBuildHasher>) -> bool {
+    if let Some(Event {
+        data: EventData::Alias { anchor },
+        ..
+    }) = event
+    {
+        return merge_anchors.contains(anchor);
+    }
     if let Some(Event {
         data:
             EventData::Scalar {
@@ -501,12 +857,19 @@ fn construct_bool_direct(py: Python, value: &str) -> PyResult<Py<PyAny>> {
     let bool_val = match value {
         "yes" | "Yes" | "YES" | "true" | "True" | "TRUE" | "on" | "On" | "ON" => true,
         "no" | "No" | "NO" | "false" | "False" | "FALSE" | "off" | "Off" | "OFF" => false,
-        _ => {
-            return Err(exception::constructor_error(
-                py,
-                format!("invalid boolean value: {}", value),
-            ));
+        _ if ["yes", "true", "on"]
+            .iter()
+            .any(|s| value.eq_ignore_ascii_case(s)) =>
+        {
+            true
         }
+        _ if ["no", "false", "off"]
+            .iter()
+            .any(|s| value.eq_ignore_ascii_case(s)) =>
+        {
+            false
+        }
+        _ => return Err(pyo3::exceptions::PyKeyError::new_err(value.to_lowercase())),
     };
     Ok(PyBool::new(py, bool_val).as_any().clone().unbind())
 }
@@ -634,6 +997,8 @@ fn construct_float_direct(py: Python, value: &str) -> PyResult<Py<PyAny>> {
     construct_float_fallback(py, value)
 }
 
+static NAN: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
 fn construct_float_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
     let bytes = value.as_bytes();
     if bytes.is_empty() {
@@ -653,7 +1018,10 @@ fn construct_float_fallback(py: Python, value: &str) -> PyResult<Py<PyAny>> {
         return Ok(PyFloat::new(py, sign * f64::INFINITY).into_any().unbind());
     }
     if remaining.eq_ignore_ascii_case(".nan") {
-        return Ok(PyFloat::new(py, f64::NAN).into_any().unbind());
+        // PyYAML returns one shared NaN object, so repeated `.nan` mapping keys
+        // collapse via dict's identity check; mirror that.
+        let nan = NAN.get_or_init(py, || PyFloat::new(py, f64::NAN).into_any().unbind());
+        return Ok(nan.clone_ref(py));
     }
 
     let result = if remaining.contains(':') {

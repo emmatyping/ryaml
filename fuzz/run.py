@@ -1,4 +1,4 @@
-#!/home/emma/oss/ryaml/.venv/bin/python3
+#!/usr/bin/env python3
 import sys
 import math
 
@@ -15,7 +15,7 @@ with atheris.instrument_imports():
 
     import yaml
 
-def approx_equal(a, b, rel_tol=1e-9):
+def approx_equal(a, b, rel_tol=1e-9, _seen=None):
     """Recursively compare structures, using math.isclose for floats."""
     if type(a) != type(b):
         return False
@@ -27,13 +27,27 @@ def approx_equal(a, b, rel_tol=1e-9):
     if isinstance(a, dict):
         if len(a) != len(b):
             return False
+        if _seen is None:
+            _seen = set()
+        pair = (id(a), id(b))
+        if pair in _seen:
+            return True
+        _seen.add(pair)
         # Compare sorted by repr since keys might be floats
         a_items = sorted(a.items(), key=repr)
         b_items = sorted(b.items(), key=repr)
-        return all(approx_equal(ak, bk) and approx_equal(av, bv)
+        return all(approx_equal(ak, bk, rel_tol, _seen) and approx_equal(av, bv, rel_tol, _seen)
                     for (ak, av), (bk, bv) in zip(a_items, b_items))
     if isinstance(a, (list, tuple)):
-        return len(a) == len(b) and all(approx_equal(x, y) for x, y in zip(a, b))
+        if len(a) != len(b):
+            return False
+        if _seen is None:
+            _seen = set()
+        pair = (id(a), id(b))
+        if pair in _seen:
+            return True
+        _seen.add(pair)
+        return all(approx_equal(x, y, rel_tol, _seen) for x, y in zip(a, b))
     return a == b
 
 def compare(text):
@@ -103,5 +117,11 @@ def test_any_bytes(data):
     text = data.decode("utf-8", errors="replace")
     compare(text)
 
-atheris.Setup(sys.argv, test_any_bytes.hypothesis.fuzz_one_input)
+@atheris.instrument_func
+def fuzz_yaml(data):
+    # Corpus entries are YAML files, not Hypothesis's encoded choice streams.
+    compare(data.decode("utf-8", errors="replace"))
+
+
+atheris.Setup(sys.argv, fuzz_yaml)
 atheris.Fuzz()

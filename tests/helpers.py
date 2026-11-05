@@ -4,6 +4,14 @@ from typing import Any
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+import pytest
+import yaml
+
+try:
+    from yaml import CSafeLoader as REFERENCE_LOADER
+except ImportError:  # PyYAML built without LibYAML (e.g. Windows ARM wheels)
+    from yaml import SafeLoader as REFERENCE_LOADER
+
 # https://github.com/yaml/yaml-test-suite/releases/tag/data-2022-01-17
 YAML_TEST_SUITE = Path(__file__).resolve().parent / "yaml-test-suite"
 
@@ -178,3 +186,20 @@ def _is_nan(obj: Any) -> Any | dict[Any, Any] | list[Any]:
     if isinstance(obj, float) and math.isnan(obj):
         return "ryaml_tests_nan"
     return obj
+
+
+def load_reference(source: str) -> list[Any]:
+    """PyYAML's result for a valid yaml-test-suite case.
+
+    PyYAML ships LibYAML wheels for Windows ARM only from 6.0.3 and only for
+    CPython 3.12+, so 3.10/3.11 there fall back to the pure-Python loader. Its
+    scanner rejects some valid inputs that LibYAML and ryaml accept (tabs in
+    DK95/05, DK95/07, MUS6/03, Y79Y/002); there is nothing to compare against
+    for those, so skip them.
+    """
+    try:
+        return list(yaml.load_all(source, Loader=REFERENCE_LOADER))
+    except yaml.YAMLError as e:
+        if REFERENCE_LOADER is yaml.SafeLoader:
+            pytest.skip(f"pure-Python PyYAML rejects this valid input: {e.problem}")
+        raise

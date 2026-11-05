@@ -190,7 +190,7 @@ fn is_exponent(b: &[u8]) -> bool {
 }
 
 /// Match YAML 1.1 timestamp: date-only (YYYY-MM-DD) or full datetime.
-fn is_timestamp(value: &str) -> bool {
+pub(crate) fn is_timestamp(value: &str) -> bool {
     let b = value.as_bytes();
     // Year: [0-9]{4}-
     if b.len() < 8

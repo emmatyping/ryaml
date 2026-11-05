@@ -99,13 +99,19 @@ def compare(text):
         )
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="libyaml inconsistent on Windows")
+@pytest.mark.skipif(
+    sys.platform == "win32" or SafeLoader is None,
+    reason="needs LibYAML-backed PyYAML; libyaml inconsistent on Windows",
+)
 @given(st.text())
 @settings(max_examples=5000, suppress_health_check=[HealthCheck.too_slow])
 def test_any_text(text):
     compare(text)
 
-@pytest.mark.skipif(sys.platform == "win32", reason="libyaml inconsistent on Windows")
+@pytest.mark.skipif(
+    sys.platform == "win32" or SafeLoader is None,
+    reason="needs LibYAML-backed PyYAML; libyaml inconsistent on Windows",
+)
 @given(st.binary())
 @settings(max_examples=5000)
 def test_any_bytes(data):
@@ -127,7 +133,10 @@ yaml_scalars = st.one_of(
     st.just(".nan"),
 )
 
-@pytest.mark.skipif(sys.platform == "win32", reason="libyaml inconsistent on Windows")
+@pytest.mark.skipif(
+    sys.platform == "win32" or SafeLoader is None,
+    reason="needs LibYAML-backed PyYAML; libyaml inconsistent on Windows",
+)
 @given(st.recursive(
     yaml_scalars,
     lambda children: st.one_of(

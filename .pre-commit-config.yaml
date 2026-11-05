@@ -1,4 +1,4 @@
-exclude: (^tests/yaml-test-suite/)
+exclude: (^tests/yaml-test-suite/|^fuzz/seed/)
 repos:
     -   repo: https://github.com/pre-commit/pre-commit-hooks
         rev: v4.0.1

@@ -49,7 +49,7 @@ include = [
 test = [
     "hypothesis>=6.0",
     "pytest>=9.0",
-    "pyyaml>=6.0",
+    "pyyaml>=6.0.3",
 ]
 
 [tool.hatch.envs.default]
