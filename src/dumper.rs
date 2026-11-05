@@ -479,21 +479,7 @@ impl RSafeDumper {
     }
 
     fn represent_float(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
-        let f: f64 = data.extract()?;
-        let value = if f.is_nan() {
-            ".nan".to_string()
-        } else if f.is_infinite() {
-            if f > 0.0 { ".inf" } else { "-.inf" }.to_string()
-        } else {
-            // PyYAML: repr(data).lower(), with ".0" added before an exponent
-            // when there is no decimal point (repr(1e17) is "1e+17").
-            let value = data.repr()?.to_str()?.to_lowercase();
-            if !value.contains('.') && value.contains('e') {
-                value.replacen('e', ".0e", 1)
-            } else {
-                value
-            }
-        };
+        let value = yaml_float(data.extract::<f64>()?);
         Ok(self.make_scalar(crate::TAG_FLOAT, &value, None))
     }
 
@@ -903,6 +889,89 @@ impl RSafeDumper {
 
 static DATE_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static DATETIME_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+
+/// PyYAML's `represent_float`: `.nan`, `.inf`, `-.inf`, or `repr(value)`
+/// lowercased, with `.0` added before an exponent when there is no decimal
+/// point (`1e+17` becomes `1.0e+17`).
+fn yaml_float(value: f64) -> String {
+    if value.is_nan() {
+        return ".nan".to_string();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { ".inf" } else { "-.inf" }.to_string();
+    }
+    let mut out = String::with_capacity(24);
+    write_python_float_repr(value, &mut out);
+    if !out.contains('.')
+        && let Some(e) = out.find('e')
+    {
+        out.insert_str(e, ".0");
+    }
+    out
+}
+
+/// Python's `repr(float)` for a finite value (CPython's `format_float_short`
+/// in mode 'r'): the shortest digits that round-trip, in fixed notation when
+/// the decimal point falls within -4 < decpt <= 16 (with ".0" added when there
+/// is no fractional part), otherwise as d.ddde+XX with at least two exponent
+/// digits. Rust's `{:e}` gives the same shortest digits.
+fn write_python_float_repr(value: f64, out: &mut String) {
+    use std::fmt::Write as _;
+    let mut sci = String::with_capacity(24);
+    write!(sci, "{:e}", value.abs()).expect("formatting into a String");
+    // When two shortest strings are equally close (the value is exactly
+    // halfway), Python picks the one with an even last digit; Rust's shortest
+    // formatting may pick the odd one. Exact formatting to as many digits
+    // rounds halfway cases to even, so use it when it still round-trips.
+    let mantissa_end = sci.find('e').expect("{:e} has an exponent");
+    if sci.as_bytes()[mantissa_end - 1] % 2 == 1 {
+        let digits = sci[..mantissa_end].replace('.', "").len();
+        let mut even = String::with_capacity(24);
+        write!(even, "{:.*e}", digits - 1, value.abs()).expect("formatting into a String");
+        if even.parse::<f64>() == Ok(value.abs()) {
+            sci = even;
+        }
+    }
+    let (mantissa, exponent) = sci.split_once('e').expect("{:e} has an exponent");
+    let exponent: i32 = exponent.parse().expect("{:e} exponent is an integer");
+    let (first, rest) = mantissa.split_at(1);
+    let rest = rest.strip_prefix('.').unwrap_or("");
+    let digits_len = 1 + rest.len() as i32;
+    // The decimal point comes after `decpt` digits.
+    let decpt = exponent + 1;
+    if value.is_sign_negative() {
+        out.push('-');
+    }
+    if decpt <= -4 || decpt > 16 {
+        out.push_str(first);
+        if !rest.is_empty() {
+            out.push('.');
+            out.push_str(rest);
+        }
+        write!(
+            out,
+            "e{}{:02}",
+            if exponent < 0 { '-' } else { '+' },
+            exponent.abs()
+        )
+        .expect("formatting into a String");
+    } else if decpt <= 0 {
+        out.push_str("0.");
+        out.extend(std::iter::repeat_n('0', (-decpt) as usize));
+        out.push_str(first);
+        out.push_str(rest);
+    } else if decpt < digits_len {
+        let digits = [first, rest].concat();
+        out.push_str(&digits[..decpt as usize]);
+        out.push('.');
+        out.push_str(&digits[decpt as usize..]);
+    } else {
+        out.push_str(first);
+        out.push_str(rest);
+        out.extend(std::iter::repeat_n('0', (decpt - digits_len) as usize));
+        out.push_str(".0");
+    }
+}
 
 /// A tag handle or prefix: CEmitter takes exactly a str (encoded as UTF-8)
 /// or bytes.
