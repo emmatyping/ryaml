@@ -167,6 +167,9 @@ strings = st.one_of(
     st.text(st.characters(categories=["Cs"]), min_size=1, max_size=3),
     # Indicators in the middle of text.
     joined(special_strings, st.just("")).map(lambda s: s[:200]),
+    # Short strings dense in blanks, breaks and indicators, which decide
+    # scalar styles, folding and quoting.
+    st.text(alphabet=" \t\n\r#:-?'\"\\,[]{}a\x85\u2028\xe9", max_size=12),
     # Long enough to be folded or split at the line width.
     joined(special_strings, pick([" ", "  ", "\n", " \n", "\t"])),
 )
