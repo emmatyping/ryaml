@@ -27,10 +27,7 @@ use crate::resolver;
 enum RepNode {
     Scalar {
         tag: &'static str,
-        /// The text, or the error converting a `str` to UTF-8 (a lone
-        /// surrogate), which PyYAML's emitter only raises when it writes the
-        /// scalar, after the whole document is represented.
-        value: PyResult<String>,
+        value: ScalarText,
         style: Option<char>,
     },
     Sequence {
@@ -46,6 +43,42 @@ enum RepNode {
 }
 
 type NodeId = usize;
+
+/// A scalar's text.
+#[derive(Debug)]
+enum ScalarText {
+    Owned(String),
+    /// A `str`, encoded as UTF-8 only when the scalar is written: like
+    /// PyYAML's emitter, which raises the error for a lone surrogate then,
+    /// after the whole document is represented. Its UTF-8 is cached in the
+    /// object, so this avoids a copy.
+    Str(Py<PyString>),
+}
+
+impl ScalarText {
+    fn text<'a>(&'a self, py: Python<'_>) -> PyResult<&'a str> {
+        match self {
+            ScalarText::Owned(text) => Ok(text),
+            ScalarText::Str(text) => {
+                let mut size: pyo3::ffi::Py_ssize_t = 0;
+                // SAFETY: `text` is a str; with the GIL held, this returns its
+                // UTF-8, cached in the object, which lives at least as long as
+                // the reference in `self`.
+                let data = unsafe { pyo3::ffi::PyUnicode_AsUTF8AndSize(text.as_ptr(), &mut size) };
+                if data.is_null() {
+                    return Err(PyErr::fetch(py));
+                }
+                // SAFETY: CPython returned `size` bytes of valid UTF-8.
+                Ok(unsafe {
+                    std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                        data.cast::<u8>(),
+                        size as usize,
+                    ))
+                })
+            }
+        }
+    }
+}
 
 /// The serializer's record of a node (PyYAML's `anchors` and
 /// `serialized_nodes`).
@@ -484,7 +517,7 @@ impl RSafeDumper {
     }
 
     fn represent_str(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
-        let value = data.extract::<String>();
+        let value = ScalarText::Str(data.cast::<PyString>()?.clone().unbind());
         Ok(self.push_scalar(crate::TAG_STR, value, None))
     }
 
@@ -679,15 +712,10 @@ impl RSafeDumper {
     }
 
     fn make_scalar(&mut self, tag: &'static str, value: &str, style: Option<char>) -> NodeId {
-        self.push_scalar(tag, Ok(value.to_string()), style)
+        self.push_scalar(tag, ScalarText::Owned(value.to_string()), style)
     }
 
-    fn push_scalar(
-        &mut self,
-        tag: &'static str,
-        value: PyResult<String>,
-        style: Option<char>,
-    ) -> NodeId {
+    fn push_scalar(&mut self, tag: &'static str, value: ScalarText, style: Option<char>) -> NodeId {
         let style = style.or(self.default_style);
         self.nodes.push(RepNode::Scalar { tag, value, style });
         self.nodes.len() - 1
@@ -846,7 +874,7 @@ impl RSafeDumper {
 
         match &self.nodes[node] {
             RepNode::Scalar { tag, value, style } => {
-                let value = value.as_ref().map_err(|e| e.clone_ref(py))?;
+                let value = value.text(py)?;
                 let plain_implicit = *tag == resolver::resolve_scalar_tag(value, true);
                 // A non-plain scalar always resolves to str.
                 let quoted_implicit = *tag == crate::TAG_STR;
