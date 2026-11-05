@@ -940,3 +940,41 @@ def test_sexagesimal_parts_convert_before_summing(load, reference, source):
         except Exception as e:  # noqa: BLE001
             return type(e).__name__
     assert outcome(load) == outcome(reference)
+
+
+def _words(count):
+    # Mixed-width characters, so libyaml's 16 KB raw chunks split some of them.
+    return " ".join(f"w{i}é中𝄞" for i in range(count))
+
+
+_LONG = _words(2500)  # about 30 KB of UTF-8
+
+
+@pytest.mark.parametrize("source", [
+    pytest.param(f"key: {_LONG}\n", id="plain"),
+    pytest.param(f"key: {_LONG}  \n  {_LONG}\n", id="plain-folded"),
+    pytest.param(f"key: {_LONG} # comment\n", id="plain-comment"),
+    pytest.param(f"key: {_LONG}\t \tend\n", id="plain-tabs"),
+    pytest.param(f"[{_LONG}, {_LONG}]\n", id="plain-flow"),
+    pytest.param(f"key: '{_LONG}  '\n", id="single-quoted"),
+    pytest.param(f"key: '{_LONG} '' {_LONG}'\n", id="single-quoted-escape"),
+    pytest.param(f'key: "{_LONG}\\n\\t{_LONG}  "\n', id="double-quoted"),
+    pytest.param(f'key: "{_LONG}  \n   {_LONG}"\n', id="double-quoted-folded"),
+    pytest.param(f"key: |\n  {_LONG}\n  {_LONG}\n", id="literal"),
+    pytest.param(f"key: >\n  {_LONG}\n\n  {_LONG}\n", id="folded"),
+    pytest.param(f"key: {_LONG}\x01 tail\n", id="control-character"),
+    pytest.param(f"key: '{_LONG}", id="unterminated-quote"),
+])
+@pytest.mark.parametrize("encode", [False, True], ids=["str", "bytes"])
+def test_long_scalars_across_input_chunks(load, reference, source, encode):
+    # The scanner reads runs of scalar characters at once; they must stop where
+    # libyaml's character-at-a-time loops would, including at chunk ends.
+    if encode:
+        source = source.encode("utf-8")
+
+    def outcome(loader):
+        try:
+            return loader(source)
+        except Exception as e:  # noqa: BLE001
+            return type(e).__name__
+    assert outcome(load) == outcome(reference)
