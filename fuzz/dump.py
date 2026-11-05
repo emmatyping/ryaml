@@ -16,6 +16,8 @@ is an ordinary Hypothesis test, which shrinks failures to small examples:
 import collections
 import contextlib
 import datetime
+import decimal
+import enum
 import math
 import sys
 
@@ -75,15 +77,47 @@ class DictSubclass(dict):
 
 
 class Placeholder:
-    """A str or int subclass instance, made only when the test runs (see
-    `realize`). Hypothesis reuses generated str and int values as choices in
-    later examples, and fails to replay ones of a subclass."""
+    """A value made only when the test runs (see `realize`), for objects of
+    types PyYAML refuses. Hypothesis reuses generated str and int values as
+    choices in later examples, and fails to replay ones of a subclass, so such
+    values must not appear in generated data."""
 
-    def __init__(self, cls, value):
-        self.cls, self.value = cls, value
+    def __init__(self, label, make):
+        self.label, self.make = label, make
 
     def __repr__(self):
-        return f"{self.cls.__name__}({self.value!r})"
+        return self.label
+
+
+class SetSubclass(set):
+    pass
+
+
+class DatetimeSubclass(datetime.datetime):
+    pass
+
+
+class Color(enum.IntEnum):
+    RED = 1
+
+
+Point = collections.namedtuple("Point", "x y")
+
+# Values whose exact type SafeRepresenter does not register.
+UNREPRESENTABLE = [
+    Placeholder("StrSubclass('s')", lambda: StrSubclass("s")),
+    Placeholder("IntSubclass(3)", lambda: IntSubclass(3)),
+    Placeholder("Color.RED", lambda: Color.RED),
+    Placeholder("Point(1, 2)", lambda: Point(1, 2)),
+    Placeholder("SetSubclass({1})", lambda: SetSubclass({1})),
+    Placeholder("DatetimeSubclass(2001, 1, 2)", lambda: DatetimeSubclass(2001, 1, 2)),
+    Placeholder("bytearray(b'a')", lambda: bytearray(b"a")),
+    Placeholder("1j", lambda: 1j),
+    Placeholder("Decimal('1.5')", lambda: decimal.Decimal("1.5")),
+    Placeholder("object()", object),
+    Placeholder("range(2)", lambda: range(2)),
+    Placeholder("frozenset({1})", lambda: frozenset({1})),
+]
 
 
 def realize(value, seen=None):
@@ -92,7 +126,7 @@ def realize(value, seen=None):
     if seen is None:
         seen = set()
     if isinstance(value, Placeholder):
-        return value.cls(value.value)
+        return value.make()
     if isinstance(value, tuple):
         return tuple(realize(item, seen) for item in value)
     if id(value) in seen:
@@ -145,7 +179,7 @@ dates = st.one_of(st.dates(), st.datetimes(timezones=timezones))
 scalars = st.one_of(
     strings, integers, floats, st.booleans(), st.none(), st.binary(max_size=70), dates,
     # Values PyYAML's SafeRepresenter does not represent.
-    pick([Placeholder(StrSubclass, "s"), Placeholder(IntSubclass, 3), frozenset({1})]),
+    pick(UNREPRESENTABLE),
 )
 keys = st.recursive(
     st.one_of(strings, integers, floats, st.booleans(), st.none(), dates),
