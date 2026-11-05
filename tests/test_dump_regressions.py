@@ -430,3 +430,42 @@ def test_dumper_class_sorts_keys_by_default():
         instance.close()
         return stream.getvalue()
     assert run(ryaml.RSafeDumper) == run(yaml.CSafeDumper)
+
+
+@pytest.mark.parametrize(("name", "value"), [
+    ("default_style", "'x"), ("default_style", "''"), ("default_style", 0),
+    ("default_style", "|x"), ("default_style", "x"),
+    ("default_flow_style", 0), ("default_flow_style", 1), ("default_flow_style", "yes"),
+    ("canonical", 1), ("canonical", ""), ("allow_unicode", 1),
+    ("explicit_start", "x"), ("explicit_end", 1), ("sort_keys", 0),
+    ("indent", 2.7), ("indent", "3"), ("indent", float("nan")), ("width", 9.99),
+    ("width", 2**31), ("line_break", 5), ("line_break", "x"),
+    ("version", (1, 1, 0)), ("version", [1, 2]), ("version", (1,)), ("version", "11"),
+    ("tags", {"!e!": 1}), ("tags", {1: "x"}), ("tags", {"!e!": b"p:"}),
+    ("tags", {"!e%d!" % i: "p:" for i in range(129)}), ("tags", {}),
+])
+def test_option_values_like_pyyaml(reference, name, value):
+    # PyYAML uses most options by truthiness, compares default_style and
+    # line_break with exact strings, converts indent and width like int(), and
+    # checks version and tags when serializing each document.
+    docs = [{"a": [1, "x y"], "b": "line\nbreak"}, "s"]
+    assert_same_dump(reference, docs, **{name: value})
+
+
+@pytest.mark.skipif(not hasattr(yaml, "CSafeDumper"), reason="PyYAML was built without LibYAML")
+@pytest.mark.parametrize("options", [{"tags": {1: "x"}}, {"version": (1,)}],
+                         ids=["tags", "version"])
+def test_directives_checked_per_document(options):
+    def run(dumper):
+        import io
+        try:
+            instance = dumper(io.StringIO(), **options)
+        except Exception as e:  # noqa: BLE001
+            return "init", type(e).__name__
+        instance.open()
+        try:
+            instance.represent("a")
+        except Exception as e:  # noqa: BLE001
+            return "represent", type(e).__name__
+        return "ok", None
+    assert run(ryaml.RSafeDumper) == run(yaml.CSafeDumper)

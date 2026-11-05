@@ -165,10 +165,11 @@ pub struct RSafeDumper {
 
     // Serializer config
     document_start_implicit: bool,
-    /// `%YAML` and `%TAG` directives for every document (PyYAML's
-    /// `use_version` and `use_tags`), tags in the dict's order.
-    version: Option<VersionDirective>,
-    tags: Vec<TagDirective>,
+    /// The `version` and `tags` options (PyYAML's `use_version` and
+    /// `use_tags`), turned into `%YAML` and `%TAG` directives for each document
+    /// (see `directives`).
+    version: Option<Py<PyAny>>,
+    tags: Option<Py<PyAny>>,
     document_end_implicit: bool,
 
     // Serializer state (reset per document)
@@ -268,27 +269,26 @@ impl Drop for RecursionGuard {
 impl RSafeDumper {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature = (stream, default_style=None, default_flow_style=Some(false),
-        canonical=None, indent=None, width=None, allow_unicode=None,
-        line_break=None, encoding=None, explicit_start=None, explicit_end=None,
-        version=None, tags=None, sort_keys=true))]
-    #[allow(unused_variables)]
+    #[pyo3(signature = (stream, default_style=None, default_flow_style=Some(Truthy(false)),
+        canonical=Truthy(false), indent=None, width=None, allow_unicode=Truthy(false),
+        line_break=None, encoding=None, explicit_start=Truthy(false), explicit_end=Truthy(false),
+        version=None, tags=None, sort_keys=Truthy(true)))]
     fn new(
         py: Python,
         stream: Py<PyAny>,
-        default_style: Option<&str>,
-        default_flow_style: Option<bool>,
-        canonical: Option<bool>,
-        indent: Option<i32>,
-        width: Option<i32>,
-        allow_unicode: Option<bool>,
-        line_break: Option<&str>,
+        default_style: Option<Bound<'_, PyAny>>,
+        default_flow_style: Option<Truthy>,
+        canonical: Truthy,
+        indent: Option<CInt>,
+        width: Option<CInt>,
+        allow_unicode: Truthy,
+        line_break: Option<Bound<'_, PyAny>>,
         encoding: Option<Bound<'_, PyAny>>,
-        explicit_start: Option<bool>,
-        explicit_end: Option<bool>,
-        version: Option<(i32, i32)>,
-        tags: Option<Bound<'_, PyDict>>,
-        sort_keys: bool,
+        explicit_start: Truthy,
+        explicit_end: Truthy,
+        version: Option<Py<PyAny>>,
+        tags: Option<Py<PyAny>>,
+        sort_keys: Truthy,
     ) -> PyResult<Self> {
         let mut ew = EmitterWrapper::new();
 
@@ -309,56 +309,59 @@ impl RSafeDumper {
         };
         ew.configure(enc, Some(stream.clone_ref(py)), dump_unicode);
 
-        if let Some(true) = canonical {
+        if canonical.0 {
             ew.emitter_mut().set_canonical(true);
         }
-        if let Some(i) = indent {
+        if let Some(CInt(i)) = indent {
             ew.emitter_mut().set_indent(i);
         }
-        if let Some(w) = width {
+        if let Some(CInt(w)) = width {
             ew.emitter_mut().set_width(w);
         }
-        if let Some(true) = allow_unicode {
+        if allow_unicode.0 {
             ew.emitter_mut().set_unicode(true);
         }
-        if let Some(lb) = line_break {
-            let brk = match lb {
-                "\n" => libyaml_safer::Break::Ln,
-                "\r" => libyaml_safer::Break::Cr,
-                "\r\n" => libyaml_safer::Break::CrLn,
-                _ => libyaml_safer::Break::Ln,
-            };
+        // CEmitter only recognizes these line breaks and ignores anything else.
+        let line_break = line_break.and_then(|lb| lb.extract::<String>().ok());
+        let brk = match line_break.as_deref() {
+            Some("\n") => Some(libyaml_safer::Break::Ln),
+            Some("\r") => Some(libyaml_safer::Break::Cr),
+            Some("\r\n") => Some(libyaml_safer::Break::CrLn),
+            _ => None,
+        };
+        if let Some(brk) = brk {
             ew.emitter_mut().set_break(brk);
         }
 
-        let tags = match tags {
-            Some(tags) => tags
-                .iter()
-                .map(|(handle, prefix)| {
-                    Ok(TagDirective {
-                        handle: handle.extract()?,
-                        prefix: prefix.extract()?,
-                    })
-                })
-                .collect::<PyResult<Vec<_>>>()?,
-            None => Vec::new(),
+        // The representer stores default_style on every scalar node, and
+        // CEmitter writes only exactly "'", '"', '|' or '>' as that style.
+        // Any other truthy value is written plain but still counts as a style
+        // when choosing flow style.
+        let default_style_char = match default_style {
+            None => None,
+            Some(style) => match style.extract::<String>().ok().as_deref() {
+                Some("'") => Some('\''),
+                Some("\"") => Some('"'),
+                Some("|") => Some('|'),
+                Some(">") => Some('>'),
+                _ if style.is_truthy()? => Some(OTHER_STYLE),
+                _ => None,
+            },
         };
-
-        let default_style_char = default_style.and_then(|s| s.chars().next());
 
         Ok(RSafeDumper {
             emitter: ew,
             closed: -1,
-            document_start_implicit: !explicit_start.unwrap_or(false),
-            version: version.map(|(major, minor)| VersionDirective { major, minor }),
+            document_start_implicit: !explicit_start.0,
+            version,
             tags,
-            document_end_implicit: !explicit_end.unwrap_or(false),
+            document_end_implicit: !explicit_end.0,
             serialized_nodes: HashSet::new(),
             anchors: HashMap::new(),
             last_alias_id: 0,
             default_style: default_style_char,
-            default_flow_style,
-            sort_keys,
+            default_flow_style: default_flow_style.map(|style| style.0),
+            sort_keys: sort_keys.0,
             represented_objects: HashMap::new(),
             nodes: Vec::new(),
             object_keeper: Vec::new(),
@@ -722,6 +725,41 @@ impl RSafeDumper {
         })
     }
 
+    /// The `%YAML` and `%TAG` directives for a document, checked when it is
+    /// serialized, as CEmitter does: a truthy `version` gives
+    /// `version[0]`.`version[1]`; a truthy `tags` mapping (at most 128) gives
+    /// each handle and its prefix, which must be str or bytes.
+    fn directives(&self, py: Python) -> PyResult<(Option<VersionDirective>, Vec<TagDirective>)> {
+        let mut version = None;
+        if let Some(use_version) = &self.version {
+            let use_version = use_version.bind(py);
+            if use_version.is_truthy()? {
+                version = Some(VersionDirective {
+                    major: use_version.get_item(0)?.extract()?,
+                    minor: use_version.get_item(1)?.extract()?,
+                });
+            }
+        }
+        let mut tags = Vec::new();
+        if let Some(use_tags) = &self.tags {
+            let use_tags = use_tags.bind(py);
+            if use_tags.is_truthy()? {
+                if use_tags.len()? > 128 {
+                    return Err(pyo3::exceptions::PyValueError::new_err("too many tags"));
+                }
+                for handle in use_tags.try_iter()? {
+                    let handle = handle?;
+                    let prefix = use_tags.get_item(&handle)?;
+                    tags.push(TagDirective {
+                        handle: tag_part(&handle, "handle")?,
+                        prefix: tag_part(&prefix, "prefix")?,
+                    });
+                }
+            }
+        }
+        Ok((version, tags))
+    }
+
     fn serialize(&mut self, py: Python, node: NodeId) -> PyResult<()> {
         // PyYAML represents the data first, then its serializer checks it is
         // open.
@@ -740,9 +778,10 @@ impl RSafeDumper {
             }
             _ => {}
         }
+        let (version, tags) = self.directives(py)?;
         self.emit(
             py,
-            Event::document_start(self.version, &self.tags, self.document_start_implicit),
+            Event::document_start(version, &tags, self.document_start_implicit),
         )?;
 
         self.anchor_node(py, node)?;
@@ -874,6 +913,49 @@ impl RSafeDumper {
 static DATE_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static DATETIME_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 
+/// A tag handle or prefix: CEmitter takes exactly a str (encoded as UTF-8)
+/// or bytes.
+fn tag_part(value: &Bound<'_, PyAny>, what: &str) -> PyResult<String> {
+    if value.is_exact_instance_of::<PyString>() {
+        return value.extract();
+    }
+    if value.is_exact_instance_of::<PyBytes>() {
+        return Ok(std::str::from_utf8(value.cast::<PyBytes>()?.as_bytes())?.to_owned());
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "tag {what} must be a string"
+    )))
+}
+
+/// An option CEmitter passes to libyaml as a C int: like `int(value)` for
+/// numbers (floats and decimals truncate), but str and bytes are refused.
+struct CInt(i32);
+
+impl<'py> FromPyObject<'py> for CInt {
+    fn extract_bound(value: &Bound<'py, PyAny>) -> PyResult<Self> {
+        let ty = value.get_type();
+        if !ty.hasattr("__index__")? && !ty.hasattr("__int__")? {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "an integer is required",
+            ));
+        }
+        let int = value.py().get_type::<PyInt>().call1((value,))?;
+        Ok(CInt(int.extract()?))
+    }
+}
+
+/// A PyYAML option used for its truthiness (`if canonical:`).
+struct Truthy(bool);
+
+impl<'py> FromPyObject<'py> for Truthy {
+    fn extract_bound(value: &Bound<'py, PyAny>) -> PyResult<Self> {
+        Ok(Truthy(value.is_truthy()?))
+    }
+}
+
+/// A `default_style` PyYAML keeps on scalar nodes but CEmitter writes plain.
+const OTHER_STYLE: char = '\0';
+
 /// Whether SafeRepresenter has a representer for exactly this type.
 fn is_represented_type(py: Python, ty: &Bound<'_, PyType>) -> PyResult<bool> {
     Ok(ty.is(py.None().bind(py).get_type())
@@ -931,7 +1013,7 @@ pub fn dumps_to_string(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<String> {
         closed: 0,
         document_start_implicit: true,
         version: None,
-        tags: Vec::new(),
+        tags: None,
         document_end_implicit: true,
         serialized_nodes: HashSet::new(),
         anchors: HashMap::new(),
