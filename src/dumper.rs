@@ -17,7 +17,7 @@ use pyo3::types::{
 };
 
 use crate::exception;
-use crate::resolver;
+use crate::resolver::{self, Tag};
 
 /// A represented node (PyYAML's `yaml.nodes`), kept in `RSafeDumper::nodes`.
 /// Children are indices into it, so a collection can be registered before its
@@ -26,17 +26,17 @@ use crate::resolver;
 #[derive(Debug)]
 enum RepNode {
     Scalar {
-        tag: &'static str,
+        tag: Tag,
         value: ScalarText,
         style: Option<char>,
     },
     Sequence {
-        tag: &'static str,
+        tag: Tag,
         value: Vec<NodeId>,
         flow_style: Option<bool>,
     },
     Mapping {
-        tag: &'static str,
+        tag: Tag,
         value: Vec<(NodeId, NodeId)>,
         flow_style: Option<bool>,
     },
@@ -515,13 +515,13 @@ impl RSafeDumper {
     }
 
     fn represent_none(&mut self) -> NodeId {
-        self.make_scalar(crate::TAG_NULL, "null", None)
+        self.make_scalar(Tag::Null, "null", None)
     }
 
     fn represent_bool(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let b: bool = data.extract()?;
         let value = if b { "true" } else { "false" };
-        Ok(self.make_scalar(crate::TAG_BOOL, value, None))
+        Ok(self.make_scalar(Tag::Bool, value, None))
     }
 
     fn represent_int(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
@@ -530,17 +530,17 @@ impl RSafeDumper {
             Ok(value) => value.to_string(),
             Err(_) => data.str()?.to_string(),
         };
-        Ok(self.make_scalar(crate::TAG_INT, value, None))
+        Ok(self.make_scalar(Tag::Int, value, None))
     }
 
     fn represent_float(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let value = yaml_float(data.extract::<f64>()?);
-        Ok(self.make_scalar(crate::TAG_FLOAT, value, None))
+        Ok(self.make_scalar(Tag::Float, value, None))
     }
 
     fn represent_str(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let value = ScalarText::Str(data.cast::<PyString>()?.clone().unbind());
-        Ok(self.push_scalar(crate::TAG_STR, value, None))
+        Ok(self.push_scalar(Tag::Str, value, None))
     }
 
     fn represent_binary(&mut self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
@@ -555,17 +555,17 @@ impl RSafeDumper {
             result.push('\n');
         }
 
-        Ok(self.make_scalar(crate::TAG_BINARY, result, Some('|')))
+        Ok(self.make_scalar(Tag::Binary, result, Some('|')))
     }
 
     fn represent_date(&mut self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let value: String = data.call_method0("isoformat")?.extract()?;
-        Ok(self.make_scalar(crate::TAG_TIMESTAMP, value, None))
+        Ok(self.make_scalar(Tag::Timestamp, value, None))
     }
 
     fn represent_datetime(&mut self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let value: String = data.call_method1("isoformat", (" ",))?.extract()?;
-        Ok(self.make_scalar(crate::TAG_TIMESTAMP, value, None))
+        Ok(self.make_scalar(Tag::Timestamp, value, None))
     }
 
     fn represent_list(
@@ -577,7 +577,7 @@ impl RSafeDumper {
         let node = self.register(
             alias_key,
             RepNode::Sequence {
-                tag: crate::TAG_SEQ,
+                tag: Tag::Seq,
                 value: Vec::new(),
                 flow_style: None,
             },
@@ -608,7 +608,7 @@ impl RSafeDumper {
         data: &Bound<'_, PyAny>,
         alias_key: Option<usize>,
     ) -> PyResult<NodeId> {
-        self.represent_mapping(py, crate::TAG_MAP, data.cast::<PyDict>()?, alias_key)
+        self.represent_mapping(py, Tag::Map, data.cast::<PyDict>()?, alias_key)
     }
 
     /// PyYAML's `represent_set`: a mapping of the members to None.
@@ -622,14 +622,14 @@ impl RSafeDumper {
         for item in data.try_iter()? {
             value.set_item(item?, py.None())?;
         }
-        self.represent_mapping(py, crate::TAG_SET, &value, alias_key)
+        self.represent_mapping(py, Tag::Set, &value, alias_key)
     }
 
     /// PyYAML's `represent_mapping`, for dicts and sets.
     fn represent_mapping(
         &mut self,
         py: Python,
-        tag: &'static str,
+        tag: Tag,
         mapping: &Bound<'_, PyDict>,
         alias_key: Option<usize>,
     ) -> PyResult<NodeId> {
@@ -749,14 +749,14 @@ impl RSafeDumper {
 
     fn make_scalar(
         &mut self,
-        tag: &'static str,
+        tag: Tag,
         value: impl Into<ScalarText>,
         style: Option<char>,
     ) -> NodeId {
         self.push_scalar(tag, value.into(), style)
     }
 
-    fn push_scalar(&mut self, tag: &'static str, value: ScalarText, style: Option<char>) -> NodeId {
+    fn push_scalar(&mut self, tag: Tag, value: ScalarText, style: Option<char>) -> NodeId {
         let style = style.or(self.default_style);
         self.nodes.push(RepNode::Scalar { tag, value, style });
         self.nodes.len() - 1
@@ -917,13 +917,14 @@ impl RSafeDumper {
         match &self.nodes[node] {
             RepNode::Scalar { tag, value, style } => {
                 let value = value.text(py)?;
-                let plain_implicit = *tag == resolver::resolve_scalar_tag(value, true);
+                let plain_implicit = *tag == resolver::resolve_scalar(value, true);
                 // A non-plain scalar always resolves to str.
-                let quoted_implicit = *tag == crate::TAG_STR;
+                let quoted_implicit = *tag == Tag::Str;
                 let scalar_style = char_to_scalar_style(*style);
                 // The emitter only looks at the tag when it is canonical or
                 // neither implicit flag is set, so skip building it otherwise.
-                let tag = (self.canonical || !plain_implicit && !quoted_implicit).then_some(*tag);
+                let tag =
+                    (self.canonical || !plain_implicit && !quoted_implicit).then(|| tag.as_str());
 
                 let event = Event::scalar(
                     anchor_ref,
@@ -938,7 +939,7 @@ impl RSafeDumper {
             RepNode::Sequence {
                 tag, flow_style, ..
             } => {
-                let implicit = *tag == resolver::DEFAULT_SEQUENCE_TAG;
+                let implicit = *tag == Tag::Seq;
                 // CEmitter: flow if node.flow_style is true, else block.
                 let style = if *flow_style == Some(true) {
                     SequenceStyle::Flow
@@ -946,7 +947,7 @@ impl RSafeDumper {
                     SequenceStyle::Block
                 };
                 // As for scalars, the tag only matters when it is written.
-                let tag = (self.canonical || !implicit).then_some(*tag);
+                let tag = (self.canonical || !implicit).then(|| tag.as_str());
                 let event = Event::sequence_start(anchor_ref, tag, implicit, style);
                 self.emit(py, event)?;
                 for index in 0.. {
@@ -963,13 +964,13 @@ impl RSafeDumper {
             RepNode::Mapping {
                 tag, flow_style, ..
             } => {
-                let implicit = *tag == resolver::DEFAULT_MAPPING_TAG;
+                let implicit = *tag == Tag::Map;
                 let style = if *flow_style == Some(true) {
                     MappingStyle::Flow
                 } else {
                     MappingStyle::Block
                 };
-                let tag = (self.canonical || !implicit).then_some(*tag);
+                let tag = (self.canonical || !implicit).then(|| tag.as_str());
                 let event = Event::mapping_start(anchor_ref, tag, implicit, style);
                 self.emit(py, event)?;
                 for index in 0.. {

@@ -1,9 +1,6 @@
 //! Shared resolver for YAML 1.1 implicit tag resolution.
 //! Used by both the loader and dumper.
 
-pub const DEFAULT_SEQUENCE_TAG: &str = crate::TAG_SEQ;
-pub const DEFAULT_MAPPING_TAG: &str = crate::TAG_MAP;
-
 /// A resolved tag. The standard tags are variants, so the loader matches on
 /// them without comparing strings.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,24 +52,24 @@ impl Tag {
 
     pub fn as_str(&self) -> &str {
         match self {
+            Tag::Null => crate::TAG_NULL,
+            Tag::Bool => crate::TAG_BOOL,
+            Tag::Int => crate::TAG_INT,
+            Tag::Float => crate::TAG_FLOAT,
+            Tag::Str => crate::TAG_STR,
+            Tag::Binary => crate::TAG_BINARY,
+            Tag::Timestamp => crate::TAG_TIMESTAMP,
+            Tag::Seq => crate::TAG_SEQ,
+            Tag::Map => crate::TAG_MAP,
+            Tag::Set => crate::TAG_SET,
+            Tag::Omap => crate::TAG_OMAP,
+            Tag::Pairs => crate::TAG_PAIRS,
+            Tag::Merge => crate::TAG_MERGE,
+            Tag::Value => crate::TAG_VALUE,
+            Tag::Yaml => crate::TAG_YAML,
             Tag::Other(tag) => tag,
-            standard => standard.standard_name().expect("standard tag"),
         }
     }
-
-    fn standard_name(&self) -> Option<&'static str> {
-        Self::STANDARD
-            .iter()
-            .find(|(_, standard)| standard == self)
-            .map(|(name, _)| *name)
-    }
-}
-
-/// Resolve the implicit tag for a scalar value, as a string.
-pub fn resolve_scalar_tag(value: &str, plain_implicit: bool) -> &'static str {
-    resolve_scalar(value, plain_implicit)
-        .standard_name()
-        .expect("implicit tags are standard")
 }
 
 /// Resolve the implicit tag for a scalar value.
