@@ -1,5 +1,6 @@
 mod dumper;
 mod exception;
+mod input;
 mod loader;
 mod mark;
 mod nodes;
@@ -28,6 +29,7 @@ mod _ryaml {
     use pyo3::types::PyList;
 
     use crate::dumper::register_dumper;
+    use crate::input::Source;
     use crate::loader::register_loader;
     use crate::mark::register_mark;
     use crate::nodes::register_nodes;
@@ -54,16 +56,17 @@ mod _ryaml {
     use crate::nodes::PyMappingNode;
 
     #[pyfunction]
-    fn loads(py: Python, str: String) -> PyResult<Option<Py<PyAny>>> {
-        RSafeLoader::new(str).get_single_data(py)
+    fn loads(py: Python, str: Source) -> PyResult<Option<Py<PyAny>>> {
+        RSafeLoader::from_text(str.into_text(py)?).get_single_data(py)
     }
 
     #[pyfunction]
-    fn loads_all(py: Python, str: String) -> PyResult<Option<Py<PyAny>>> {
+    fn loads_all(py: Python, str: Source) -> PyResult<Option<Py<PyAny>>> {
+        let str = str.into_text(py)?;
         if str.is_empty() {
             Ok(Some(Python::None(py)))
         } else {
-            let mut loader = RSafeLoader::new(str);
+            let mut loader = RSafeLoader::from_text(str);
             let mut docs = Vec::new();
             while loader.check_data(py)? {
                 docs.push(loader.get_data(py)?)

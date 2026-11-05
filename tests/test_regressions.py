@@ -1,6 +1,8 @@
 """PyYAML compatibility regressions, including the original 15 examples."""
 
+import codecs
 import datetime as dt
+import io
 
 import pytest
 import yaml
@@ -601,3 +603,48 @@ def test_reader_error_from_rust_has_message():
     with pytest.raises(yaml.reader.ReaderError) as info:
         ryaml.loads("a: \x07")
     assert "control characters are not allowed" in str(info.value)
+
+
+BYTE_STREAMS = {
+    "utf8-bom": codecs.BOM_UTF8 + "a: é".encode(),
+    "utf16le-bom": codecs.BOM_UTF16_LE + "a: é".encode("utf-16-le"),
+    "utf16be-bom": codecs.BOM_UTF16_BE + "a: é".encode("utf-16-be"),
+    "utf16le-astral": codecs.BOM_UTF16_LE + "a: 😀".encode("utf-16-le"),
+    "utf16le-two-docs": codecs.BOM_UTF16_LE + "a\n---\nb".encode("utf-16-le"),
+    "utf16le-no-bom": "a: 1".encode("utf-16-le"),
+    "utf32-bom": codecs.BOM_UTF32_LE + "a: 1".encode("utf-32-le"),
+    "invalid-start": b"a: \xff",
+    "truncated": b"a: \xc3",
+    "surrogate": b"a: \xed\xa0\x80",
+    "latin1": "a: é".encode("latin-1"),
+    "utf16-odd-length": codecs.BOM_UTF16_LE + b"a\x00:",
+    "utf16-lone-surrogate": codecs.BOM_UTF16_LE + b"\x00\xd8",
+    "bom-mid-document": b"a: 1\n" + codecs.BOM_UTF8 + b"b: 2",
+    "values": b"[1, 2.5, yes]",
+}
+
+
+@pytest.mark.skipif(not hasattr(yaml, "CSafeLoader"),
+                    reason="PyYAML was built without LibYAML")
+@pytest.mark.parametrize("data", BYTE_STREAMS.values(), ids=BYTE_STREAMS.keys())
+def test_byte_streams(data):
+    # YAML 1.1 5.2: a UTF-16 BOM selects UTF-16, otherwise UTF-8 (no UTF-32,
+    # no BOM-less detection). Invalid bytes raise ReaderError, not
+    # UnicodeDecodeError (which is not a yaml.YAMLError).
+    def outcome(load):
+        try:
+            return repr(load(data))
+        except Exception as e:  # noqa: BLE001
+            return type(e).__name__
+    expected = outcome(lambda d: list(yaml.load_all(d, Loader=yaml.CSafeLoader)))
+    assert outcome(lambda d: list(yaml.load_all(d, Loader=ryaml.RSafeLoader))) == expected
+    assert outcome(lambda d: ryaml.load_all(io.BytesIO(d))) == expected
+    assert outcome(ryaml.loads_all) == expected
+
+
+def test_rsafeloader_uses_native_methods():
+    # If these are not the extension's own methods, RSafeLoader silently falls
+    # back to PyYAML's pure-Python BaseLoader (every scalar a string).
+    for name in ("check_data", "get_data", "get_single_data"):
+        method = getattr(ryaml.RSafeLoader, name)
+        assert type(method).__name__ == "method_descriptor", (name, method)

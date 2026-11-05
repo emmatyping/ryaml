@@ -23,8 +23,6 @@ class RSafeLoader(_RSafeLoader, BaseLoader):
             data = stream.read() # type: ignore
         except AttributeError:
             data = stream
-        if isinstance(data, bytes):
-            data = data.decode('utf8')
         return super().__new__(cls, data) # type: ignore
 
 class RSafeDumper(_RSafeDumper):

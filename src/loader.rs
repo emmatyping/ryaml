@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
 use crate::exception;
+use crate::input::Source;
 use crate::resolver;
 
 /// Only mappings with merges need a second construction step. Ordinary mappings
@@ -70,25 +71,8 @@ pub struct RSafeLoader {
 #[pymethods]
 impl RSafeLoader {
     #[new]
-    pub fn new(source: String) -> Self {
-        let mut parser = Parser::new();
-        parser.set_input(Cursor::new(source));
-        Self {
-            parser,
-            parsed_event: None,
-            anchors: HashMap::with_hasher(FxBuildHasher),
-            merge_anchors: HashSet::with_hasher(FxBuildHasher),
-            value_alias_errors: HashMap::with_hasher(FxBuildHasher),
-            merge_source_lists: HashMap::with_hasher(FxBuildHasher),
-            scalar_anchor_values: HashMap::with_hasher(FxBuildHasher),
-            deferred_scalars: HashMap::with_hasher(FxBuildHasher),
-            skipped_anchors: HashSet::with_hasher(FxBuildHasher),
-            scalar_mappings_in_progress: Vec::new(),
-            pending_mappings: Vec::new(),
-            set_mappings: HashMap::with_hasher(FxBuildHasher),
-            pairs_mappings: HashMap::with_hasher(FxBuildHasher),
-            anchored_mapping_lengths: HashMap::with_hasher(FxBuildHasher),
-        }
+    pub fn new(py: Python, source: Source) -> PyResult<Self> {
+        Ok(Self::from_text(source.into_text(py)?))
     }
 
     pub fn peek_token(&self) -> PyResult<()> {
@@ -1759,6 +1743,29 @@ fn parse_sexagesimal_int(s: &str) -> Result<i64, ()> {
             .ok_or(())?;
     }
     Ok(result)
+}
+
+impl RSafeLoader {
+    pub fn from_text(source: String) -> Self {
+        let mut parser = Parser::new();
+        parser.set_input(Cursor::new(source));
+        Self {
+            parser,
+            parsed_event: None,
+            anchors: HashMap::with_hasher(FxBuildHasher),
+            merge_anchors: HashSet::with_hasher(FxBuildHasher),
+            value_alias_errors: HashMap::with_hasher(FxBuildHasher),
+            merge_source_lists: HashMap::with_hasher(FxBuildHasher),
+            scalar_anchor_values: HashMap::with_hasher(FxBuildHasher),
+            deferred_scalars: HashMap::with_hasher(FxBuildHasher),
+            skipped_anchors: HashSet::with_hasher(FxBuildHasher),
+            scalar_mappings_in_progress: Vec::new(),
+            pending_mappings: Vec::new(),
+            set_mappings: HashMap::with_hasher(FxBuildHasher),
+            pairs_mappings: HashMap::with_hasher(FxBuildHasher),
+            anchored_mapping_lengths: HashMap::with_hasher(FxBuildHasher),
+        }
+    }
 }
 
 pub fn register_loader(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
