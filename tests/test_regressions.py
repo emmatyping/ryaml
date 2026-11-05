@@ -465,3 +465,20 @@ def test_scalar_tag_on_mapping_own_anchor_errors(load, reference, source, error)
 ])
 def test_scalar_tag_on_mapping_own_anchor(load, reference, source):
     assert_same(load(source), reference(source))
+
+
+@pytest.mark.parametrize(("source", "error"), [
+    ("[1", yaml.parser.ParserError),
+    ("- a\nb: c", yaml.parser.ParserError),
+    ("&a &b x", yaml.parser.ParserError),
+    ("%YAML 2.0\n--- x", yaml.parser.ParserError),
+    ("key: 'x", yaml.scanner.ScannerError),
+    ("a: b: c", yaml.scanner.ScannerError),
+    ("a: \x07", yaml.reader.ReaderError),
+])
+def test_parse_error_classes(load, reference, source, error):
+    # libyaml-safer's error kind maps to PyYAML's class for that stage.
+    for loader in (reference, load):
+        with pytest.raises(error) as info:
+            loader(source)
+        assert type(info.value).__name__ == error.__name__

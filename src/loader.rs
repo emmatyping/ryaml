@@ -2,7 +2,7 @@
 //! Implements RLoader, which can load YAML 1.1
 
 use base64::Engine as _;
-use libyaml_safer::{Event, EventData, Parser};
+use libyaml_safer::{ErrorKind, Event, EventData, Parser};
 use pyo3::exceptions::{PyIndexError, PyNotImplementedError, PyRecursionError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
@@ -194,7 +194,7 @@ impl RSafeLoader {
                 Ok(event) => {
                     self.parsed_event = Some(event);
                 }
-                Err(e) => return Err(exception::scanner_error(py, format!("{}", e))),
+                Err(e) => return Err(parse_error(py, &e)),
             }
         }
         Ok(())
@@ -1286,6 +1286,18 @@ fn construct_python_scalar(
         Ok(py.import("ryaml._scalars")?.getattr(name)?.unbind())
     })?;
     Ok(constructor.bind(py).call1((value,))?.unbind())
+}
+
+/// The PyYAML exception class for a libyaml-safer error, by the stage that
+/// raised it (PyYAML raises `ParserError` for structural errors, for example).
+fn parse_error(py: Python, error: &libyaml_safer::Error) -> PyErr {
+    let class = match error.kind() {
+        ErrorKind::Reader => "ReaderError",
+        ErrorKind::Parser => "ParserError",
+        ErrorKind::Composer => "ComposerError",
+        ErrorKind::Scanner | ErrorKind::Emitter | ErrorKind::Io => "ScannerError",
+    };
+    exception::yaml_error(py, class, format!("{}", error))
 }
 
 /// Tags whose constructors take a scalar node.

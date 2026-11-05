@@ -17,10 +17,6 @@ pub fn yaml_error(py: Python, class_name: &str, message: String) -> PyErr {
     InvalidYamlError::new_err(message)
 }
 
-pub fn scanner_error(py: Python, message: String) -> PyErr {
-    yaml_error(py, "ScannerError", message)
-}
-
 pub fn composer_error(py: Python, message: String) -> PyErr {
     yaml_error(py, "ComposerError", message)
 }
