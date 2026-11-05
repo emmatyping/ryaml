@@ -57,6 +57,9 @@ pub struct RSafeLoader {
     pending_mappings: Vec<PendingMapping>,
     // Sets are represented by mapping nodes in YAML and can be merge sources.
     set_mappings: HashMap<usize, (Py<PySet>, Py<PyDict>), FxBuildHasher>,
+    /// Anchored !!omap / !!pairs lists (by object) and the single-entry
+    /// mappings PyYAML would merge if an alias to them is a merge source.
+    pairs_mappings: HashMap<usize, Py<PyList>, FxBuildHasher>,
     anchored_mapping_lengths: HashMap<usize, usize, FxBuildHasher>,
 }
 
@@ -78,6 +81,7 @@ impl RSafeLoader {
             skipped_anchors: HashSet::with_hasher(FxBuildHasher),
             pending_mappings: Vec::new(),
             set_mappings: HashMap::with_hasher(FxBuildHasher),
+            pairs_mappings: HashMap::with_hasher(FxBuildHasher),
             anchored_mapping_lengths: HashMap::with_hasher(FxBuildHasher),
         }
     }
@@ -249,6 +253,7 @@ impl RSafeLoader {
         self.deferred_scalars.clear();
         self.skipped_anchors.clear();
         self.set_mappings.clear();
+        self.pairs_mappings.clear();
         self.anchored_mapping_lengths.clear();
 
         Ok(Some(result))
@@ -375,6 +380,7 @@ impl RSafeLoader {
         let list_obj: Py<PyAny> = list.clone().unbind().into_any();
 
         // Store in anchors BEFORE recursing (handles circular references)
+        let anchored_pairs = pairs && anchor.is_some();
         if let Some(anchor_name) = anchor {
             self.register_anchor(py, anchor_name, list_obj.clone_ref(py))?;
         }
@@ -400,6 +406,28 @@ impl RSafeLoader {
         }
 
         self.parsed_event = None;
+        if anchored_pairs {
+            // PyYAML merges the node, a sequence of single-entry mappings, so an
+            // alias used as a merge source gets those mappings, not the tuples.
+            let mappings = PyList::empty(py);
+            let all_hashable = list.iter().all(|entry| {
+                let mapping = PyDict::new(py);
+                entry
+                    .cast::<PyTuple>()
+                    .ok()
+                    .and_then(|t| {
+                        mapping
+                            .set_item(t.get_item(0).ok()?, t.get_item(1).ok()?)
+                            .ok()
+                    })
+                    .and_then(|()| mappings.append(mapping).ok())
+                    .is_some()
+            });
+            if all_hashable {
+                self.pairs_mappings
+                    .insert(list.as_ptr() as usize, mappings.unbind());
+            }
+        }
         Ok(list_obj)
     }
 
@@ -944,14 +972,31 @@ impl RSafeLoader {
             .enumerate()
             .map(|(i, mapping)| (mapping.dict.as_ptr() as usize, i))
             .collect();
+        let ctx = MergeContext {
+            pending: &pending,
+            indices: &indices,
+            set_mappings: &self.set_mappings,
+            pairs_mappings: &self.pairs_mappings,
+        };
         let mut visited = vec![false; pending.len()];
         // Parents are appended after their children. Flatten parents first, as
         // PyYAML does, and break recursive merge edges at the explicit entries.
         for i in (0..pending.len()).rev() {
-            finish_mapping(py, i, &pending, &indices, &self.set_mappings, &mut visited)?;
+            finish_mapping(py, i, &ctx, &mut visited)?;
         }
         Ok(())
     }
+}
+
+/// Read-only lookups for flattening merges at the end of a document.
+struct MergeContext<'a> {
+    pending: &'a [PendingMapping],
+    /// Pending mapping index by dict object.
+    indices: &'a HashMap<usize, usize, FxBuildHasher>,
+    /// !!set objects and the dicts they were built from.
+    set_mappings: &'a HashMap<usize, (Py<PySet>, Py<PyDict>), FxBuildHasher>,
+    /// !!omap / !!pairs lists and their single-entry mappings.
+    pairs_mappings: &'a HashMap<usize, Py<PyList>, FxBuildHasher>,
 }
 
 /// Rebuild only mappings which contain merges, preserving insertion order and
@@ -959,36 +1004,29 @@ impl RSafeLoader {
 fn finish_mapping(
     py: Python,
     index: usize,
-    pending: &[PendingMapping],
-    indices: &HashMap<usize, usize, FxBuildHasher>,
-    set_mappings: &HashMap<usize, (Py<PySet>, Py<PyDict>), FxBuildHasher>,
+    ctx: &MergeContext,
     visited: &mut [bool],
 ) -> PyResult<()> {
     if visited[index] {
         return Ok(());
     }
     visited[index] = true;
-    let mapping = &pending[index];
+    let mapping = &ctx.pending[index];
     let mut merged: Option<Bound<'_, PyDict>> = None;
     for source in &mapping.sources {
         let source = source.bind(py);
-        let Ok(list) = source.cast::<PyList>() else {
-            merge_source(
-                py,
-                source,
-                &mut merged,
-                pending,
-                indices,
-                set_mappings,
-                visited,
-            )?;
+        let Ok(mut list) = source.cast::<PyList>().cloned() else {
+            merge_source(py, source, &mut merged, ctx, visited)?;
             continue;
         };
+        if let Some(mappings) = ctx.pairs_mappings.get(&(list.as_ptr() as usize)) {
+            list = mappings.bind(py).clone();
+        }
         // A merge sequence is flattened in reverse so its first mapping wins,
         // while later << entries still win overall.
         let items: Vec<_> = list.iter().collect();
         for item in items.into_iter().rev() {
-            let item = match set_mappings.get(&(item.as_ptr() as usize)) {
+            let item = match ctx.set_mappings.get(&(item.as_ptr() as usize)) {
                 Some((_, mapping)) => mapping.bind(py).clone().into_any(),
                 None => item,
             };
@@ -998,30 +1036,16 @@ fn finish_mapping(
                     "expected a mapping for merging, but found non-mapping".to_string(),
                 ));
             }
-            merge_source(
-                py,
-                &item,
-                &mut merged,
-                pending,
-                indices,
-                set_mappings,
-                visited,
-            )?;
+            merge_source(py, &item, &mut merged, ctx, visited)?;
         }
     }
-    let Some(merged) = merged else {
-        // Only empty merge sequences: nothing to merge.
-        if let Some(set) = &mapping.set {
-            for key in mapping.dict.bind(py).keys().iter() {
-                set.bind(py).add(key)?;
-            }
-        }
-        return Ok(());
-    };
     let dict = mapping.dict.bind(py);
-    merged.update(dict.as_mapping())?;
-    dict.clear();
-    dict.update(merged.as_mapping())?;
+    if let Some(merged) = merged {
+        merged.update(dict.as_mapping())?;
+        dict.clear();
+        dict.update(merged.as_mapping())?;
+    }
+    // Only empty merge sequences leave `merged` unset: nothing to merge.
     if let Some(set) = &mapping.set {
         for key in dict.keys().iter() {
             set.bind(py).add(key)?;
@@ -1034,13 +1058,11 @@ fn merge_source<'py>(
     py: Python<'py>,
     source: &Bound<'py, PyAny>,
     merged: &mut Option<Bound<'py, PyDict>>,
-    pending: &[PendingMapping],
-    indices: &HashMap<usize, usize, FxBuildHasher>,
-    set_mappings: &HashMap<usize, (Py<PySet>, Py<PyDict>), FxBuildHasher>,
+    ctx: &MergeContext,
     visited: &mut [bool],
 ) -> PyResult<()> {
-    if let Some(&source_index) = indices.get(&(source.as_ptr() as usize)) {
-        finish_mapping(py, source_index, pending, indices, set_mappings, visited)?;
+    if let Some(&source_index) = ctx.indices.get(&(source.as_ptr() as usize)) {
+        finish_mapping(py, source_index, ctx, visited)?;
     }
     let source = source.cast::<PyDict>()?;
     match merged {

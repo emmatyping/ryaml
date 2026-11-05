@@ -424,3 +424,17 @@ def test_recursive_merge_sequence_non_mapping(load, reference, source):
         reference(source)
     with pytest.raises(yaml.constructor.ConstructorError):
         load(source)
+
+
+@pytest.mark.parametrize("source", [
+    pytest.param("- &o !!omap [{x: 1}]\n- {<<: *o}\n", id="omap"),
+    pytest.param("- &o !!pairs [{x: 1}, {x: 2}, {y: 3}]\n- {<<: *o, z: 0}\n",
+                 id="pairs-first-wins"),
+    pytest.param("- &o !!omap [{x: 1}, {y: 2}]\n- *o\n- {<<: *o}\n",
+                 id="also-used-as-value"),
+    pytest.param("&o !!omap [{x: {<<: *o}}]", id="recursive"),
+    pytest.param("- &o !!omap []\n- {<<: *o, a: 1}\n", id="empty"),
+])
+def test_omap_and_pairs_as_merge_source(load, reference, source):
+    # PyYAML merges the node (single-entry mappings), not the tuple list.
+    assert repr(load(source)) == repr(reference(source))
