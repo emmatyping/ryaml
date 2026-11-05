@@ -342,3 +342,39 @@ def test_explicit_float_matches_pyyaml(load, reference, value):
     expected, actual = reference(source), load(source)
     assert type(actual) is float
     assert actual == expected or (actual != actual and expected != expected)
+
+
+@pytest.mark.parametrize("source", [
+    pytest.param("!!str\n�: &node1\n=: &node1", id="fuzz"),
+    pytest.param("!!str {a: &k 1, b: &k 2, =: x}", id="two-skipped-entries"),
+    pytest.param("- !!str {a: [&k 1], =: x}\n- &k 2\n", id="nested-in-skipped"),
+    pytest.param("- !!str {a: &k [1], =: x}\n- &k 2\n", id="skipped-collection"),
+])
+def test_scalar_tag_on_mapping_duplicate_anchor(load, reference, source):
+    # PyYAML composes every entry (so anchors count) but constructs only `=`.
+    with pytest.raises(yaml.composer.ComposerError):
+        reference(source)
+    with pytest.raises(yaml.composer.ComposerError):
+        load(source)
+
+
+@pytest.mark.parametrize("source", [
+    pytest.param("- !!str {a: &k !!int 7, =: y}\n- [*k, *k]\n", id="deferred-scalar"),
+    pytest.param("- !!str {a: {b: &k 1}, =: x}\n- *k\n", id="nested-deferred-scalar"),
+    pytest.param("- !!str {=: &k 05}\n- *k\n", id="value-anchor"),
+    pytest.param("- !!str {a: &k ~, =: x}\n- *k\n", id="deferred-null"),
+])
+def test_scalar_tag_on_mapping_alias_to_skipped_scalar(load, reference, source):
+    assert_same(load(source), reference(source))
+
+
+@pytest.mark.parametrize(("source", "error"), [
+    ("- !!str {a: &k !!int x, =: y}\n- *k\n", ValueError),
+    ("- !!str {a: &k !o 1, =: 2}\n- *k\n", yaml.constructor.ConstructorError),
+])
+def test_scalar_tag_on_mapping_alias_constructs_lazily(load, reference, source, error):
+    # The skipped scalar is constructed (and fails) only when an alias uses it.
+    with pytest.raises(error):
+        reference(source)
+    with pytest.raises(error):
+        load(source)

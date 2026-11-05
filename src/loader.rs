@@ -47,6 +47,13 @@ pub struct RSafeLoader {
     /// Raw text of anchored scalars, for an alias used as the `=` value of a
     /// mapping that is constructed as a scalar (see `mapping_value_scalar`).
     scalar_anchor_values: HashMap<String, String, FxBuildHasher>,
+    /// Anchored scalars inside skipped entries (see `skip_node`): PyYAML composes
+    /// them but constructs them only when an alias uses them, so keep the tag,
+    /// raw text and implicit flag until then.
+    deferred_scalars: HashMap<String, (Option<String>, String, bool), FxBuildHasher>,
+    /// Anchored collections inside skipped entries. They count for duplicate
+    /// anchors, but cannot be constructed afterwards.
+    skipped_anchors: HashSet<String, FxBuildHasher>,
     pending_mappings: Vec<PendingMapping>,
     // Sets are represented by mapping nodes in YAML and can be merge sources.
     set_mappings: HashMap<usize, (Py<PySet>, Py<PyDict>), FxBuildHasher>,
@@ -67,6 +74,8 @@ impl RSafeLoader {
             merge_source_tags: HashMap::with_hasher(FxBuildHasher),
             merge_source_lists: HashMap::with_hasher(FxBuildHasher),
             scalar_anchor_values: HashMap::with_hasher(FxBuildHasher),
+            deferred_scalars: HashMap::with_hasher(FxBuildHasher),
+            skipped_anchors: HashSet::with_hasher(FxBuildHasher),
             pending_mappings: Vec::new(),
             set_mappings: HashMap::with_hasher(FxBuildHasher),
             anchored_mapping_lengths: HashMap::with_hasher(FxBuildHasher),
@@ -197,7 +206,11 @@ impl RSafeLoader {
     }
 
     fn check_new_anchor(&self, py: Python, name: &str) -> PyResult<()> {
-        if self.anchors.contains_key(name) || self.merge_anchors.contains(name) {
+        if self.anchors.contains_key(name)
+            || self.merge_anchors.contains(name)
+            || self.deferred_scalars.contains_key(name)
+            || self.skipped_anchors.contains(name)
+        {
             return Err(exception::composer_error(
                 py,
                 format!("found duplicate anchor '{}'", name),
@@ -229,6 +242,8 @@ impl RSafeLoader {
         self.merge_source_tags.clear();
         self.merge_source_lists.clear();
         self.scalar_anchor_values.clear();
+        self.deferred_scalars.clear();
+        self.skipped_anchors.clear();
         self.set_mappings.clear();
         self.anchored_mapping_lengths.clear();
 
@@ -247,6 +262,12 @@ impl RSafeLoader {
                     ))
                 } else if let Some(obj) = self.anchors.get(&anchor) {
                     Ok(obj.clone_ref(py))
+                } else if let Some((tag, value, implicit)) = self.deferred_scalars.remove(&anchor) {
+                    // First use of a composed-but-unconstructed scalar: construct
+                    // it now (with its own errors, as PyYAML) and cache it.
+                    let obj = self.construct_scalar_direct(py, None, tag, value, implicit)?;
+                    self.anchors.insert(anchor, obj.clone_ref(py));
+                    Ok(obj)
                 } else if self.merge_anchors.contains(&anchor) {
                     Err(merge_node_error(py))
                 } else {
@@ -619,15 +640,8 @@ impl RSafeLoader {
                 plain_implicit,
                 ..
             } => {
-                if anchor.is_some() {
-                    // PyYAML composes the node, so later aliases to it work.
-                    let _ = self.construct_scalar_direct(
-                        py,
-                        anchor,
-                        tag,
-                        value.clone(),
-                        plain_implicit,
-                    );
+                if let Some(anchor) = anchor {
+                    self.defer_scalar(py, anchor, tag, value.clone(), plain_implicit)?;
                 }
                 Ok(value)
             }
@@ -648,35 +662,54 @@ impl RSafeLoader {
         }
     }
 
-    /// Consume the current node without constructing it. Anchored scalars are
-    /// still registered (when they construct cleanly) so later aliases work.
+    /// Consume the current node without constructing it. PyYAML still composes
+    /// it, so every anchor inside is checked for duplicates and recorded:
+    /// scalars are deferred until an alias uses them.
     fn skip_node(&mut self, py: Python) -> PyResult<()> {
-        let event = self.parsed_event.take().unwrap();
-        match event.data {
-            EventData::Scalar {
-                anchor: anchor @ Some(_),
-                tag,
-                value,
-                plain_implicit,
-                ..
-            } => {
-                let _ = self.construct_scalar_direct(py, anchor, tag, value, plain_implicit);
+        let mut depth = 0usize;
+        loop {
+            if depth > 0 {
+                self._parse_next_event(py)?;
             }
-            EventData::SequenceStart { .. } | EventData::MappingStart { .. } => {
-                let mut depth = 1;
-                while depth > 0 {
-                    self._parse_next_event(py)?;
-                    match self.parsed_event.take().unwrap().data {
-                        EventData::SequenceStart { .. } | EventData::MappingStart { .. } => {
-                            depth += 1
-                        }
-                        EventData::SequenceEnd | EventData::MappingEnd => depth -= 1,
-                        _ => {}
+            let event = self.parsed_event.take().unwrap();
+            match event.data {
+                EventData::Scalar {
+                    anchor: Some(anchor),
+                    tag,
+                    value,
+                    plain_implicit,
+                    ..
+                } => self.defer_scalar(py, anchor, tag, value, plain_implicit)?,
+                EventData::SequenceStart { anchor, .. }
+                | EventData::MappingStart { anchor, .. } => {
+                    if let Some(anchor) = anchor {
+                        self.check_new_anchor(py, &anchor)?;
+                        self.skipped_anchors.insert(anchor);
                     }
+                    depth += 1;
                 }
+                EventData::SequenceEnd | EventData::MappingEnd => depth -= 1,
+                _ => {}
             }
-            _ => {}
+            if depth == 0 {
+                return Ok(());
+            }
         }
+    }
+
+    fn defer_scalar(
+        &mut self,
+        py: Python,
+        anchor: String,
+        tag: Option<String>,
+        value: String,
+        plain_implicit: bool,
+    ) -> PyResult<()> {
+        self.check_new_anchor(py, &anchor)?;
+        self.scalar_anchor_values
+            .insert(anchor.clone(), value.clone());
+        self.deferred_scalars
+            .insert(anchor, (tag, value, plain_implicit));
         Ok(())
     }
 
@@ -821,7 +854,9 @@ impl RSafeLoader {
         let event = self.parsed_event.take().unwrap();
         let anchor = match event.data {
             EventData::Alias { anchor } => {
-                if self.merge_anchors.contains(&anchor) {
+                if self.merge_anchors.contains(&anchor)
+                    || self.deferred_scalars.contains_key(&anchor)
+                {
                     return Err(exception::constructor_error(
                         py,
                         "expected a mapping of length 1".to_string(),
