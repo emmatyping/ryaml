@@ -527,3 +527,28 @@ def test_construction_error_vs_stream_errors(source, single, multi):
         with pytest.raises(error) as info:
             loader(source)
         assert type(info.value).__name__ == error.__name__
+
+
+@pytest.mark.parametrize("source", [
+    pytest.param("!!pairs [!o {a: 1}, !!str {b: 2}]", id="entry-tags-ignored"),
+    pytest.param("- !!omap [&e !!set {a}]\n- *e\n", id="set-alias-is-set"),
+    pytest.param("- !!pairs [&e !!set {a: 1}]\n- {<<: *e}\n", id="set-alias-merges"),
+    pytest.param("- !!omap [&e !o {a: 1}]\n- {<<: *e}\n", id="tagged-alias-merges"),
+    pytest.param("- !!omap [&e !!map {a: 1}]\n- *e\n", id="map-alias"),
+])
+def test_tagged_pair_entries(load, reference, source):
+    assert_same(load(source), reference(source))
+
+
+@pytest.mark.parametrize("source", [
+    "- !!omap [&e !o {a: 1}]\n- *e\n",
+    "- !!pairs [&e !!omap {a: 1}]\n- *e\n",
+    "- !!pairs [&e !!str {a: 1}]\n- *e\n",
+])
+def test_tagged_pair_entry_alias_constructed_by_tag(load, reference, source):
+    # The entry's tag is ignored for the pair, but an alias used as a value is
+    # constructed by it.
+    with pytest.raises(yaml.constructor.ConstructorError):
+        reference(source)
+    with pytest.raises(yaml.constructor.ConstructorError):
+        load(source)

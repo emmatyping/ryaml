@@ -1075,7 +1075,7 @@ impl RSafeLoader {
                     "expected a single mapping item".to_string(),
                 ));
             }
-            EventData::MappingStart { anchor, .. } => anchor,
+            EventData::MappingStart { anchor, tag, .. } => (anchor, tag),
             _ => {
                 return Err(exception::constructor_error(
                     py,
@@ -1083,9 +1083,10 @@ impl RSafeLoader {
                 ));
             }
         };
-        let wrapper = if let Some(anchor) = anchor {
+        let (anchor, tag) = anchor;
+        let wrapper = if let Some(anchor) = &anchor {
             let mapping = PyDict::new(py);
-            self.register_anchor(py, anchor, mapping.clone().into_any().unbind())?;
+            self.register_anchor(py, anchor.clone(), mapping.clone().into_any().unbind())?;
             Some(mapping)
         } else {
             None
@@ -1114,9 +1115,25 @@ impl RSafeLoader {
             ));
         }
         self.parsed_event = None;
-        if let Some(mapping) = wrapper {
+        if let (Some(mapping), Some(anchor)) = (wrapper, anchor) {
             // The wrapper is a mapping node if referenced elsewhere by an alias.
             mapping.set_item(&key, &value)?;
+            // PyYAML reads the entry by node kind and ignores its tag, but an
+            // alias used as a value is constructed by that tag.
+            match tag.as_deref() {
+                None | Some("!") | Some(crate::TAG_MAP) => {}
+                Some(crate::TAG_SET) => {
+                    let set = PySet::new(py, [&key])?;
+                    self.set_mappings.insert(
+                        set.as_ptr() as usize,
+                        (set.clone().unbind(), mapping.clone().unbind()),
+                    );
+                    self.anchors.insert(anchor, set.into_any().unbind());
+                }
+                Some(t) => {
+                    self.merge_source_tags.insert(anchor, t.to_string());
+                }
+            }
         }
         Ok(PyTuple::new(py, [key, value])?.into_any().unbind())
     }
