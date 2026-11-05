@@ -278,3 +278,42 @@ def test_dumper_protocol_like_pyyaml(ops):
     # raises SerializerError if not open or already closed, and its dispose()
     # does nothing.
     assert _protocol(ryaml.RSafeDumper, ops) == _protocol(yaml.CSafeDumper, ops)
+
+
+class _RecordingStream:
+    def __init__(self):
+        self.writes = []
+
+    def write(self, data):
+        self.writes.append(data)
+
+
+@pytest.mark.skipif(not hasattr(yaml, "CSafeDumper"), reason="PyYAML was built without LibYAML")
+@pytest.mark.parametrize("docs", [
+    pytest.param([{"a": 1}, [1, 2]], id="small"),
+    pytest.param([["x" * 50] * 1000], id="many-items"),
+    pytest.param(["\xe9" * 20000], id="long-scalar"),
+    pytest.param([{"k%d" % i: "v" * 30 for i in range(2000)}, "tail"], id="large-mapping"),
+])
+@pytest.mark.parametrize("encoding", [None, "utf-16-le"])
+@pytest.mark.parametrize("style", [None, "'", '"'])
+def test_output_written_when_libyaml_flushes(docs, encoding, style):
+    # CEmitter writes each libyaml flush to the stream: at every document end
+    # and whenever the 16 KB buffer fills, before every character.
+    expected, actual = _RecordingStream(), _RecordingStream()
+    yaml.dump_all(docs, expected, Dumper=yaml.CSafeDumper, encoding=encoding, default_style=style)
+    yaml.dump_all(docs, actual, Dumper=ryaml.RSafeDumper, encoding=encoding, default_style=style)
+    assert actual.writes == expected.writes
+
+
+@pytest.mark.skipif(not hasattr(yaml, "CSafeDumper"), reason="PyYAML was built without LibYAML")
+def test_documents_written_before_close():
+    streams = []
+    for dumper in (yaml.CSafeDumper, ryaml.RSafeDumper):
+        stream = _RecordingStream()
+        instance = dumper(stream)
+        instance.open()
+        instance.represent({"a": [1]})
+        instance.represent("b")
+        streams.append(stream.writes)
+    assert streams[1] == streams[0]

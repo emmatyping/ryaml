@@ -45,6 +45,27 @@ enum RepNode {
 
 type NodeId = usize;
 
+/// The emitter's output, one chunk per flush: libyaml calls PyYAML's output
+/// handler (which writes to the stream) once per flush, so each chunk becomes
+/// one `write` call.
+#[derive(Default)]
+struct FlushedChunks {
+    chunks: Vec<Vec<u8>>,
+}
+
+impl std::io::Write for FlushedChunks {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // The emitter writes each flush with one write_all, which a writer
+        // that takes everything turns into one call.
+        self.chunks.push(buf.to_vec());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Wraps libyaml Emitter with a self-owned output buffer.
 ///
 /// Safety: `emitter` borrows from `output` via an unsafe lifetime cast.
@@ -52,14 +73,13 @@ type NodeId = usize;
 /// We guarantee emitter is always dropped before output by setting it
 /// to None in dispose()/Drop.
 struct EmitterWrapper {
-    #[allow(clippy::box_collection)]
-    output: Box<Vec<u8>>,
+    output: Box<FlushedChunks>,
     emitter: Option<Emitter<'static>>,
 }
 
 impl EmitterWrapper {
     fn new() -> Self {
-        let output = Box::new(Vec::new());
+        let output = Box::new(FlushedChunks::default());
         let emitter = Emitter::new();
         EmitterWrapper {
             output,
@@ -70,11 +90,11 @@ impl EmitterWrapper {
     fn configure(&mut self, encoding: Encoding) {
         // SAFETY: output lives in a Box (stable heap address) and we guarantee
         // the emitter is dropped before output (see dispose/Drop).
-        let output_ref: &'static mut Vec<u8> =
-            unsafe { &mut *(self.output.as_mut() as *mut Vec<u8>) };
+        let output_ref: &'static mut FlushedChunks =
+            unsafe { &mut *(self.output.as_mut() as *mut FlushedChunks) };
         let emitter = self.emitter.as_mut().unwrap();
         emitter.set_encoding(encoding);
-        emitter.set_output_string(output_ref);
+        emitter.set_output(output_ref);
     }
 
     fn emitter_mut(&mut self) -> &mut Emitter<'static> {
@@ -87,8 +107,9 @@ impl EmitterWrapper {
             .map_err(|e| format!("emitter error: {e}"))
     }
 
-    fn take_output(&mut self) -> Vec<u8> {
-        std::mem::take(self.output.as_mut())
+    /// The output flushed so far, one chunk per flush.
+    fn take_output(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.output.chunks)
     }
 
     fn dispose(&mut self) {
@@ -327,9 +348,7 @@ impl RSafeDumper {
                 .to_string(),
             ));
         }
-        self.emitter
-            .emit(Event::stream_start(Encoding::Utf8))
-            .map_err(|e| exception::emitter_error(py, e))?;
+        self.emit(py, Event::stream_start(Encoding::Utf8))?;
         self.closed = 0;
         Ok(())
     }
@@ -356,21 +375,8 @@ impl RSafeDumper {
         if self.closed == 1 {
             return Ok(());
         }
-        self.emitter
-            .emit(Event::stream_end())
-            .map_err(|e| exception::emitter_error(py, e))?;
+        self.emit(py, Event::stream_end())?;
         self.closed = 1;
-
-        // Flush output to stream
-        let output = self.emitter.take_output();
-        let stream = self.stream.bind(py);
-        if self.dump_unicode {
-            let s = String::from_utf8(output)
-                .map_err(|e| exception::emitter_error(py, format!("invalid utf8 output: {e}")))?;
-            stream.call_method1("write", (s,))?;
-        } else {
-            stream.call_method1("write", (PyBytes::new(py, &output),))?;
-        }
         Ok(())
     }
 
@@ -676,6 +682,31 @@ impl RSafeDumper {
 // ── Serializer ───────────────────────────────────────────────────────────────
 
 impl RSafeDumper {
+    /// Emit an event, then write whatever the emitter flushed to the stream,
+    /// like PyYAML's CEmitter, whose libyaml output handler writes each flush
+    /// (at every document end, and when the buffer fills). `ryaml.dumps` has
+    /// no stream and takes the output at the end.
+    fn emit(&mut self, py: Python, event: Event) -> PyResult<()> {
+        self.emitter
+            .emit(event)
+            .map_err(|e| exception::emitter_error(py, e))?;
+        if self.stream.is_none(py) {
+            return Ok(());
+        }
+        let stream = self.stream.bind(py);
+        for output in self.emitter.take_output() {
+            if self.dump_unicode {
+                let text = String::from_utf8(output).map_err(|e| {
+                    exception::emitter_error(py, format!("invalid utf8 output: {e}"))
+                })?;
+                stream.call_method1("write", (text,))?;
+            } else {
+                stream.call_method1("write", (PyBytes::new(py, &output),))?;
+            }
+        }
+        Ok(())
+    }
+
     fn serialize(&mut self, py: Python, node: NodeId) -> PyResult<()> {
         // PyYAML represents the data first, then its serializer checks it is
         // open.
@@ -694,20 +725,15 @@ impl RSafeDumper {
             }
             _ => {}
         }
-        self.emitter
-            .emit(Event::document_start(
-                self.version,
-                &self.tags,
-                self.document_start_implicit,
-            ))
-            .map_err(|e| exception::emitter_error(py, e))?;
+        self.emit(
+            py,
+            Event::document_start(self.version, &self.tags, self.document_start_implicit),
+        )?;
 
         self.anchor_node(py, node)?;
         self.serialize_node(py, node)?;
 
-        self.emitter
-            .emit(Event::document_end(self.document_end_implicit))
-            .map_err(|e| exception::emitter_error(py, e))?;
+        self.emit(py, Event::document_end(self.document_end_implicit))?;
 
         // Reset serializer state
         self.serialized_nodes.clear();
@@ -751,9 +777,7 @@ impl RSafeDumper {
         if self.serialized_nodes.contains(&node) {
             // Emit alias
             let anchor_str = anchor.as_deref().unwrap_or("");
-            self.emitter
-                .emit(Event::alias(anchor_str))
-                .map_err(|e| exception::emitter_error(py, e))?;
+            self.emit(py, Event::alias(anchor_str))?;
             return Ok(());
         }
         self.serialized_nodes.insert(node);
@@ -777,9 +801,7 @@ impl RSafeDumper {
                     quoted_implicit,
                     scalar_style,
                 );
-                self.emitter
-                    .emit(event)
-                    .map_err(|e| exception::emitter_error(py, e))?;
+                self.emit(py, event)?;
             }
             RepNode::Sequence {
                 tag, flow_style, ..
@@ -791,9 +813,7 @@ impl RSafeDumper {
                     None => SequenceStyle::Any,
                 };
                 let event = Event::sequence_start(anchor_ref, Some(tag), implicit, style);
-                self.emitter
-                    .emit(event)
-                    .map_err(|e| exception::emitter_error(py, e))?;
+                self.emit(py, event)?;
                 for index in 0.. {
                     let RepNode::Sequence { value, .. } = &self.nodes[node] else {
                         unreachable!()
@@ -803,9 +823,7 @@ impl RSafeDumper {
                     };
                     self.serialize_node(py, item)?;
                 }
-                self.emitter
-                    .emit(Event::sequence_end())
-                    .map_err(|e| exception::emitter_error(py, e))?;
+                self.emit(py, Event::sequence_end())?;
             }
             RepNode::Mapping {
                 tag, flow_style, ..
@@ -817,9 +835,7 @@ impl RSafeDumper {
                     None => MappingStyle::Any,
                 };
                 let event = Event::mapping_start(anchor_ref, Some(tag), implicit, style);
-                self.emitter
-                    .emit(event)
-                    .map_err(|e| exception::emitter_error(py, e))?;
+                self.emit(py, event)?;
                 for index in 0.. {
                     let RepNode::Mapping { value, .. } = &self.nodes[node] else {
                         unreachable!()
@@ -830,9 +846,7 @@ impl RSafeDumper {
                     self.serialize_node(py, k)?;
                     self.serialize_node(py, v)?;
                 }
-                self.emitter
-                    .emit(Event::mapping_end())
-                    .map_err(|e| exception::emitter_error(py, e))?;
+                self.emit(py, Event::mapping_end())?;
             }
         }
         Ok(())
@@ -933,7 +947,7 @@ pub fn dumps_to_string(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<String> {
         .emit(Event::stream_end())
         .map_err(|e| exception::emitter_error(py, e))?;
 
-    let output = dumper.emitter.take_output();
+    let output = dumper.emitter.take_output().concat();
     String::from_utf8(output)
         .map_err(|e| exception::emitter_error(py, format!("invalid utf8 output: {e}")))
 }
