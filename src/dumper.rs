@@ -7,8 +7,9 @@ use std::sync::Arc;
 use base64::Engine as _;
 use libyaml_safer::{Emitter, Encoding, Event, MappingStyle, ScalarStyle, SequenceStyle};
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{
-    PyBool, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PySet, PyString, PyTuple,
+    PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PySet, PyString, PyTuple, PyType,
 };
 
 use crate::exception;
@@ -293,33 +294,35 @@ impl RSafeDumper {
             Some(key)
         };
 
-        // Type dispatch (order matters: bool before int, datetime before date)
+        // SafeRepresenter dispatches on the exact type only (it registers no
+        // multi-representers), so subclasses and other types are refused.
+        let ty = data.get_type();
         let node = if data.is_none() {
             self.represent_none()
-        } else if data.is_instance_of::<PyBool>() {
+        } else if ty.is(py.get_type::<PyBool>()) {
             self.represent_bool(data)?
-        } else if data.is_instance_of::<PyInt>() {
+        } else if ty.is(py.get_type::<PyInt>()) {
             self.represent_int(data)?
-        } else if data.is_instance_of::<PyFloat>() {
+        } else if ty.is(py.get_type::<PyFloat>()) {
             self.represent_float(data)?
-        } else if data.is_instance_of::<PyString>() {
+        } else if ty.is(py.get_type::<PyString>()) {
             self.represent_str(data)?
-        } else if data.is_instance_of::<PyBytes>() {
+        } else if ty.is(py.get_type::<PyBytes>()) {
             self.represent_binary(py, data)?
-        } else if Self::is_datetime(py, data)? {
+        } else if ty.is(datetime_type(py, "datetime")?) {
             self.represent_datetime(py, data)?
-        } else if Self::is_date(py, data)? {
+        } else if ty.is(datetime_type(py, "date")?) {
             self.represent_date(py, data)?
-        } else if data.is_instance_of::<PyList>() || data.is_instance_of::<PyTuple>() {
+        } else if ty.is(py.get_type::<PyList>()) || ty.is(py.get_type::<PyTuple>()) {
             self.represent_list(py, data)?
-        } else if data.is_instance_of::<PyDict>() {
+        } else if ty.is(py.get_type::<PyDict>()) {
             self.represent_dict(py, data)?
-        } else if data.is_instance_of::<PySet>() || data.is_instance_of::<PyFrozenSet>() {
+        } else if ty.is(py.get_type::<PySet>()) {
             self.represent_set(py, data)?
         } else {
             return Err(exception::representer_error(
                 py,
-                format!("cannot represent an object: {:?}", data.get_type().name()?),
+                format!("cannot represent an object: {}", data.repr()?),
             ));
         };
 
@@ -478,18 +481,6 @@ impl RSafeDumper {
             Some(best_style)
         }
     }
-
-    fn is_datetime(py: Python, data: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let datetime_mod = py.import("datetime")?;
-        let datetime_cls = datetime_mod.getattr("datetime")?;
-        data.is_instance(&datetime_cls)
-    }
-
-    fn is_date(py: Python, data: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let datetime_mod = py.import("datetime")?;
-        let date_cls = datetime_mod.getattr("date")?;
-        data.is_instance(&date_cls)
-    }
 }
 
 // ── Serializer ───────────────────────────────────────────────────────────────
@@ -634,6 +625,27 @@ impl RSafeDumper {
 }
 
 // ── Free helpers ─────────────────────────────────────────────────────────────
+
+static DATE_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static DATETIME_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+
+/// `datetime.date` or `datetime.datetime`.
+fn datetime_type<'py>(py: Python<'py>, name: &str) -> PyResult<&'py Bound<'py, PyType>> {
+    let cache = if name == "date" {
+        &DATE_TYPE
+    } else {
+        &DATETIME_TYPE
+    };
+    Ok(cache
+        .get_or_try_init(py, || -> PyResult<_> {
+            Ok(py
+                .import("datetime")?
+                .getattr(name)?
+                .cast_into::<PyType>()?
+                .unbind())
+        })?
+        .bind(py))
+}
 
 fn is_plain_scalar(node: &Arc<RepNode>) -> bool {
     matches!(node.as_ref(), RepNode::Scalar { style: None, .. })
