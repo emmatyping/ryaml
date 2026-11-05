@@ -18,6 +18,7 @@ import contextlib
 import datetime
 import decimal
 import enum
+import io
 import math
 import sys
 
@@ -322,11 +323,92 @@ def compare(docs, kwargs):
     check("ryaml.dumps", expected, actual, docs[:1], {"sort_keys": False})
 
 
+class RecordingStream:
+    """A stream without an `encoding` attribute: PyYAML writes bytes to it
+    when given an encoding. Records each write."""
+
+    def __init__(self):
+        self.writes = []
+
+    def write(self, data):
+        self.writes.append(data)
+
+
+class RecordingTextStream(RecordingStream):
+    """A stream with an `encoding` attribute: PyYAML always writes str."""
+
+    encoding = None
+
+
+STREAMS = [io.StringIO, io.BytesIO, RecordingStream, RecordingTextStream]
+
+
+def written(stream):
+    return stream.getvalue() if hasattr(stream, "getvalue") else stream.writes
+
+
+def compare_stream(docs, kwargs, make_stream):
+    """yaml.dump_all into a stream: every write must match, also when the dump
+    fails part way."""
+    def dump(dumper):
+        stream = make_stream()
+        result = outcome(lambda: yaml.dump_all(docs, stream, Dumper=dumper, **kwargs))
+        return result, written(stream)
+
+    (expected, expected_writes), (actual, actual_writes) = dump(SafeDumper), dump(RSafeDumper)
+    name = f"dump_all to {make_stream.__name__}"
+    check(name, expected, actual, docs, kwargs)
+    assert actual_writes == expected_writes, (
+        f"Different writes ({name}):\n  pyyaml: {expected_writes!r}\n"
+        f"  ryaml:  {actual_writes!r}\n  documents: {docs!r}\n  options:   {kwargs!r}"
+    )
+
+
+def compare_protocol(docs, kwargs, make_stream, calls):
+    """The dumper protocol driven directly: open/represent/close/dispose in any
+    order, as code using a Dumper class itself might."""
+    def run(dumper):
+        stream = make_stream()
+        results = []
+        try:
+            instance = dumper(stream, **kwargs)
+        except Exception as e:
+            return [type(e)], written(stream)
+        for call in calls:
+            if isinstance(call, int):
+                results.append(outcome(lambda: instance.represent(docs[call % len(docs)]))[1])
+            else:
+                results.append(outcome(getattr(instance, call))[1])
+        return results, written(stream)
+
+    expected, actual = run(SafeDumper), run(RSafeDumper)
+    for e, a in zip(expected[0], actual[0]):
+        assert (e is None) == (a is None) and (e is None or issubclass(a, e)), (
+            f"Different protocol outcomes:\n  pyyaml: {expected!r}\n  ryaml:  {actual!r}\n"
+            f"  calls: {calls!r}\n  documents: {docs!r}\n  options:   {kwargs!r}"
+        )
+    assert actual[1] == expected[1], (
+        f"Different protocol writes:\n  pyyaml: {expected[1]!r}\n  ryaml:  {actual[1]!r}\n"
+        f"  calls: {calls!r}\n  documents: {docs!r}\n  options:   {kwargs!r}"
+    )
+
+
+# A call of the dumper protocol; an int represents that document.
+protocol_calls = st.lists(
+    st.one_of(pick(["open", "close", "dispose"]), st.integers(0, 2)), max_size=8)
+
+
 @settings(database=None, deadline=None, max_examples=500,
           suppress_health_check=list(HealthCheck))
-@given(documents(), options)
-def test_dump(docs, kwargs):
-    compare(realize(docs), kwargs)
+@given(documents(), options, st.integers(0, 3), pick(STREAMS), protocol_calls)
+def test_dump(docs, kwargs, mode, make_stream, calls):
+    docs = realize(docs)
+    if mode <= 1:
+        compare(docs, kwargs)
+    elif mode == 2:
+        compare_stream(docs, kwargs, make_stream)
+    else:
+        compare_protocol(docs, kwargs, make_stream, ["open"] + calls)
 
 
 if __name__ == "__main__":
