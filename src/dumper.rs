@@ -567,21 +567,21 @@ impl RSafeDumper {
                 flow_style: None,
             },
         );
-        let mut items = Vec::new();
         let mut best_style = true;
         self.level += 1;
         for item in data.try_iter()? {
             let item = self.represent_data(py, &item?)?;
             best_style &= self.is_plain_scalar(item);
-            items.push(item);
+            // Added at once, like PyYAML: if a later item fails, the node
+            // stays registered with the items so far, and a later `represent`
+            // of the same object reuses it.
+            if let RepNode::Sequence { value, .. } = &mut self.nodes[node] {
+                value.push(item);
+            }
         }
         self.level -= 1;
         let flow = self.choose_flow_style(best_style);
-        if let RepNode::Sequence {
-            value, flow_style, ..
-        } = &mut self.nodes[node]
-        {
-            *value = items;
+        if let RepNode::Sequence { flow_style, .. } = &mut self.nodes[node] {
             *flow_style = flow;
         }
         Ok(node)
@@ -628,7 +628,6 @@ impl RSafeDumper {
             },
         );
         let items = self.mapping_items(py, items)?;
-        let mut pairs = Vec::new();
         let mut best_style = true;
         self.level += 1;
         for item in items.iter() {
@@ -636,15 +635,14 @@ impl RSafeDumper {
             let key_node = self.represent_data(py, &k)?;
             let val_node = self.represent_data(py, &v)?;
             best_style &= self.is_plain_scalar(key_node) && self.is_plain_scalar(val_node);
-            pairs.push((key_node, val_node));
+            // Added at once, like PyYAML (see `represent_list`).
+            if let RepNode::Mapping { value, .. } = &mut self.nodes[node] {
+                value.push((key_node, val_node));
+            }
         }
         self.level -= 1;
         let flow = self.choose_flow_style(best_style);
-        if let RepNode::Mapping {
-            value, flow_style, ..
-        } = &mut self.nodes[node]
-        {
-            *value = pairs;
+        if let RepNode::Mapping { flow_style, .. } = &mut self.nodes[node] {
             *flow_style = flow;
         }
         Ok(node)
@@ -824,10 +822,11 @@ impl RSafeDumper {
                 tag, flow_style, ..
             } => {
                 let implicit = *tag == resolver::DEFAULT_SEQUENCE_TAG;
-                let style = match flow_style {
-                    Some(true) => SequenceStyle::Flow,
-                    Some(false) => SequenceStyle::Block,
-                    None => SequenceStyle::Any,
+                // CEmitter: flow if node.flow_style is true, else block.
+                let style = if *flow_style == Some(true) {
+                    SequenceStyle::Flow
+                } else {
+                    SequenceStyle::Block
                 };
                 let event = Event::sequence_start(anchor_ref, Some(tag), implicit, style);
                 self.emit(py, event)?;
@@ -846,10 +845,10 @@ impl RSafeDumper {
                 tag, flow_style, ..
             } => {
                 let implicit = *tag == resolver::DEFAULT_MAPPING_TAG;
-                let style = match flow_style {
-                    Some(true) => MappingStyle::Flow,
-                    Some(false) => MappingStyle::Block,
-                    None => MappingStyle::Any,
+                let style = if *flow_style == Some(true) {
+                    MappingStyle::Flow
+                } else {
+                    MappingStyle::Block
                 };
                 let event = Event::mapping_start(anchor_ref, Some(tag), implicit, style);
                 self.emit(py, event)?;

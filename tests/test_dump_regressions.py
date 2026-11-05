@@ -381,3 +381,37 @@ def test_failed_writes_like_libyaml(make_stream, options):
                 results.append(type(e).__name__)
         return results, getattr(stream, "writes", None) or stream.getvalue()
     assert run(ryaml.RSafeDumper) == run(yaml.CSafeDumper)
+
+
+def _partly_unrepresentable():
+    items = []
+    items.append(items)
+    items.append(StrSubclass("s"))
+    mapping = {"a": 1}
+    mapping["self"] = mapping
+    mapping["bad"] = frozenset()
+    return [items, mapping, {"k": [1, 2, object()]}]
+
+
+@pytest.mark.skipif(not hasattr(yaml, "CSafeDumper"), reason="PyYAML was built without LibYAML")
+@pytest.mark.parametrize("index", range(3))
+def test_failed_represent_leaves_partial_nodes_like_pyyaml(index):
+    # PyYAML adds each item to the collection's node as it goes and does not
+    # forget represented objects when representing fails, so representing the
+    # object again reuses the partly filled node.
+    def run(dumper):
+        import io
+        value = _partly_unrepresentable()[index]
+        stream = io.StringIO()
+        instance = dumper(stream, sort_keys=False)
+        instance.open()
+        results = []
+        again = value[0] if isinstance(value, list) else value.get("self", value.get("k"))
+        for target in (value, again):
+            try:
+                instance.represent(target)
+                results.append(None)
+            except Exception as e:  # noqa: BLE001
+                results.append(type(e).__name__)
+        return results, stream.getvalue()
+    assert run(ryaml.RSafeDumper) == run(yaml.CSafeDumper)
