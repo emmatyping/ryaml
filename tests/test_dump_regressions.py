@@ -77,6 +77,8 @@ def test_encodings_like_pyyaml(reference, encoding):
 @pytest.mark.parametrize("value", [
     1e16, 1e17, 123456789012345678.0, 1.5e300, 1e-4, 1e-5, 0.0001234, 5e-324,
     1.7976931348623157e308, -0.0, 0.1, 1.0, -2.5e-07, 1e22, 9999999999999998.0,
+    # Exactly halfway between two shortest strings: Python picks the even one.
+    -1113178120592002.2, -233891771783429.62, 1125899906842624.5, 4503599627370495.5,
 ])
 def test_floats_like_python_repr(reference, value):
     # PyYAML writes repr(value).lower(), adding ".0" before a bare exponent.
@@ -531,3 +533,57 @@ def test_big_ints_like_pyyaml(reference, value):
     ryaml.dump(stream, {"t1": value})
     assert stream.getvalue() == yaml.safe_dump({"t1": value})
     assert ryaml.loads(stream.getvalue()) == {"t1": value}
+
+
+@pytest.mark.skipif(not hasattr(yaml, "CSafeDumper"), reason="PyYAML was built without LibYAML")
+@pytest.mark.parametrize("ops", [
+    ("bad", "bad", "bad"),
+    ("bad", "good", "close"),
+    ("badlist", "badlist", "good"),
+], ids="-".join)
+def test_serializer_state_kept_after_a_failed_document(ops):
+    # CEmitter resets its anchors and written nodes only after a document
+    # succeeds, so a document after a failed one (reusing its nodes) sees them.
+    import io
+
+    def run(dumper):
+        shared = ["s"]
+        docs = {
+            "bad": {"\udd3d": "!", (("", ("", "")), "  "): False},
+            "badlist": ["a", ["\ud800", shared], shared],
+            "good": {"a": [1, shared], "b": shared},
+        }
+        stream = io.StringIO()
+        instance = dumper(stream)
+        instance.open()
+        results = []
+        for op in ops:
+            try:
+                instance.represent(docs[op]) if op in docs else getattr(instance, op)()
+                results.append(None)
+            except Exception as e:  # noqa: BLE001
+                results.append(type(e).__name__)
+        return results, stream.getvalue()
+    assert run(ryaml.RSafeDumper) == run(yaml.CSafeDumper)
+
+
+@pytest.mark.skipif(not hasattr(yaml, "CSafeDumper"), reason="PyYAML was built without LibYAML")
+@pytest.mark.parametrize("explicit_end", [None, True])
+def test_failed_write_keeps_nodes_seen(explicit_end):
+    # Writing str to a BytesIO fails at document end; the kept state has the
+    # (reused) date seen once, so the next document writes it as an alias.
+    import datetime
+    import io
+
+    def run(dumper):
+        doc = datetime.datetime(1, 12, 10, 13, 8, 0, 115)
+        instance = dumper(io.BytesIO(), explicit_end=explicit_end)
+        results = []
+        for op in ("open", "represent", "represent", "open"):
+            try:
+                instance.represent(doc) if op == "represent" else getattr(instance, op)()
+                results.append(None)
+            except Exception as e:  # noqa: BLE001
+                results.append(type(e).__name__)
+        return results
+    assert run(ryaml.RSafeDumper) == run(yaml.CSafeDumper)
