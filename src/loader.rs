@@ -84,6 +84,21 @@ pub struct RSafeLoader {
     pending: VecDeque<(NodeId, Py<PyAny>)>,
 }
 
+thread_local! {
+    /// Strings made for short mapping keys, reused for keys with the same
+    /// text: mappings tend to repeat their keys (within a document and from
+    /// one load to the next), and a reused string skips decoding, allocation
+    /// and (in the dict) hashing. Each slot holds the last key whose text
+    /// hashes to it.
+    static KEY_CACHE: std::cell::RefCell<[Option<Py<PyString>>; KEY_CACHE_SLOTS]> =
+        const { std::cell::RefCell::new([const { None }; KEY_CACHE_SLOTS]) };
+}
+
+/// The longest key text `KEY_CACHE` holds.
+const MAX_CACHED_KEY: usize = 64;
+/// Slots in `KEY_CACHE`, chosen by a hash of the key's text.
+const KEY_CACHE_SLOTS: usize = 256;
+
 #[pymethods]
 impl RSafeLoader {
     #[new]
@@ -487,7 +502,10 @@ impl RSafeLoader {
             && let Some(&(key_node, value_node)) = entries.get(index)
         {
             index += 1;
-            let key = self.construct_object(py, key_node)?;
+            let key = match self.cached_key(py, key_node) {
+                Some(key) => key,
+                None => self.construct_object(py, key_node)?,
+            };
             if key.is_instance_of::<PyList>()
                 || key.is_instance_of::<PyDict>()
                 || key.is_instance_of::<PySet>()
@@ -501,6 +519,39 @@ impl RSafeLoader {
             insert(&key, &value)?;
         }
         Ok(())
+    }
+
+    /// A str key's object from `KEY_CACHE`, for a short plain `str` scalar
+    /// that `construct_object` would not remember (so only its text matters).
+    fn cached_key<'py>(&mut self, py: Python<'py>, node: NodeId) -> Option<Bound<'py, PyAny>> {
+        if self.has_merge {
+            return None;
+        }
+        let Node {
+            tag: Tag::Str,
+            anchored: false,
+            data: NodeData::Scalar { value, .. },
+        } = &self.nodes[node]
+        else {
+            return None;
+        };
+        let text = &self.text[value.clone()];
+        if text.len() > MAX_CACHED_KEY {
+            return None;
+        }
+        let slot =
+            std::hash::BuildHasher::hash_one(&FxBuildHasher, text) as usize % KEY_CACHE_SLOTS;
+        let key = KEY_CACHE.with_borrow_mut(|cache| match &cache[slot] {
+            Some(key) if key.bind(py).to_str().is_ok_and(|cached| cached == text) => {
+                key.bind(py).clone()
+            }
+            _ => {
+                let key = PyString::new(py, text);
+                cache[slot] = Some(key.clone().unbind());
+                key
+            }
+        });
+        Some(key.into_any())
     }
 
     /// PyYAML's `flatten_mapping`: replace `<<` entries with the entries of the
