@@ -588,3 +588,12 @@ def test_failed_write_keeps_nodes_seen(explicit_end):
                 results.append(type(e).__name__)
         return results
     assert run(ryaml.RSafeDumper) == run(yaml.CSafeDumper)
+
+
+@pytest.mark.parametrize("width", [None, -1, 0, 1, 20, 2**31 - 2, 2**31 - 1])
+@pytest.mark.parametrize("default_style", [None, "'", '"'])
+def test_folding_long_text_like_pyyaml(reference, width, default_style):
+    # Runs of text are written at once up to where a space might fold the line.
+    text = "lorem ipsum  dolor\tsit amet " * 12 + "end"
+    docs = [[text, {"k": text}, "x" * 100 + " " + "y" * 100]]
+    assert_same_dump(reference, docs, width=width, default_style=default_style)
