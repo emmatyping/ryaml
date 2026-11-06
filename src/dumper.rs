@@ -1193,7 +1193,10 @@ fn char_to_scalar_style(style: Option<char>) -> ScalarStyle {
 // ── Fast-path for dumps() ────────────────────────────────────────────────────
 
 /// Dump a Python object to a YAML string, bypassing the pyyaml stream protocol.
-pub fn dumps_to_string(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<String> {
+pub fn dumps_to_string<'py>(
+    py: Python<'py>,
+    obj: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyString>> {
     let mut ew = EmitterWrapper::new();
     ew.configure(Encoding::Utf8, None, true);
 
@@ -1231,8 +1234,40 @@ pub fn dumps_to_string(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<String> {
         .map_err(|e| exception::emitter_error(py, e))?;
 
     let output = dumper.emitter.take_output();
-    String::from_utf8(output)
-        .map_err(|e| exception::emitter_error(py, format!("invalid utf8 output: {e}")))
+    output_to_str(py, &output)
+}
+
+/// The emitter's output (UTF-8) as a `str`. ASCII, the usual case, is copied
+/// straight into a new compact ASCII string, skipping decoding (except with
+/// the limited API, which cannot make one).
+fn output_to_str<'py>(py: Python<'py>, output: &[u8]) -> PyResult<Bound<'py, PyString>> {
+    let len = pyo3::ffi::Py_ssize_t::try_from(output.len())
+        .map_err(|_| pyo3::exceptions::PyOverflowError::new_err("output is too long"))?;
+    if cfg!(feature = "abi3") || !output.is_ascii() {
+        // SAFETY: `output` holds `len` bytes; CPython decodes and checks them.
+        let object = unsafe {
+            pyo3::ffi::PyUnicode_DecodeUTF8(output.as_ptr().cast(), len, std::ptr::null())
+        };
+        // SAFETY: a new reference or NULL with an exception set.
+        return unsafe { Bound::from_owned_ptr_or_err(py, object) }.map(|object| {
+            object
+                .cast_into::<PyString>()
+                .expect("PyUnicode_DecodeUTF8 returns a str")
+        });
+    }
+    #[cfg(not(feature = "abi3"))]
+    // SAFETY: PyUnicode_New(len, 127) makes a compact ASCII string with room
+    // for `len` bytes (plus the NUL it writes), whose data we fill before
+    // anyone else can see it.
+    unsafe {
+        let object = pyo3::ffi::PyUnicode_New(len, 127);
+        let object = Bound::from_owned_ptr_or_err(py, object)?;
+        let data = pyo3::ffi::PyUnicode_DATA(object.as_ptr()).cast::<u8>();
+        std::ptr::copy_nonoverlapping(output.as_ptr(), data, output.len());
+        Ok(object.cast_into_unchecked::<PyString>())
+    }
+    #[cfg(feature = "abi3")]
+    unreachable!("the limited API has no PyUnicode_New")
 }
 
 pub fn register_dumper(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
