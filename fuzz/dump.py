@@ -284,8 +284,6 @@ def outcome(dump):
     """(output, None) or (None, exception class)."""
     try:
         return dump(), None
-    except RecursionError:
-        raise
     except Exception as e:
         return None, type(e)
     except BaseException as e:
@@ -297,7 +295,19 @@ def outcome(dump):
         raise
 
 
+def too_deep_for_pyyaml(expected):
+    """PyYAML's representer is recursive Python, so it raises RecursionError
+    at a depth set by the recursion limit and the caller's stack; ryaml's
+    fixed limit is deeper, so then it may succeed or raise RecursionError."""
+    return expected[1] is not None and issubclass(expected[1], RecursionError)
+
+
 def check(name, expected, actual, docs, kwargs):
+    if too_deep_for_pyyaml(expected):
+        assert actual[1] is None or issubclass(actual[1], RecursionError), (
+            f"Different exceptions ({name}):\n  pyyaml: {expected[1]}\n  ryaml:  {actual[1]}"
+        )
+        return
     pyyaml_out, pyyaml_exc = expected
     ryaml_out, ryaml_exc = actual
     context = f"  documents: {docs!r}\n  options:   {kwargs!r}"
@@ -363,6 +373,8 @@ def compare_stream(docs, kwargs, make_stream):
     (expected, expected_writes), (actual, actual_writes) = dump(SafeDumper), dump(RSafeDumper)
     name = f"dump_all to {make_stream.__name__}"
     check(name, expected, actual, docs, kwargs)
+    if too_deep_for_pyyaml(expected):
+        return
     assert actual_writes == expected_writes, (
         f"Different writes ({name}):\n  pyyaml: {expected_writes!r}\n"
         f"  ryaml:  {actual_writes!r}\n  documents: {docs!r}\n  options:   {kwargs!r}"
@@ -387,6 +399,8 @@ def compare_protocol(docs, kwargs, make_stream, calls):
         return results, written(stream)
 
     expected, actual = run(SafeDumper), run(RSafeDumper)
+    if any(e is not None and issubclass(e, RecursionError) for e in expected[0]):
+        return  # see too_deep_for_pyyaml; the dumpers' states differ after
     for e, a in zip(expected[0], actual[0]):
         assert (e is None) == (a is None) and (e is None or issubclass(a, e)), (
             f"Different protocol outcomes:\n  pyyaml: {expected!r}\n  ryaml:  {actual!r}\n"

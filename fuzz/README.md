@@ -62,7 +62,9 @@ indicators, line breaks, BOMs, lone surrogates, characters at the edges of
 libyaml's printable ranges, long text for folding), ints and floats of every
 size, dates and datetimes with arbitrary UTC offsets, bytes, sets, tuples, and
 lists and dicts that are shared or recursive (anchors and aliases), sometimes
-nested deep enough to reach the recursion limit. Some values are ones PyYAML's
+nested deep enough to reach PyYAML's recursion limit (where PyYAML raises
+`RecursionError`, ryaml, whose fixed limit of 500 levels is deeper, may
+succeed). Some values are ones PyYAML's
 SafeRepresenter refuses (subclasses such as `OrderedDict`, frozensets,
 `Decimal`, ...). Each example is checked in one of three ways:
 
