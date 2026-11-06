@@ -16,6 +16,7 @@ libyaml-safer = { path = "./libyaml-safer"}
 base64 = "0.22"
 rustc-hash = "2.1.1"
 widestring = "1.2"
+stacker = "0.1"
 
 [dependencies.pyo3]
 version = "0.26.0"

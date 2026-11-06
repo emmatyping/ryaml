@@ -2,37 +2,93 @@
 //! All in Rust, matching the RSafeLoader pattern.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use base64::Engine as _;
-use libyaml_safer::{Emitter, Encoding, Event, MappingStyle, ScalarStyle, SequenceStyle};
+use libyaml_safer::{
+    Emitter, Encoding, Event, MappingStyle, ScalarStyle, SequenceStyle, TagDirective,
+    VersionDirective,
+};
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{
-    PyBool, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PySet, PyString, PyTuple,
+    PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PySet, PyString, PyTuple, PyType,
 };
 
 use crate::exception;
 use crate::resolver;
 
-/// Internal representation node used by the representer/serializer.
-/// Uses Rc for alias detection via pointer identity.
+/// A represented node (PyYAML's `yaml.nodes`), kept in `RSafeDumper::nodes`.
+/// Children are indices into it, so a collection can be registered before its
+/// children are represented and recursive data refers back to it, as in
+/// PyYAML's representer.
 #[derive(Debug)]
 enum RepNode {
     Scalar {
-        tag: String,
-        value: String,
+        tag: &'static str,
+        /// The text, or the error converting a `str` to UTF-8 (a lone
+        /// surrogate), which PyYAML's emitter only raises when it writes the
+        /// scalar, after the whole document is represented.
+        value: PyResult<String>,
         style: Option<char>,
     },
     Sequence {
-        tag: String,
-        value: Vec<Arc<RepNode>>,
+        tag: &'static str,
+        value: Vec<NodeId>,
         flow_style: Option<bool>,
     },
     Mapping {
-        tag: String,
-        value: Vec<(Arc<RepNode>, Arc<RepNode>)>,
+        tag: &'static str,
+        value: Vec<(NodeId, NodeId)>,
         flow_style: Option<bool>,
     },
+}
+
+type NodeId = usize;
+
+/// Where the emitter's output goes. Like PyYAML's CEmitter, whose libyaml
+/// output handler writes every flush to the stream (at each document end, and
+/// whenever the buffer fills), each flush is written to `stream` as it happens,
+/// as `str` or `bytes`. Without a stream (`ryaml.dumps`) the output is kept.
+#[derive(Default)]
+struct StreamWriter {
+    stream: Option<Py<PyAny>>,
+    dump_unicode: bool,
+    output: Vec<u8>,
+    /// The exception the stream's `write` raised, re-raised by `emit`.
+    error: Option<PyErr>,
+}
+
+impl std::io::Write for StreamWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let Some(stream) = &self.stream else {
+            self.output.extend_from_slice(buf);
+            return Ok(buf.len());
+        };
+        let result = Python::attach(|py| -> PyResult<()> {
+            let stream = stream.bind(py);
+            if self.dump_unicode {
+                let text = std::str::from_utf8(buf).map_err(|e| {
+                    exception::emitter_error(py, format!("invalid utf8 output: {e}"))
+                })?;
+                stream.call_method1("write", (text,))?;
+            } else {
+                stream.call_method1("write", (PyBytes::new(py, buf),))?;
+            }
+            Ok(())
+        });
+        match result {
+            // The emitter writes each flush with one write_all.
+            Ok(()) => Ok(buf.len()),
+            Err(error) => {
+                self.error = Some(error);
+                Err(std::io::Error::other("write error"))
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Wraps libyaml Emitter with a self-owned output buffer.
@@ -42,14 +98,13 @@ enum RepNode {
 /// We guarantee emitter is always dropped before output by setting it
 /// to None in dispose()/Drop.
 struct EmitterWrapper {
-    #[allow(clippy::box_collection)]
-    output: Box<Vec<u8>>,
+    output: Box<StreamWriter>,
     emitter: Option<Emitter<'static>>,
 }
 
 impl EmitterWrapper {
     fn new() -> Self {
-        let output = Box::new(Vec::new());
+        let output = Box::new(StreamWriter::default());
         let emitter = Emitter::new();
         EmitterWrapper {
             output,
@@ -57,14 +112,16 @@ impl EmitterWrapper {
         }
     }
 
-    fn configure(&mut self, encoding: Encoding) {
+    fn configure(&mut self, encoding: Encoding, stream: Option<Py<PyAny>>, dump_unicode: bool) {
+        self.output.stream = stream;
+        self.output.dump_unicode = dump_unicode;
         // SAFETY: output lives in a Box (stable heap address) and we guarantee
         // the emitter is dropped before output (see dispose/Drop).
-        let output_ref: &'static mut Vec<u8> =
-            unsafe { &mut *(self.output.as_mut() as *mut Vec<u8>) };
+        let output_ref: &'static mut StreamWriter =
+            unsafe { &mut *(self.output.as_mut() as *mut StreamWriter) };
         let emitter = self.emitter.as_mut().unwrap();
         emitter.set_encoding(encoding);
-        emitter.set_output_string(output_ref);
+        emitter.set_output(output_ref);
     }
 
     fn emitter_mut(&mut self) -> &mut Emitter<'static> {
@@ -77,8 +134,14 @@ impl EmitterWrapper {
             .map_err(|e| format!("emitter error: {e}"))
     }
 
+    /// The output flushed so far, without a stream.
     fn take_output(&mut self) -> Vec<u8> {
-        std::mem::take(self.output.as_mut())
+        std::mem::take(&mut self.output.output)
+    }
+
+    /// The exception the stream raised during the last emit, if any.
+    fn take_write_error(&mut self) -> Option<PyErr> {
+        self.output.error.take()
     }
 
     fn dispose(&mut self) {
@@ -97,13 +160,16 @@ impl Drop for EmitterWrapper {
 pub struct RSafeDumper {
     // Emitter
     emitter: EmitterWrapper,
-    stream: Py<PyAny>,
-    dump_unicode: bool,
     // -1 = not opened, 0 = open, 1 = closed
     closed: i8,
 
     // Serializer config
     document_start_implicit: bool,
+    /// The `version` and `tags` options (PyYAML's `use_version` and
+    /// `use_tags`), turned into `%YAML` and `%TAG` directives for each document
+    /// (see `directives`).
+    version: Option<Py<PyAny>>,
+    tags: Option<Py<PyAny>>,
     document_end_implicit: bool,
 
     // Serializer state (reset per document)
@@ -117,93 +183,143 @@ pub struct RSafeDumper {
     sort_keys: bool,
 
     // Representer state (reset per represent() call)
-    represented_objects: HashMap<usize, Arc<RepNode>>,
+    represented_objects: HashMap<usize, NodeId>,
+    /// Nodes of the document being represented.
+    nodes: Vec<RepNode>,
     object_keeper: Vec<Py<PyAny>>,
+    /// Nesting depth of the value being represented (the root is 0).
+    level: usize,
+}
+
+/// The deepest nesting ryaml represents and serializes; deeper data raises
+/// `RecursionError`. The recursion is native and grows its stack as needed
+/// (`with_stack`), so the limit is the same on every platform and Python
+/// version. It is deeper than PyYAML goes with the default recursion limit
+/// (about 330 levels, as its representer is recursive Python, three frames
+/// per level).
+const MAX_DEPTH: usize = 500;
+
+/// Run one level of the dumper's recursion, on a new stack segment if the
+/// current one is nearly used up, so `MAX_DEPTH` holds whatever the thread's
+/// stack size (musl gives threads 128 KB, for example). A level needs about
+/// half a kilobyte, plus whatever Python calls it makes (comparing keys,
+/// formatting dates), well within the red zone.
+fn with_stack<T>(f: impl FnOnce() -> T) -> T {
+    const RED_ZONE: usize = 64 * 1024;
+    const SEGMENT: usize = 1024 * 1024;
+    stacker::maybe_grow(RED_ZONE, SEGMENT, f)
+}
+
+fn check_depth(depth: usize) -> PyResult<()> {
+    if depth > MAX_DEPTH {
+        return Err(pyo3::exceptions::PyRecursionError::new_err(
+            "maximum recursion depth exceeded while representing an object",
+        ));
+    }
+    Ok(())
 }
 
 #[pymethods]
 impl RSafeDumper {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature = (stream, default_style=None, default_flow_style=Some(false),
-        canonical=None, indent=None, width=None, allow_unicode=None,
-        line_break=None, encoding=None, explicit_start=None, explicit_end=None,
-        version=None, tags=None, sort_keys=false))]
-    #[allow(unused_variables)]
+    #[pyo3(signature = (stream, default_style=None, default_flow_style=Some(Truthy(false)),
+        canonical=Truthy(false), indent=None, width=None, allow_unicode=Truthy(false),
+        line_break=None, encoding=None, explicit_start=Truthy(false), explicit_end=Truthy(false),
+        version=None, tags=None, sort_keys=Truthy(true)))]
     fn new(
         py: Python,
         stream: Py<PyAny>,
-        default_style: Option<&str>,
-        default_flow_style: Option<bool>,
-        canonical: Option<bool>,
-        indent: Option<i32>,
-        width: Option<i32>,
-        allow_unicode: Option<bool>,
-        line_break: Option<&str>,
-        encoding: Option<&str>,
-        explicit_start: Option<bool>,
-        explicit_end: Option<bool>,
-        version: Option<(i32, i32)>,
-        tags: Option<HashMap<String, String>>,
-        sort_keys: bool,
+        default_style: Option<Bound<'_, PyAny>>,
+        default_flow_style: Option<Truthy>,
+        canonical: Truthy,
+        indent: Option<CInt>,
+        width: Option<CInt>,
+        allow_unicode: Truthy,
+        line_break: Option<Bound<'_, PyAny>>,
+        encoding: Option<Bound<'_, PyAny>>,
+        explicit_start: Truthy,
+        explicit_end: Truthy,
+        version: Option<Py<PyAny>>,
+        tags: Option<Py<PyAny>>,
+        sort_keys: Truthy,
     ) -> PyResult<Self> {
         let mut ew = EmitterWrapper::new();
 
-        // Configure emitter
-        let enc = match encoding {
-            None | Some("utf-8") | Some("utf8") => Encoding::Utf8,
-            Some("utf-16-le") | Some("utf-16le") => Encoding::Utf16Le,
-            Some("utf-16-be") | Some("utf-16be") => Encoding::Utf16Be,
-            Some(other) => {
-                return Err(exception::emitter_error(
-                    py,
-                    format!("unknown encoding: {other}"),
-                ));
-            }
+        // Like PyYAML's CEmitter: it writes str (so UTF-8) to a stream with an
+        // `encoding` attribute, or when no encoding is given. Otherwise it
+        // writes bytes: UTF-16 for exactly "utf-16-le" or "utf-16-be", UTF-8
+        // for any other encoding.
+        let dump_unicode = stream.bind(py).hasattr("encoding")? || encoding.is_none();
+        let enc = match encoding
+            .as_ref()
+            .and_then(|e| e.extract::<String>().ok())
+            .as_deref()
+        {
+            _ if dump_unicode => Encoding::Utf8,
+            Some("utf-16-le") => Encoding::Utf16Le,
+            Some("utf-16-be") => Encoding::Utf16Be,
+            _ => Encoding::Utf8,
         };
-        ew.configure(enc);
+        ew.configure(enc, Some(stream.clone_ref(py)), dump_unicode);
 
-        if let Some(true) = canonical {
+        if canonical.0 {
             ew.emitter_mut().set_canonical(true);
         }
-        if let Some(i) = indent {
+        if let Some(CInt(i)) = indent {
             ew.emitter_mut().set_indent(i);
         }
-        if let Some(w) = width {
+        if let Some(CInt(w)) = width {
             ew.emitter_mut().set_width(w);
         }
-        if let Some(true) = allow_unicode {
+        if allow_unicode.0 {
             ew.emitter_mut().set_unicode(true);
         }
-        if let Some(lb) = line_break {
-            let brk = match lb {
-                "\n" => libyaml_safer::Break::Ln,
-                "\r" => libyaml_safer::Break::Cr,
-                "\r\n" => libyaml_safer::Break::CrLn,
-                _ => libyaml_safer::Break::Ln,
-            };
+        // CEmitter only recognizes these line breaks and ignores anything else.
+        let line_break = line_break.and_then(|lb| lb.extract::<String>().ok());
+        let brk = match line_break.as_deref() {
+            Some("\n") => Some(libyaml_safer::Break::Ln),
+            Some("\r") => Some(libyaml_safer::Break::Cr),
+            Some("\r\n") => Some(libyaml_safer::Break::CrLn),
+            _ => None,
+        };
+        if let Some(brk) = brk {
             ew.emitter_mut().set_break(brk);
         }
 
-        let dump_unicode = encoding.is_none();
-
-        let default_style_char = default_style.and_then(|s| s.chars().next());
+        // The representer stores default_style on every scalar node, and
+        // CEmitter writes only exactly "'", '"', '|' or '>' as that style.
+        // Any other truthy value is written plain but still counts as a style
+        // when choosing flow style.
+        let default_style_char = match default_style {
+            None => None,
+            Some(style) => match style.extract::<String>().ok().as_deref() {
+                Some("'") => Some('\''),
+                Some("\"") => Some('"'),
+                Some("|") => Some('|'),
+                Some(">") => Some('>'),
+                _ if style.is_truthy()? => Some(OTHER_STYLE),
+                _ => None,
+            },
+        };
 
         Ok(RSafeDumper {
             emitter: ew,
-            stream,
-            dump_unicode,
             closed: -1,
-            document_start_implicit: !explicit_start.unwrap_or(false),
-            document_end_implicit: !explicit_end.unwrap_or(false),
+            document_start_implicit: !explicit_start.0,
+            version,
+            tags,
+            document_end_implicit: !explicit_end.0,
             serialized_nodes: HashSet::new(),
             anchors: HashMap::new(),
             last_alias_id: 0,
             default_style: default_style_char,
-            default_flow_style,
-            sort_keys,
+            default_flow_style: default_flow_style.map(|style| style.0),
+            sort_keys: sort_keys.0,
             represented_objects: HashMap::new(),
+            nodes: Vec::new(),
             object_keeper: Vec::new(),
+            level: 0,
         })
     }
 
@@ -219,18 +335,18 @@ impl RSafeDumper {
                 .to_string(),
             ));
         }
-        self.emitter
-            .emit(Event::stream_start(Encoding::Utf8))
-            .map_err(|e| exception::emitter_error(py, e))?;
+        self.emit(py, Event::stream_start(Encoding::Utf8))?;
         self.closed = 0;
         Ok(())
     }
 
     fn represent(&mut self, py: Python, data: Py<PyAny>) -> PyResult<()> {
+        self.level = 0;
         let node = self.represent_data(py, data.bind(py))?;
-        self.serialize(py, &node)?;
+        self.serialize(py, node)?;
         self.represented_objects.clear();
         self.object_keeper.clear();
+        self.nodes.clear();
         Ok(())
     }
 
@@ -244,27 +360,14 @@ impl RSafeDumper {
         if self.closed == 1 {
             return Ok(());
         }
-        self.emitter
-            .emit(Event::stream_end())
-            .map_err(|e| exception::emitter_error(py, e))?;
+        self.emit(py, Event::stream_end())?;
         self.closed = 1;
-
-        // Flush output to stream
-        let output = self.emitter.take_output();
-        let stream = self.stream.bind(py);
-        if self.dump_unicode {
-            let s = String::from_utf8(output)
-                .map_err(|e| exception::emitter_error(py, format!("invalid utf8 output: {e}")))?;
-            stream.call_method1("write", (s,))?;
-        } else {
-            stream.call_method1("write", (PyBytes::new(py, &output),))?;
-        }
         Ok(())
     }
 
-    fn dispose(&mut self) {
-        self.emitter.dispose();
-    }
+    /// Like PyYAML's `CEmitter.dispose`, which does nothing: the dumper can
+    /// still be used, and the emitter is freed with it.
+    fn dispose(&mut self) {}
 }
 
 // ── Representer ──────────────────────────────────────────────────────────────
@@ -280,195 +383,272 @@ impl RSafeDumper {
             || data.is_instance_of::<PyFloat>()
     }
 
-    fn represent_data(&mut self, py: Python, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
-        // Alias tracking
+    fn represent_data(&mut self, py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
+        with_stack(|| self.represent_data_inner(py, data))
+    }
+
+    fn represent_data_inner(&mut self, py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
+        check_depth(self.level)?;
+        // Alias tracking. Collections register their node before representing
+        // their items (see `register`), so recursive data finds it here.
         let alias_key = if self.ignore_aliases(py, data) {
             None
         } else {
             let key = data.as_ptr() as usize;
-            if let Some(node) = self.represented_objects.get(&key) {
-                return Ok(Arc::clone(node));
+            if let Some(&node) = self.represented_objects.get(&key) {
+                return Ok(node);
             }
             self.object_keeper.push(data.clone().unbind());
             Some(key)
         };
 
-        // Type dispatch (order matters: bool before int, datetime before date)
+        // SafeRepresenter dispatches on the exact type only (it registers no
+        // multi-representers), so subclasses and other types are refused.
+        let ty = data.get_type();
         let node = if data.is_none() {
             self.represent_none()
-        } else if data.is_instance_of::<PyBool>() {
+        } else if ty.is(py.get_type::<PyBool>()) {
             self.represent_bool(data)?
-        } else if data.is_instance_of::<PyInt>() {
+        } else if ty.is(py.get_type::<PyInt>()) {
             self.represent_int(data)?
-        } else if data.is_instance_of::<PyFloat>() {
+        } else if ty.is(py.get_type::<PyFloat>()) {
             self.represent_float(data)?
-        } else if data.is_instance_of::<PyString>() {
+        } else if ty.is(py.get_type::<PyString>()) {
             self.represent_str(data)?
-        } else if data.is_instance_of::<PyBytes>() {
+        } else if ty.is(py.get_type::<PyBytes>()) {
             self.represent_binary(py, data)?
-        } else if Self::is_datetime(py, data)? {
+        } else if ty.is(datetime_type(py, "datetime")?) {
             self.represent_datetime(py, data)?
-        } else if Self::is_date(py, data)? {
+        } else if ty.is(datetime_type(py, "date")?) {
             self.represent_date(py, data)?
-        } else if data.is_instance_of::<PyList>() || data.is_instance_of::<PyTuple>() {
-            self.represent_list(py, data)?
-        } else if data.is_instance_of::<PyDict>() {
-            self.represent_dict(py, data)?
-        } else if data.is_instance_of::<PySet>() || data.is_instance_of::<PyFrozenSet>() {
-            self.represent_set(py, data)?
+        } else if ty.is(py.get_type::<PyList>()) || ty.is(py.get_type::<PyTuple>()) {
+            self.represent_list(py, data, alias_key)?
+        } else if ty.is(py.get_type::<PyDict>()) {
+            self.represent_dict(py, data, alias_key)?
+        } else if ty.is(py.get_type::<PySet>()) {
+            self.represent_set(py, data, alias_key)?
         } else {
             return Err(exception::representer_error(
                 py,
-                format!("cannot represent an object: {:?}", data.get_type().name()?),
+                format!("cannot represent an object: {}", data.repr()?),
             ));
         };
 
         if let Some(key) = alias_key {
-            self.represented_objects.insert(key, Arc::clone(&node));
+            self.represented_objects.insert(key, node);
         }
 
         Ok(node)
     }
 
-    fn represent_none(&self) -> Arc<RepNode> {
+    fn represent_none(&mut self) -> NodeId {
         self.make_scalar(crate::TAG_NULL, "null", None)
     }
 
-    fn represent_bool(&self, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
+    fn represent_bool(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let b: bool = data.extract()?;
         let value = if b { "true" } else { "false" };
         Ok(self.make_scalar(crate::TAG_BOOL, value, None))
     }
 
-    fn represent_int(&self, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
+    fn represent_int(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let s = data.str()?.to_string();
         Ok(self.make_scalar(crate::TAG_INT, &s, None))
     }
 
-    fn represent_float(&self, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
+    fn represent_float(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let f: f64 = data.extract()?;
-        let value = format_float(f);
+        let value = if f.is_nan() {
+            ".nan".to_string()
+        } else if f.is_infinite() {
+            if f > 0.0 { ".inf" } else { "-.inf" }.to_string()
+        } else {
+            // PyYAML: repr(data).lower(), with ".0" added before an exponent
+            // when there is no decimal point (repr(1e17) is "1e+17").
+            let value = data.repr()?.to_str()?.to_lowercase();
+            if !value.contains('.') && value.contains('e') {
+                value.replacen('e', ".0e", 1)
+            } else {
+                value
+            }
+        };
         Ok(self.make_scalar(crate::TAG_FLOAT, &value, None))
     }
 
-    fn represent_str(&self, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
-        let s: String = data.extract()?;
-        Ok(self.make_scalar(crate::TAG_STR, &s, None))
+    fn represent_str(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
+        let value = data.extract::<String>();
+        Ok(self.push_scalar(crate::TAG_STR, value, None))
     }
 
-    fn represent_binary(&self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
+    fn represent_binary(&mut self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let bytes: &[u8] = data.downcast::<PyBytes>()?.as_bytes();
         let encoded = base64::prelude::BASE64_STANDARD.encode(bytes);
 
-        // Add line breaks every 76 characters to match Python's base64.encodebytes()
-        let mut result = String::new();
-        for (i, ch) in encoded.chars().enumerate() {
-            if i > 0 && i % 76 == 0 {
-                result.push('\n');
-            }
-            result.push(ch);
+        // Python's base64.encodebytes: lines of at most 76 characters, each
+        // ending in a newline (so no bytes give an empty string).
+        let mut result = String::with_capacity(encoded.len() + encoded.len() / 76 + 1);
+        for line in encoded.as_bytes().chunks(76) {
+            result.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+            result.push('\n');
         }
-        result.push('\n');
 
         Ok(self.make_scalar(crate::TAG_BINARY, &result, Some('|')))
     }
 
-    fn represent_date(&self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
+    fn represent_date(&mut self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let value: String = data.call_method0("isoformat")?.extract()?;
         Ok(self.make_scalar(crate::TAG_TIMESTAMP, &value, None))
     }
 
-    fn represent_datetime(&self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
+    fn represent_datetime(&mut self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let value: String = data.call_method1("isoformat", (" ",))?.extract()?;
         Ok(self.make_scalar(crate::TAG_TIMESTAMP, &value, None))
     }
 
-    fn represent_list(&mut self, py: Python, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
-        // Get iterator by calling __iter__
-        let iter_obj = data.call_method0("__iter__")?;
-        let mut items = Vec::new();
+    fn represent_list(
+        &mut self,
+        py: Python,
+        data: &Bound<'_, PyAny>,
+        alias_key: Option<usize>,
+    ) -> PyResult<NodeId> {
+        let node = self.register(
+            alias_key,
+            RepNode::Sequence {
+                tag: crate::TAG_SEQ,
+                value: Vec::new(),
+                flow_style: None,
+            },
+        );
         let mut best_style = true;
-        loop {
-            match iter_obj.call_method0("__next__") {
-                Ok(item) => {
-                    let node = self.represent_data(py, &item)?;
-                    if !is_plain_scalar(&node) {
-                        best_style = false;
-                    }
-                    items.push(node);
-                }
-                Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => break,
-                Err(e) => return Err(e),
+        self.level += 1;
+        for item in data.try_iter()? {
+            let item = self.represent_data(py, &item?)?;
+            best_style &= self.is_plain_scalar(item);
+            // Added at once, like PyYAML: if a later item fails, the node
+            // stays registered with the items so far, and a later `represent`
+            // of the same object reuses it.
+            if let RepNode::Sequence { value, .. } = &mut self.nodes[node] {
+                value.push(item);
             }
         }
-        let flow_style = self.choose_flow_style(best_style);
-        Ok(Arc::new(RepNode::Sequence {
-            tag: crate::TAG_SEQ.to_string(),
-            value: items,
-            flow_style,
-        }))
+        self.level -= 1;
+        let flow = self.choose_flow_style(best_style);
+        if let RepNode::Sequence { flow_style, .. } = &mut self.nodes[node] {
+            *flow_style = flow;
+        }
+        Ok(node)
     }
 
-    fn represent_dict(&mut self, py: Python, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
-        let dict = data.downcast::<PyDict>()?;
-        let mut pairs: Vec<(Py<PyAny>, Py<PyAny>)> =
-            dict.iter().map(|(k, v)| (k.unbind(), v.unbind())).collect();
-
-        if self.sort_keys {
-            // Sort by key, ignoring errors (matching pyyaml which wraps in try/except TypeError)
-            let _ = try_sort_pairs(py, &mut pairs);
-        }
-
-        let mut items = Vec::new();
-        let mut best_style = true;
-        for (k, v) in &pairs {
-            let key_node = self.represent_data(py, k.bind(py))?;
-            let val_node = self.represent_data(py, v.bind(py))?;
-            if !is_plain_scalar(&key_node) || !is_plain_scalar(&val_node) {
-                best_style = false;
-            }
-            items.push((key_node, val_node));
-        }
-        let flow_style = self.choose_flow_style(best_style);
-        Ok(Arc::new(RepNode::Mapping {
-            tag: crate::TAG_MAP.to_string(),
-            value: items,
-            flow_style,
-        }))
+    fn represent_dict(
+        &mut self,
+        py: Python,
+        data: &Bound<'_, PyAny>,
+        alias_key: Option<usize>,
+    ) -> PyResult<NodeId> {
+        let items = data.cast::<PyDict>()?.items();
+        self.represent_mapping(py, crate::TAG_MAP, items, alias_key)
     }
 
-    fn represent_set(&mut self, py: Python, data: &Bound<'_, PyAny>) -> PyResult<Arc<RepNode>> {
-        // Get iterator by calling __iter__
-        let iter_obj = data.call_method0("__iter__")?;
-        let mut items = Vec::new();
-        loop {
-            match iter_obj.call_method0("__next__") {
-                Ok(item) => {
-                    let key_node = self.represent_data(py, &item)?;
-                    // Create a fresh null node for each value (don't share Arc to avoid aliases)
-                    let null_node = self.represent_none();
-                    items.push((key_node, null_node));
-                }
-                Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => break,
-                Err(e) => return Err(e),
+    /// PyYAML's `represent_set`: a mapping of the members to None.
+    fn represent_set(
+        &mut self,
+        py: Python,
+        data: &Bound<'_, PyAny>,
+        alias_key: Option<usize>,
+    ) -> PyResult<NodeId> {
+        let value = PyDict::new(py);
+        for item in data.try_iter()? {
+            value.set_item(item?, py.None())?;
+        }
+        self.represent_mapping(py, crate::TAG_SET, value.items(), alias_key)
+    }
+
+    /// PyYAML's `represent_mapping`, for dicts and sets.
+    fn represent_mapping(
+        &mut self,
+        py: Python,
+        tag: &'static str,
+        items: Bound<'_, PyList>,
+        alias_key: Option<usize>,
+    ) -> PyResult<NodeId> {
+        let node = self.register(
+            alias_key,
+            RepNode::Mapping {
+                tag,
+                value: Vec::new(),
+                flow_style: None,
+            },
+        );
+        let items = self.mapping_items(py, items)?;
+        let mut best_style = true;
+        self.level += 1;
+        for item in items.iter() {
+            let (k, v) = item.extract::<(Bound<'_, PyAny>, Bound<'_, PyAny>)>()?;
+            let key_node = self.represent_data(py, &k)?;
+            let val_node = self.represent_data(py, &v)?;
+            best_style &= self.is_plain_scalar(key_node) && self.is_plain_scalar(val_node);
+            // Added at once, like PyYAML (see `represent_list`).
+            if let RepNode::Mapping { value, .. } = &mut self.nodes[node] {
+                value.push((key_node, val_node));
             }
         }
-        Ok(Arc::new(RepNode::Mapping {
-            tag: crate::TAG_SET.to_string(),
-            value: items,
-            flow_style: Some(false),
-        }))
+        self.level -= 1;
+        let flow = self.choose_flow_style(best_style);
+        if let RepNode::Mapping { flow_style, .. } = &mut self.nodes[node] {
+            *flow_style = flow;
+        }
+        Ok(node)
     }
 
     // ── Helpers ──
 
-    fn make_scalar(&self, tag: &str, value: &str, style: Option<char>) -> Arc<RepNode> {
+    /// PyYAML's `represent_mapping`: the (key, value) items, sorted with
+    /// Python's `sorted` when `sort_keys` is set, or left in order if that
+    /// raises `TypeError` (keys that cannot be compared).
+    fn mapping_items<'py>(
+        &self,
+        py: Python<'py>,
+        items: Bound<'py, PyList>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        if !self.sort_keys {
+            return Ok(items);
+        }
+        match py.import("builtins")?.getattr("sorted")?.call1((&items,)) {
+            Ok(sorted) => Ok(sorted.cast_into::<PyList>()?),
+            Err(e) if e.is_instance_of::<pyo3::exceptions::PyTypeError>(py) => Ok(items),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Add a collection node and record it as `alias_key`'s node before its
+    /// items are represented, like PyYAML's `represent_sequence` and
+    /// `represent_mapping`.
+    fn register(&mut self, alias_key: Option<usize>, node: RepNode) -> NodeId {
+        let id = self.nodes.len();
+        self.nodes.push(node);
+        if let Some(key) = alias_key {
+            self.represented_objects.insert(key, id);
+        }
+        id
+    }
+
+    fn is_plain_scalar(&self, node: NodeId) -> bool {
+        matches!(self.nodes[node], RepNode::Scalar { style: None, .. })
+    }
+
+    fn make_scalar(&mut self, tag: &'static str, value: &str, style: Option<char>) -> NodeId {
+        self.push_scalar(tag, Ok(value.to_string()), style)
+    }
+
+    fn push_scalar(
+        &mut self,
+        tag: &'static str,
+        value: PyResult<String>,
+        style: Option<char>,
+    ) -> NodeId {
         let style = style.or(self.default_style);
-        Arc::new(RepNode::Scalar {
-            tag: tag.to_string(),
-            value: value.to_string(),
-            style,
-        })
+        self.nodes.push(RepNode::Scalar { tag, value, style });
+        self.nodes.len() - 1
     }
 
     fn choose_flow_style(&self, best_style: bool) -> Option<bool> {
@@ -478,38 +658,85 @@ impl RSafeDumper {
             Some(best_style)
         }
     }
-
-    fn is_datetime(py: Python, data: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let datetime_mod = py.import("datetime")?;
-        let datetime_cls = datetime_mod.getattr("datetime")?;
-        data.is_instance(&datetime_cls)
-    }
-
-    fn is_date(py: Python, data: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let datetime_mod = py.import("datetime")?;
-        let date_cls = datetime_mod.getattr("date")?;
-        data.is_instance(&date_cls)
-    }
 }
 
 // ── Serializer ───────────────────────────────────────────────────────────────
 
 impl RSafeDumper {
-    fn serialize(&mut self, py: Python, node: &Arc<RepNode>) -> PyResult<()> {
-        self.emitter
-            .emit(Event::document_start(
-                None,
-                &[],
-                self.document_start_implicit,
-            ))
-            .map_err(|e| exception::emitter_error(py, e))?;
+    /// Emit an event; the emitter writes each flush to the stream (see
+    /// `StreamWriter`).
+    fn emit(&mut self, py: Python, event: Event) -> PyResult<()> {
+        self.emitter.emit(event).map_err(|e| {
+            // A failed write raises the stream's own exception, as in PyYAML.
+            self.emitter
+                .take_write_error()
+                .unwrap_or_else(|| exception::emitter_error(py, e))
+        })
+    }
 
-        self.anchor_node(node);
-        self.serialize_node(py, node)?;
+    /// The `%YAML` and `%TAG` directives for a document, checked when it is
+    /// serialized, as CEmitter does: a truthy `version` gives
+    /// `version[0]`.`version[1]`; a truthy `tags` mapping (at most 128) gives
+    /// each handle and its prefix, which must be str or bytes.
+    fn directives(&self, py: Python) -> PyResult<(Option<VersionDirective>, Vec<TagDirective>)> {
+        let mut version = None;
+        if let Some(use_version) = &self.version {
+            let use_version = use_version.bind(py);
+            if use_version.is_truthy()? {
+                version = Some(VersionDirective {
+                    major: use_version.get_item(0)?.extract()?,
+                    minor: use_version.get_item(1)?.extract()?,
+                });
+            }
+        }
+        let mut tags = Vec::new();
+        if let Some(use_tags) = &self.tags {
+            let use_tags = use_tags.bind(py);
+            if use_tags.is_truthy()? {
+                if use_tags.len()? > 128 {
+                    return Err(pyo3::exceptions::PyValueError::new_err("too many tags"));
+                }
+                for handle in use_tags.try_iter()? {
+                    let handle = handle?;
+                    let prefix = use_tags.get_item(&handle)?;
+                    tags.push(TagDirective {
+                        handle: tag_part(&handle, "handle")?,
+                        prefix: tag_part(&prefix, "prefix")?,
+                    });
+                }
+            }
+        }
+        Ok((version, tags))
+    }
 
-        self.emitter
-            .emit(Event::document_end(self.document_end_implicit))
-            .map_err(|e| exception::emitter_error(py, e))?;
+    fn serialize(&mut self, py: Python, node: NodeId) -> PyResult<()> {
+        // PyYAML represents the data first, then its serializer checks it is
+        // open.
+        match self.closed {
+            -1 => {
+                return Err(exception::serializer_error(
+                    py,
+                    "serializer is not opened".to_string(),
+                ));
+            }
+            1 => {
+                return Err(exception::serializer_error(
+                    py,
+                    "serializer is closed".to_string(),
+                ));
+            }
+            _ => {}
+        }
+        let (version, tags) = self.directives(py)?;
+        self.emit(
+            py,
+            Event::document_start(version, &tags, self.document_start_implicit),
+        )?;
+
+        self.anchor_node(py, node, 0)?;
+        self.serialize_node(py, node, 0)?;
+
+        self.emit(py, Event::document_end(self.document_end_implicit))?;
 
         // Reset serializer state
         self.serialized_nodes.clear();
@@ -518,115 +745,122 @@ impl RSafeDumper {
         Ok(())
     }
 
-    fn anchor_node(&mut self, node: &Arc<RepNode>) {
-        let key = Arc::as_ptr(node) as usize;
-        if let Some(anchor) = self.anchors.get_mut(&key) {
+    fn anchor_node(&mut self, py: Python, node: NodeId, depth: usize) -> PyResult<()> {
+        with_stack(|| self.anchor_node_inner(py, node, depth))
+    }
+
+    fn anchor_node_inner(&mut self, py: Python, node: NodeId, depth: usize) -> PyResult<()> {
+        // Nodes of a document are at most MAX_DEPTH deep, but nodes kept from
+        // a failed document can be reused deeper in a later one.
+        check_depth(depth)?;
+        if let Some(anchor) = self.anchors.get_mut(&node) {
             // Seen before with None → assign anchor name
             if anchor.is_none() {
                 self.last_alias_id += 1;
                 *anchor = Some(format!("id{:03}", self.last_alias_id));
             }
-        } else {
-            self.anchors.insert(key, None);
-            match node.as_ref() {
-                RepNode::Sequence { value, .. } => {
-                    for item in value {
-                        self.anchor_node(item);
-                    }
-                }
-                RepNode::Mapping { value, .. } => {
-                    for (k, v) in value {
-                        self.anchor_node(k);
-                        self.anchor_node(v);
-                    }
-                }
-                RepNode::Scalar { .. } => {}
-            }
-        }
-    }
-
-    fn serialize_node(&mut self, py: Python, node: &Arc<RepNode>) -> PyResult<()> {
-        let key = Arc::as_ptr(node) as usize;
-        let anchor = self.anchors.get(&key).cloned().flatten();
-
-        if self.serialized_nodes.contains(&key) {
-            // Emit alias
-            let anchor_str = anchor.as_deref().unwrap_or("");
-            self.emitter
-                .emit(Event::alias(anchor_str))
-                .map_err(|e| exception::emitter_error(py, e))?;
             return Ok(());
         }
-        self.serialized_nodes.insert(key);
+        self.anchors.insert(node, None);
+        for index in 0.. {
+            match &self.nodes[node] {
+                RepNode::Sequence { value, .. } if index < value.len() => {
+                    let item = value[index];
+                    self.anchor_node(py, item, depth + 1)?;
+                }
+                RepNode::Mapping { value, .. } if index < value.len() => {
+                    let (k, v) = value[index];
+                    self.anchor_node(py, k, depth + 1)?;
+                    self.anchor_node(py, v, depth + 1)?;
+                }
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+
+    fn serialize_node(&mut self, py: Python, node: NodeId, depth: usize) -> PyResult<()> {
+        with_stack(|| self.serialize_node_inner(py, node, depth))
+    }
+
+    fn serialize_node_inner(&mut self, py: Python, node: NodeId, depth: usize) -> PyResult<()> {
+        check_depth(depth)?;
+        let anchor = self.anchors.get(&node).cloned().flatten();
+
+        if self.serialized_nodes.contains(&node) {
+            // Emit alias
+            let anchor_str = anchor.as_deref().unwrap_or("");
+            self.emit(py, Event::alias(anchor_str))?;
+            return Ok(());
+        }
+        self.serialized_nodes.insert(node);
 
         let anchor_ref = anchor.as_deref();
 
-        match node.as_ref() {
+        match &self.nodes[node] {
             RepNode::Scalar { tag, value, style } => {
+                let value = value.as_ref().map_err(|e| e.clone_ref(py))?;
                 let detected_tag = resolver::resolve_scalar_tag(value, true);
                 let default_tag = resolver::resolve_scalar_tag(value, false);
-                let plain_implicit = tag == detected_tag;
-                let quoted_implicit = tag == default_tag;
+                let plain_implicit = *tag == detected_tag;
+                let quoted_implicit = *tag == default_tag;
                 let scalar_style = char_to_scalar_style(*style);
 
-                self.emitter
-                    .emit(Event::scalar(
-                        anchor_ref,
-                        Some(tag),
-                        value,
-                        plain_implicit,
-                        quoted_implicit,
-                        scalar_style,
-                    ))
-                    .map_err(|e| exception::emitter_error(py, e))?;
+                let event = Event::scalar(
+                    anchor_ref,
+                    Some(tag),
+                    value,
+                    plain_implicit,
+                    quoted_implicit,
+                    scalar_style,
+                );
+                self.emit(py, event)?;
             }
             RepNode::Sequence {
-                tag,
-                value,
-                flow_style,
+                tag, flow_style, ..
             } => {
-                let implicit = tag == resolver::DEFAULT_SEQUENCE_TAG;
-                let style = match flow_style {
-                    Some(true) => SequenceStyle::Flow,
-                    Some(false) => SequenceStyle::Block,
-                    None => SequenceStyle::Any,
+                let implicit = *tag == resolver::DEFAULT_SEQUENCE_TAG;
+                // CEmitter: flow if node.flow_style is true, else block.
+                let style = if *flow_style == Some(true) {
+                    SequenceStyle::Flow
+                } else {
+                    SequenceStyle::Block
                 };
-                self.emitter
-                    .emit(Event::sequence_start(
-                        anchor_ref,
-                        Some(tag),
-                        implicit,
-                        style,
-                    ))
-                    .map_err(|e| exception::emitter_error(py, e))?;
-                for item in value {
-                    self.serialize_node(py, item)?;
+                let event = Event::sequence_start(anchor_ref, Some(tag), implicit, style);
+                self.emit(py, event)?;
+                for index in 0.. {
+                    let RepNode::Sequence { value, .. } = &self.nodes[node] else {
+                        unreachable!()
+                    };
+                    let Some(&item) = value.get(index) else {
+                        break;
+                    };
+                    self.serialize_node(py, item, depth + 1)?;
                 }
-                self.emitter
-                    .emit(Event::sequence_end())
-                    .map_err(|e| exception::emitter_error(py, e))?;
+                self.emit(py, Event::sequence_end())?;
             }
             RepNode::Mapping {
-                tag,
-                value,
-                flow_style,
+                tag, flow_style, ..
             } => {
-                let implicit = tag == resolver::DEFAULT_MAPPING_TAG;
-                let style = match flow_style {
-                    Some(true) => MappingStyle::Flow,
-                    Some(false) => MappingStyle::Block,
-                    None => MappingStyle::Any,
+                let implicit = *tag == resolver::DEFAULT_MAPPING_TAG;
+                let style = if *flow_style == Some(true) {
+                    MappingStyle::Flow
+                } else {
+                    MappingStyle::Block
                 };
-                self.emitter
-                    .emit(Event::mapping_start(anchor_ref, Some(tag), implicit, style))
-                    .map_err(|e| exception::emitter_error(py, e))?;
-                for (k, v) in value {
-                    self.serialize_node(py, k)?;
-                    self.serialize_node(py, v)?;
+                let event = Event::mapping_start(anchor_ref, Some(tag), implicit, style);
+                self.emit(py, event)?;
+                for index in 0.. {
+                    let RepNode::Mapping { value, .. } = &self.nodes[node] else {
+                        unreachable!()
+                    };
+                    let Some(&(k, v)) = value.get(index) else {
+                        break;
+                    };
+                    self.serialize_node(py, k, depth + 1)?;
+                    self.serialize_node(py, v, depth + 1)?;
                 }
-                self.emitter
-                    .emit(Event::mapping_end())
-                    .map_err(|e| exception::emitter_error(py, e))?;
+                self.emit(py, Event::mapping_end())?;
             }
         }
         Ok(())
@@ -635,8 +869,68 @@ impl RSafeDumper {
 
 // ── Free helpers ─────────────────────────────────────────────────────────────
 
-fn is_plain_scalar(node: &Arc<RepNode>) -> bool {
-    matches!(node.as_ref(), RepNode::Scalar { style: None, .. })
+static DATE_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static DATETIME_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+
+/// A tag handle or prefix: CEmitter takes exactly a str (encoded as UTF-8)
+/// or bytes.
+fn tag_part(value: &Bound<'_, PyAny>, what: &str) -> PyResult<String> {
+    if value.is_exact_instance_of::<PyString>() {
+        return value.extract();
+    }
+    if value.is_exact_instance_of::<PyBytes>() {
+        return Ok(std::str::from_utf8(value.cast::<PyBytes>()?.as_bytes())?.to_owned());
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "tag {what} must be a string"
+    )))
+}
+
+/// An option CEmitter passes to libyaml as a C int: like `int(value)` for
+/// numbers (floats and decimals truncate), but str and bytes are refused.
+struct CInt(i32);
+
+impl<'py> FromPyObject<'py> for CInt {
+    fn extract_bound(value: &Bound<'py, PyAny>) -> PyResult<Self> {
+        let ty = value.get_type();
+        if !ty.hasattr("__index__")? && !ty.hasattr("__int__")? {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "an integer is required",
+            ));
+        }
+        let int = value.py().get_type::<PyInt>().call1((value,))?;
+        Ok(CInt(int.extract()?))
+    }
+}
+
+/// A PyYAML option used for its truthiness (`if canonical:`).
+struct Truthy(bool);
+
+impl<'py> FromPyObject<'py> for Truthy {
+    fn extract_bound(value: &Bound<'py, PyAny>) -> PyResult<Self> {
+        Ok(Truthy(value.is_truthy()?))
+    }
+}
+
+/// A `default_style` PyYAML keeps on scalar nodes but CEmitter writes plain.
+const OTHER_STYLE: char = '\0';
+
+/// `datetime.date` or `datetime.datetime`.
+fn datetime_type<'py>(py: Python<'py>, name: &str) -> PyResult<&'py Bound<'py, PyType>> {
+    let cache = if name == "date" {
+        &DATE_TYPE
+    } else {
+        &DATETIME_TYPE
+    };
+    Ok(cache
+        .get_or_try_init(py, || -> PyResult<_> {
+            Ok(py
+                .import("datetime")?
+                .getattr(name)?
+                .cast_into::<PyType>()?
+                .unbind())
+        })?
+        .bind(py))
 }
 
 fn char_to_scalar_style(style: Option<char>) -> ScalarStyle {
@@ -650,74 +944,19 @@ fn char_to_scalar_style(style: Option<char>) -> ScalarStyle {
     }
 }
 
-/// Format a float matching pyyaml's SafeRepresenter.represent_float
-fn format_float(f: f64) -> String {
-    if f.is_nan() {
-        return ".nan".to_string();
-    }
-    if f.is_infinite() {
-        return if f.is_sign_positive() {
-            ".inf"
-        } else {
-            "-.inf"
-        }
-        .to_string();
-    }
-    // Use Python's repr-like formatting
-    let mut value = format!("{}", f);
-    // Ensure lower case for scientific notation
-    value = value.to_lowercase();
-    // If there's no decimal point but there's an 'e', add '.0' before it
-    if !value.contains('.') && value.contains('e') {
-        value = value.replacen('e', ".0e", 1);
-    }
-    // If there's no decimal point and no 'e', it's an integer-looking float
-    // Python repr would show e.g. "1.0", but Rust format! shows "1" for 1.0f64
-    // Actually Rust shows "1" only for integers; for f64 it shows e.g. "1.5"
-    // But for whole numbers like 1.0, Rust shows "1" with {} formatter
-    if !value.contains('.') && !value.contains('e') {
-        value.push_str(".0");
-    }
-    value
-}
-
-/// Try to sort (key, value) pairs by key. Silently fails on TypeError (matching pyyaml).
-fn try_sort_pairs(py: Python, pairs: &mut [(Py<PyAny>, Py<PyAny>)]) -> PyResult<()> {
-    // Use Python's comparison to sort keys
-    pairs.sort_by(|a, b| {
-        a.0.bind(py)
-            .lt(b.0.bind(py))
-            .and_then(|lt| {
-                if lt {
-                    Ok(std::cmp::Ordering::Less)
-                } else {
-                    a.0.bind(py).gt(b.0.bind(py)).map(|gt| {
-                        if gt {
-                            std::cmp::Ordering::Greater
-                        } else {
-                            std::cmp::Ordering::Equal
-                        }
-                    })
-                }
-            })
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    Ok(())
-}
-
 // ── Fast-path for dumps() ────────────────────────────────────────────────────
 
 /// Dump a Python object to a YAML string, bypassing the pyyaml stream protocol.
 pub fn dumps_to_string(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<String> {
     let mut ew = EmitterWrapper::new();
-    ew.configure(Encoding::Utf8);
+    ew.configure(Encoding::Utf8, None, true);
 
     let mut dumper = RSafeDumper {
         emitter: ew,
-        stream: py.None(),
-        dump_unicode: true,
-        closed: -1,
+        closed: 0,
         document_start_implicit: true,
+        version: None,
+        tags: None,
         document_end_implicit: true,
         serialized_nodes: HashSet::new(),
         anchors: HashMap::new(),
@@ -726,7 +965,9 @@ pub fn dumps_to_string(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<String> {
         default_flow_style: Some(false),
         sort_keys: false,
         represented_objects: HashMap::new(),
+        nodes: Vec::new(),
         object_keeper: Vec::new(),
+        level: 0,
     };
 
     dumper
@@ -735,7 +976,7 @@ pub fn dumps_to_string(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<String> {
         .map_err(|e| exception::emitter_error(py, e))?;
 
     let node = dumper.represent_data(py, obj)?;
-    dumper.serialize(py, &node)?;
+    dumper.serialize(py, node)?;
 
     dumper
         .emitter
