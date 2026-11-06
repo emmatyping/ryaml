@@ -311,11 +311,18 @@ const MAX_DEPTH: usize = 500;
 /// current one is nearly used up, so `MAX_DEPTH` holds whatever the thread's
 /// stack size (musl gives threads 128 KB, for example). A level needs about
 /// half a kilobyte, plus whatever Python calls it makes (comparing keys,
-/// formatting dates), well within the red zone.
-fn with_stack<T>(f: impl FnOnce() -> T) -> T {
+/// formatting dates), well within the red zone even for the levels between
+/// checks: checking the stack costs about as much as a scalar's level, so it
+/// is checked only every `STACK_CHECK_LEVELS` levels.
+fn with_stack<T>(depth: usize, f: impl FnOnce() -> T) -> T {
     const RED_ZONE: usize = 64 * 1024;
     const SEGMENT: usize = 1024 * 1024;
-    stacker::maybe_grow(RED_ZONE, SEGMENT, f)
+    const STACK_CHECK_LEVELS: usize = 8;
+    if depth.is_multiple_of(STACK_CHECK_LEVELS) {
+        stacker::maybe_grow(RED_ZONE, SEGMENT, f)
+    } else {
+        f()
+    }
 }
 
 fn check_depth(depth: usize) -> PyResult<()> {
@@ -496,7 +503,7 @@ impl RSafeDumper {
     }
 
     fn represent_data(&mut self, py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
-        with_stack(|| self.represent_data_inner(py, data))
+        with_stack(self.level, || self.represent_data_inner(py, data))
     }
 
     fn represent_data_inner(&mut self, py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
@@ -920,7 +927,7 @@ impl RSafeDumper {
     }
 
     fn anchor_node(&mut self, py: Python, node: NodeId, depth: usize) -> PyResult<()> {
-        with_stack(|| self.anchor_node_inner(py, node, depth))
+        with_stack(depth, || self.anchor_node_inner(py, node, depth))
     }
 
     fn anchor_node_inner(&mut self, py: Python, node: NodeId, depth: usize) -> PyResult<()> {
@@ -955,7 +962,7 @@ impl RSafeDumper {
     }
 
     fn serialize_node(&mut self, py: Python, node: NodeId, depth: usize) -> PyResult<()> {
-        with_stack(|| self.serialize_node_inner(py, node, depth))
+        with_stack(depth, || self.serialize_node_inner(py, node, depth))
     }
 
     fn serialize_node_inner(&mut self, py: Python, node: NodeId, depth: usize) -> PyResult<()> {
