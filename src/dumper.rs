@@ -49,6 +49,8 @@ type NodeId = usize;
 enum ScalarText {
     Static(&'static str),
     Owned(String),
+    /// Short text (a number) stored in the node, saving an allocation.
+    Inline(InlineText),
     /// A `str`, encoded as UTF-8 only when the scalar is written: like
     /// PyYAML's emitter, which raises the error for a lone surrogate then,
     /// after the whole document is represented. Its UTF-8 is cached in the
@@ -73,6 +75,7 @@ impl ScalarText {
         match self {
             ScalarText::Static(text) => Ok(text),
             ScalarText::Owned(text) => Ok(text),
+            ScalarText::Inline(text) => Ok(text.as_str()),
             ScalarText::Str(text) => {
                 let mut size: pyo3::ffi::Py_ssize_t = 0;
                 // SAFETY: `text` is a str; with the GIL held, this returns its
@@ -91,6 +94,37 @@ impl ScalarText {
                 })
             }
         }
+    }
+}
+
+/// Up to `InlineText::CAPACITY` bytes of ASCII text, kept in place.
+#[derive(Clone, Copy, Debug)]
+struct InlineText {
+    len: u8,
+    bytes: [u8; InlineText::CAPACITY],
+}
+
+impl InlineText {
+    /// Enough for any formatted i64 or float, and small enough that a
+    /// `ScalarText` is no bigger than with just a `String`.
+    const CAPACITY: usize = 30;
+
+    fn new() -> Self {
+        Self {
+            len: 0,
+            bytes: [0; Self::CAPACITY],
+        }
+    }
+
+    fn push_str(&mut self, text: &str) {
+        let start = usize::from(self.len);
+        self.bytes[start..start + text.len()].copy_from_slice(text.as_bytes());
+        self.len += text.len() as u8;
+    }
+
+    fn as_str(&self) -> &str {
+        // Only ASCII is pushed, from `&str`s.
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)]).expect("ASCII text")
     }
 }
 
@@ -534,15 +568,19 @@ impl RSafeDumper {
     fn represent_int(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         // str(data); ints that fit in an i64 are formatted here.
         let value = match data.extract::<i64>() {
-            Ok(value) => value.to_string(),
-            Err(_) => data.str()?.to_string(),
+            Ok(value) => {
+                let mut text = InlineText::new();
+                text.push_str(itoa::Buffer::new().format(value));
+                ScalarText::Inline(text)
+            }
+            Err(_) => ScalarText::Owned(data.str()?.to_string()),
         };
-        Ok(self.make_scalar(Tag::Int, value, None))
+        Ok(self.push_scalar(Tag::Int, value, None))
     }
 
     fn represent_float(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
         let value = yaml_float(data.extract::<f64>()?);
-        Ok(self.make_scalar(Tag::Float, value, None))
+        Ok(self.push_scalar(Tag::Float, value, None))
     }
 
     fn represent_str(&mut self, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
@@ -1021,105 +1059,63 @@ impl RSafeDumper {
 static DATE_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static DATETIME_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 
-/// Whether `value` (whose shortest digits, in `sci` as written by `{:e}`,
-/// end in an odd digit) may lie exactly halfway between that string and the
-/// one with the last digit one lower or higher: only then can its exact
-/// rounding differ. A halfway value parses back from the midpoint string (the
-/// digits followed by 5), which is much cheaper than exact formatting.
-fn may_be_halfway(sci: &str, mantissa_end: usize, value: f64) -> bool {
-    let (mantissa, exponent) = (&sci[..mantissa_end], &sci[mantissa_end..]);
-    let (last, head) = (
-        mantissa.as_bytes()[mantissa.len() - 1],
-        &mantissa[..mantissa.len() - 1],
-    );
-    let point = if mantissa.contains('.') { "" } else { "." };
-    let lower = format!("{head}{}{point}5{exponent}", char::from(last - 1));
-    let upper = format!("{mantissa}{point}5{exponent}");
-    let value = value.abs();
-    lower.parse::<f64>() == Ok(value) || upper.parse::<f64>() == Ok(value)
-}
-
 /// PyYAML's `represent_float`: `.nan`, `.inf`, `-.inf`, or `repr(value)`
 /// lowercased, with `.0` added before an exponent when there is no decimal
 /// point (`1e+17` becomes `1.0e+17`).
-fn yaml_float(value: f64) -> String {
+fn yaml_float(value: f64) -> ScalarText {
     if value.is_nan() {
-        return ".nan".to_string();
+        return ScalarText::Static(".nan");
     }
     if value.is_infinite() {
-        return if value > 0.0 { ".inf" } else { "-.inf" }.to_string();
+        return ScalarText::Static(if value > 0.0 { ".inf" } else { "-.inf" });
     }
-    let mut out = String::with_capacity(24);
-    write_python_float_repr(value, &mut out);
-    if !out.contains('.')
-        && let Some(e) = out.find('e')
-    {
-        out.insert_str(e, ".0");
-    }
-    out
+    let mut text = InlineText::new();
+    write_yaml_float(zmij::Buffer::new().format_finite(value), &mut text);
+    ScalarText::Inline(text)
 }
 
-/// Python's `repr(float)` for a finite value (CPython's `format_float_short`
-/// in mode 'r'): the shortest digits that round-trip, in fixed notation when
-/// the decimal point falls within -4 < decpt <= 16 (with ".0" added when there
-/// is no fractional part), otherwise as d.ddde+XX with at least two exponent
-/// digits. Rust's `{:e}` gives the same shortest digits.
-fn write_python_float_repr(value: f64, out: &mut String) {
-    use std::fmt::Write as _;
-    let mut sci = String::with_capacity(24);
-    write!(sci, "{:e}", value.abs()).expect("formatting into a String");
-    // When two shortest strings are equally close (the value is exactly
-    // halfway), Python picks the one with an even last digit; Rust's shortest
-    // formatting may pick the odd one. Exact formatting to as many digits
-    // rounds halfway cases to even, so use it when it still round-trips.
-    let mantissa_end = sci.find('e').expect("{:e} has an exponent");
-    if sci.as_bytes()[mantissa_end - 1] % 2 == 1 && may_be_halfway(&sci, mantissa_end, value) {
-        let digits = sci[..mantissa_end].replace('.', "").len();
-        let mut even = String::with_capacity(24);
-        write!(even, "{:.*e}", digits - 1, value.abs()).expect("formatting into a String");
-        if even.parse::<f64>() == Ok(value.abs()) {
-            sci = even;
+/// Rewrite zmij's output for a finite float in PyYAML's notation. zmij picks
+/// the same digits as Python's `repr(float)` (the shortest that round-trip,
+/// the closest to the value, ties to even), and writes them the same way
+/// except that it uses fixed notation for a decimal exponent of -5 (Python
+/// starts at -4) and does not pad the exponent to two digits.
+fn write_yaml_float(zmij: &str, out: &mut InlineText) {
+    let unsigned = match zmij.strip_prefix('-') {
+        Some(unsigned) => {
+            out.push_str("-");
+            unsigned
         }
-    }
-    let (mantissa, exponent) = sci.split_once('e').expect("{:e} has an exponent");
-    let exponent: i32 = exponent.parse().expect("{:e} exponent is an integer");
-    let (first, rest) = mantissa.split_at(1);
-    let rest = rest.strip_prefix('.').unwrap_or("");
-    let digits_len = 1 + rest.len() as i32;
-    // The decimal point comes after `decpt` digits.
-    let decpt = exponent + 1;
-    if value.is_sign_negative() {
-        out.push('-');
-    }
-    if decpt <= -4 || decpt > 16 {
+        None => zmij,
+    };
+    let (mantissa, exponent) = if let Some((mantissa, exponent)) = unsigned.split_once('e') {
+        (mantissa, exponent)
+    } else if let Some(digits) = unsigned.strip_prefix("0.0000") {
+        // 0.0000ddd is d.dde-05 in Python.
+        let (first, rest) = digits.split_at(1);
         out.push_str(first);
         if !rest.is_empty() {
-            out.push('.');
+            out.push_str(".");
             out.push_str(rest);
+        } else {
+            out.push_str(".0");
         }
-        write!(
-            out,
-            "e{}{:02}",
-            if exponent < 0 { '-' } else { '+' },
-            exponent.abs()
-        )
-        .expect("formatting into a String");
-    } else if decpt <= 0 {
-        out.push_str("0.");
-        out.extend(std::iter::repeat_n('0', (-decpt) as usize));
-        out.push_str(first);
-        out.push_str(rest);
-    } else if decpt < digits_len {
-        let digits = [first, rest].concat();
-        out.push_str(&digits[..decpt as usize]);
-        out.push('.');
-        out.push_str(&digits[decpt as usize..]);
+        out.push_str("e-05");
+        return;
     } else {
-        out.push_str(first);
-        out.push_str(rest);
-        out.extend(std::iter::repeat_n('0', (decpt - digits_len) as usize));
+        out.push_str(unsigned);
+        return;
+    };
+    out.push_str(mantissa);
+    if !mantissa.contains('.') {
         out.push_str(".0");
     }
+    let (sign, digits) = exponent.split_at(1);
+    out.push_str("e");
+    out.push_str(sign);
+    if digits.len() == 1 {
+        out.push_str("0");
+    }
+    out.push_str(digits);
 }
 
 /// A tag handle or prefix: CEmitter takes exactly a str (encoded as UTF-8)

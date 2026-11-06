@@ -77,6 +77,7 @@ def test_encodings_like_pyyaml(reference, encoding):
 @pytest.mark.parametrize("value", [
     1e16, 1e17, 123456789012345678.0, 1.5e300, 1e-4, 1e-5, 0.0001234, 5e-324,
     1.7976931348623157e308, -0.0, 0.1, 1.0, -2.5e-07, 1e22, 9999999999999998.0,
+    1.5e-05, -0.00012, 1e100, 1.25e-100, 123456.0,
     # Exactly halfway between two shortest strings: Python picks the even one.
     -1113178120592002.2, -233891771783429.62, 1125899906842624.5, 4503599627370495.5,
 ])
