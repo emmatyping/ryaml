@@ -220,20 +220,59 @@ def _dump_outcome(dumper, value):
         return type(e).__name__
 
 
-@pytest.mark.skipif(not hasattr(yaml, "CSafeDumper"), reason="PyYAML was built without LibYAML")
+# ryaml's dumper recurses natively, up to a fixed depth on every Python
+# version (PyYAML's limit depends on the recursion limit and the caller's stack).
+MAX_DEPTH = 500
+
+
 @pytest.mark.parametrize("kind", ["list", "dict"])
 @pytest.mark.parametrize("leaf", ["x", [], object()], ids=["scalar", "empty", "unrepresentable"])
-def test_deep_nesting_fails_where_pyyaml_does(kind, leaf):
-    # PyYAML's representer is recursive Python (three frames per level), so it
-    # raises RecursionError past a depth set by the recursion limit and the
-    # caller's stack. Both dumpers are called from the same place here.
-    outcomes = {
-        depth: (_dump_outcome(yaml.CSafeDumper, _nested(depth, leaf, kind)),
-                _dump_outcome(ryaml.RSafeDumper, _nested(depth, leaf, kind)))
-        for depth in range(250, 340)
-    }
-    assert {d: r for d, (r, _) in outcomes.items()} == {d: a for d, (_, a) in outcomes.items()}
-    assert {r for r, _ in outcomes.values()} >= {"RecursionError"}
+@pytest.mark.parametrize("recursion_limit", [100, 1000, 100_000])
+def test_deep_nesting_limit_is_fixed(kind, leaf, recursion_limit):
+    import sys
+    old_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(recursion_limit)
+    try:
+        within = _dump_outcome(ryaml.RSafeDumper, _nested(MAX_DEPTH, leaf, kind))
+        beyond = _dump_outcome(ryaml.RSafeDumper, _nested(MAX_DEPTH + 1, leaf, kind))
+        with pytest.raises(RecursionError):
+            ryaml.dumps(_nested(MAX_DEPTH + 1, leaf, kind))
+    finally:
+        sys.setrecursionlimit(old_limit)
+    assert within == ("RepresenterError" if leaf.__class__ is object else "ok")
+    assert beyond == "RecursionError"
+
+
+@pytest.mark.skipif(not hasattr(yaml, "CSafeDumper"), reason="PyYAML was built without LibYAML")
+@pytest.mark.parametrize("kind", ["list", "dict"])
+def test_deep_nesting_like_pyyaml_within_both_limits(kind):
+    # Where PyYAML can dump the data, ryaml writes the same output.
+    value = _nested(250, "x", kind)
+    assert yaml.dump(value, Dumper=ryaml.RSafeDumper) == yaml.dump(value, Dumper=yaml.CSafeDumper)
+
+
+@pytest.mark.parametrize("kind", ["list", "dict"])
+def test_deep_nesting_in_a_thread_with_a_small_stack(kind):
+    # The limit holds whatever the thread's stack size (musl gives threads
+    # 128 KB): the dumper grows its stack instead of overflowing it.
+    import threading
+    results = []
+
+    def dump():
+        try:
+            results.append(ryaml.dumps(_nested(MAX_DEPTH, "x", kind)).count("x"))
+            ryaml.dumps(_nested(MAX_DEPTH + 1, "x", kind))
+        except RecursionError:
+            results.append("RecursionError")
+
+    old_size = threading.stack_size(128 * 1024)
+    try:
+        thread = threading.Thread(target=dump)
+        thread.start()
+        thread.join()
+    finally:
+        threading.stack_size(old_size)
+    assert results == [1, "RecursionError"]
 
 
 def test_very_deep_nesting_raises_instead_of_crashing():

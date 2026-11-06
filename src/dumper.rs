@@ -188,81 +188,35 @@ pub struct RSafeDumper {
     nodes: Vec<RepNode>,
     object_keeper: Vec<Py<PyAny>>,
     /// Nesting depth of the value being represented (the root is 0).
-    level: isize,
-    budget: RecursionBudget,
+    level: usize,
 }
 
-/// The deepest levels at which PyYAML's pure-Python representer still fits in
-/// the recursion limit, so ryaml raises `RecursionError` where it would.
-///
-/// Called with `P` Python frames on the stack (up to `dump_all`'s), PyYAML's
-/// `represent` runs at frame `P + 1` and `represent_data` for a value at level
-/// `d` at `P + 2 + 3d`: each level adds `represent_data`, the type's
-/// representer and `represent_sequence`/`represent_mapping`. Every value first
-/// calls `ignore_aliases` (frame `P + 3 + 3d`), as do aliases and refused
-/// values (`represent_undefined`); a represented value reaches its node's
-/// `__init__` at `P + 5 + 3d`. Python raises once a frame passes the limit.
-#[derive(Clone, Copy, Debug)]
-struct RecursionBudget {
-    /// Deepest level reaching `P + 3 + 3d`.
-    max_seen_level: isize,
-    /// Deepest level reaching `P + 5 + 3d`.
-    max_node_level: isize,
+/// The deepest nesting ryaml represents and serializes; deeper data raises
+/// `RecursionError`. The recursion is native and grows its stack as needed
+/// (`with_stack`), so the limit is the same on every platform and Python
+/// version. It is deeper than PyYAML goes with the default recursion limit
+/// (about 330 levels, as its representer is recursive Python, three frames
+/// per level).
+const MAX_DEPTH: usize = 500;
+
+/// Run one level of the dumper's recursion, on a new stack segment if the
+/// current one is nearly used up, so `MAX_DEPTH` holds whatever the thread's
+/// stack size (musl gives threads 128 KB, for example). A level needs about
+/// half a kilobyte, plus whatever Python calls it makes (comparing keys,
+/// formatting dates), well within the red zone.
+fn with_stack<T>(f: impl FnOnce() -> T) -> T {
+    const RED_ZONE: usize = 64 * 1024;
+    const SEGMENT: usize = 1024 * 1024;
+    stacker::maybe_grow(RED_ZONE, SEGMENT, f)
 }
 
-impl RecursionBudget {
-    const UNLIMITED: Self = Self {
-        max_seen_level: isize::MAX,
-        max_node_level: isize::MAX,
-    };
-
-    /// The budget for a representer called from the current Python frame,
-    /// plus `extra_frames` frames PyYAML would have on top of it.
-    fn current(py: Python, extra_frames: isize) -> PyResult<Self> {
-        let mut frames = extra_frames;
-        let mut frame = py.import("sys")?.call_method1("_getframe", (0,))?;
-        while !frame.is_none() {
-            frames += 1;
-            frame = frame.getattr("f_back")?;
-        }
-        let limit = py
-            .import("sys")?
-            .call_method0("getrecursionlimit")?
-            .extract::<isize>()?;
-        Ok(Self {
-            max_seen_level: (limit - frames - 3).div_euclid(3),
-            max_node_level: (limit - frames - 5).div_euclid(3),
-        })
+fn check_depth(depth: usize) -> PyResult<()> {
+    if depth > MAX_DEPTH {
+        return Err(pyo3::exceptions::PyRecursionError::new_err(
+            "maximum recursion depth exceeded while representing an object",
+        ));
     }
-}
-
-fn recursion_error() -> PyErr {
-    pyo3::exceptions::PyRecursionError::new_err("maximum recursion depth exceeded")
-}
-
-/// Guards one level of native recursion with Python's own check, so very deep
-/// data raises `RecursionError` instead of overflowing the native stack.
-struct RecursionGuard;
-
-impl RecursionGuard {
-    fn enter(py: Python) -> PyResult<Self> {
-        // SAFETY: called with the GIL held; the guard calls
-        // Py_LeaveRecursiveCall exactly once when dropped.
-        if unsafe { pyo3::ffi::Py_EnterRecursiveCall(c" while representing an object".as_ptr()) }
-            != 0
-        {
-            return Err(PyErr::fetch(py));
-        }
-        Ok(RecursionGuard)
-    }
-}
-
-impl Drop for RecursionGuard {
-    fn drop(&mut self) {
-        // SAFETY: paired with the successful Py_EnterRecursiveCall in `enter`,
-        // still holding the GIL.
-        unsafe { pyo3::ffi::Py_LeaveRecursiveCall() }
-    }
+    Ok(())
 }
 
 #[pymethods]
@@ -366,7 +320,6 @@ impl RSafeDumper {
             nodes: Vec::new(),
             object_keeper: Vec::new(),
             level: 0,
-            budget: RecursionBudget::UNLIMITED,
         })
     }
 
@@ -388,8 +341,6 @@ impl RSafeDumper {
     }
 
     fn represent(&mut self, py: Python, data: Py<PyAny>) -> PyResult<()> {
-        // Called from PyYAML's dump_all, whose frame is the current one.
-        self.budget = RecursionBudget::current(py, 0)?;
         self.level = 0;
         let node = self.represent_data(py, data.bind(py))?;
         self.serialize(py, node)?;
@@ -433,10 +384,11 @@ impl RSafeDumper {
     }
 
     fn represent_data(&mut self, py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
-        let _guard = RecursionGuard::enter(py)?;
-        if self.level > self.budget.max_seen_level {
-            return Err(recursion_error());
-        }
+        with_stack(|| self.represent_data_inner(py, data))
+    }
+
+    fn represent_data_inner(&mut self, py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
+        check_depth(self.level)?;
         // Alias tracking. Collections register their node before representing
         // their items (see `register`), so recursive data finds it here.
         let alias_key = if self.ignore_aliases(py, data) {
@@ -453,9 +405,6 @@ impl RSafeDumper {
         // SafeRepresenter dispatches on the exact type only (it registers no
         // multi-representers), so subclasses and other types are refused.
         let ty = data.get_type();
-        if self.level > self.budget.max_node_level && is_represented_type(py, &ty)? {
-            return Err(recursion_error());
-        }
         let node = if data.is_none() {
             self.represent_none()
         } else if ty.is(py.get_type::<PyBool>()) {
@@ -784,8 +733,8 @@ impl RSafeDumper {
             Event::document_start(version, &tags, self.document_start_implicit),
         )?;
 
-        self.anchor_node(py, node)?;
-        self.serialize_node(py, node)?;
+        self.anchor_node(py, node, 0)?;
+        self.serialize_node(py, node, 0)?;
 
         self.emit(py, Event::document_end(self.document_end_implicit))?;
 
@@ -796,8 +745,14 @@ impl RSafeDumper {
         Ok(())
     }
 
-    fn anchor_node(&mut self, py: Python, node: NodeId) -> PyResult<()> {
-        let _guard = RecursionGuard::enter(py)?;
+    fn anchor_node(&mut self, py: Python, node: NodeId, depth: usize) -> PyResult<()> {
+        with_stack(|| self.anchor_node_inner(py, node, depth))
+    }
+
+    fn anchor_node_inner(&mut self, py: Python, node: NodeId, depth: usize) -> PyResult<()> {
+        // Nodes of a document are at most MAX_DEPTH deep, but nodes kept from
+        // a failed document can be reused deeper in a later one.
+        check_depth(depth)?;
         if let Some(anchor) = self.anchors.get_mut(&node) {
             // Seen before with None → assign anchor name
             if anchor.is_none() {
@@ -811,12 +766,12 @@ impl RSafeDumper {
             match &self.nodes[node] {
                 RepNode::Sequence { value, .. } if index < value.len() => {
                     let item = value[index];
-                    self.anchor_node(py, item)?;
+                    self.anchor_node(py, item, depth + 1)?;
                 }
                 RepNode::Mapping { value, .. } if index < value.len() => {
                     let (k, v) = value[index];
-                    self.anchor_node(py, k)?;
-                    self.anchor_node(py, v)?;
+                    self.anchor_node(py, k, depth + 1)?;
+                    self.anchor_node(py, v, depth + 1)?;
                 }
                 _ => break,
             }
@@ -824,8 +779,12 @@ impl RSafeDumper {
         Ok(())
     }
 
-    fn serialize_node(&mut self, py: Python, node: NodeId) -> PyResult<()> {
-        let _guard = RecursionGuard::enter(py)?;
+    fn serialize_node(&mut self, py: Python, node: NodeId, depth: usize) -> PyResult<()> {
+        with_stack(|| self.serialize_node_inner(py, node, depth))
+    }
+
+    fn serialize_node_inner(&mut self, py: Python, node: NodeId, depth: usize) -> PyResult<()> {
+        check_depth(depth)?;
         let anchor = self.anchors.get(&node).cloned().flatten();
 
         if self.serialized_nodes.contains(&node) {
@@ -876,7 +835,7 @@ impl RSafeDumper {
                     let Some(&item) = value.get(index) else {
                         break;
                     };
-                    self.serialize_node(py, item)?;
+                    self.serialize_node(py, item, depth + 1)?;
                 }
                 self.emit(py, Event::sequence_end())?;
             }
@@ -898,8 +857,8 @@ impl RSafeDumper {
                     let Some(&(k, v)) = value.get(index) else {
                         break;
                     };
-                    self.serialize_node(py, k)?;
-                    self.serialize_node(py, v)?;
+                    self.serialize_node(py, k, depth + 1)?;
+                    self.serialize_node(py, v, depth + 1)?;
                 }
                 self.emit(py, Event::mapping_end())?;
             }
@@ -956,22 +915,6 @@ impl<'py> FromPyObject<'py> for Truthy {
 /// A `default_style` PyYAML keeps on scalar nodes but CEmitter writes plain.
 const OTHER_STYLE: char = '\0';
 
-/// Whether SafeRepresenter has a representer for exactly this type.
-fn is_represented_type(py: Python, ty: &Bound<'_, PyType>) -> PyResult<bool> {
-    Ok(ty.is(py.None().bind(py).get_type())
-        || ty.is(py.get_type::<PyBool>())
-        || ty.is(py.get_type::<PyInt>())
-        || ty.is(py.get_type::<PyFloat>())
-        || ty.is(py.get_type::<PyString>())
-        || ty.is(py.get_type::<PyBytes>())
-        || ty.is(py.get_type::<PyList>())
-        || ty.is(py.get_type::<PyTuple>())
-        || ty.is(py.get_type::<PyDict>())
-        || ty.is(py.get_type::<PySet>())
-        || ty.is(datetime_type(py, "date")?)
-        || ty.is(datetime_type(py, "datetime")?))
-}
-
 /// `datetime.date` or `datetime.datetime`.
 fn datetime_type<'py>(py: Python<'py>, name: &str) -> PyResult<&'py Bound<'py, PyType>> {
     let cache = if name == "date" {
@@ -1025,7 +968,6 @@ pub fn dumps_to_string(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<String> {
         nodes: Vec::new(),
         object_keeper: Vec::new(),
         level: 0,
-        budget: RecursionBudget::UNLIMITED,
     };
 
     dumper
@@ -1033,8 +975,6 @@ pub fn dumps_to_string(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<String> {
         .emit(Event::stream_start(Encoding::Utf8))
         .map_err(|e| exception::emitter_error(py, e))?;
 
-    // As if through yaml.dump, which adds dump's and dump_all's frames.
-    dumper.budget = RecursionBudget::current(py, 2)?;
     let node = dumper.represent_data(py, obj)?;
     dumper.serialize(py, node)?;
 
