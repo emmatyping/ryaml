@@ -17,11 +17,13 @@ _TIMESTAMP = re.compile(
 
 def timestamp(value: str) -> datetime.date | datetime.datetime:
     # Explicit tags use this pattern too, including single-digit months/days.
-    # Like PyYAML, malformed explicitly tagged timestamps raise AttributeError;
-    # invalid calendar fields are rejected by datetime with ValueError.
-    year, month, day, hour, minute, second, fraction, zone, sign, zh, zm = (
-        _TIMESTAMP.match(value).groups()
-    )
+    # Like PyYAML, which calls match.groupdict(), malformed explicitly tagged
+    # timestamps raise AttributeError; invalid calendar fields are rejected by
+    # datetime with ValueError.
+    match = _TIMESTAMP.match(value)
+    if match is None:
+        raise AttributeError("'NoneType' object has no attribute 'groupdict'")
+    year, month, day, hour, minute, second, fraction, zone, sign, zh, zm = match.groups()
     date = (int(year), int(month), int(day))
     if hour is None:
         return datetime.date(*date)

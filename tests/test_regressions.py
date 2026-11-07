@@ -82,10 +82,13 @@ def test_original_examples(load, reference, source, expected):
     ("<<: [1]", yaml.constructor.ConstructorError),
 ])
 def test_constructor_validation(load, reference, source, error):
-    with pytest.raises(error):
+    with pytest.raises(error) as expected:
         reference(source)
-    with pytest.raises(error):
+    with pytest.raises(error) as actual:
         load(source)
+    if not issubclass(error, yaml.YAMLError):
+        # Raised by the same Python code paths, so with the same message.
+        assert str(actual.value) == str(expected.value)
 
 
 def test_recursive_merge(load, reference):
