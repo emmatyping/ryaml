@@ -407,7 +407,7 @@ impl RSafeLoader {
                     ));
                 }
             },
-            _ => PyString::new(py, value).into_any().unbind(),
+            _ => new_str(py, value)?.into_any().unbind(),
         })
     }
 
@@ -543,14 +543,16 @@ impl RSafeLoader {
             std::hash::BuildHasher::hash_one(&FxBuildHasher, text) as usize % KEY_CACHE_SLOTS;
         let key = KEY_CACHE.with_borrow_mut(|cache| match &cache[slot] {
             Some(key) if key.bind(py).to_str().is_ok_and(|cached| cached == text) => {
-                key.bind(py).clone()
+                Some(key.bind(py).clone())
             }
             _ => {
-                let key = PyString::new(py, text);
+                // Out of memory: no cached key, so the caller makes the key
+                // itself and raises the MemoryError.
+                let key = new_str(py, text).ok()?;
                 cache[slot] = Some(key.clone().unbind());
-                key
+                Some(key)
             }
-        });
+        })?;
         Some(key.into_any())
     }
 
@@ -1149,4 +1151,20 @@ fn parse_sexagesimal_int(s: &str) -> Result<i64, ()> {
 pub fn register_loader(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     m.add_class::<RSafeLoader>()?;
     Ok(())
+}
+
+/// A new Python `str`, or the `MemoryError` from making it, where
+/// `PyString::new` would panic.
+fn new_str<'py>(py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyString>> {
+    // A Rust string is at most isize::MAX bytes.
+    let len = pyo3::ffi::Py_ssize_t::try_from(text.len()).expect("str length fits in isize");
+    // SAFETY: `text` is valid UTF-8 of `len` bytes; the result is a new
+    // reference to a str, or null with an exception set.
+    unsafe {
+        Ok(Bound::from_owned_ptr_or_err(
+            py,
+            pyo3::ffi::PyUnicode_FromStringAndSize(text.as_ptr().cast(), len),
+        )?
+        .cast_into_unchecked())
+    }
 }

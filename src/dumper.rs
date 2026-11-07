@@ -160,6 +160,12 @@ struct StreamWriter {
 impl std::io::Write for StreamWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let Some(stream) = &self.stream else {
+            // Dumping aliased strings can make huge output; raise MemoryError
+            // like PyYAML rather than abort when it does not fit.
+            if self.output.try_reserve(buf.len()).is_err() {
+                self.error = Some(pyo3::exceptions::PyMemoryError::new_err(()));
+                return Err(std::io::Error::other("out of memory"));
+            }
             self.output.extend_from_slice(buf);
             return Ok(buf.len());
         };

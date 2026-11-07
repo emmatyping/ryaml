@@ -1,6 +1,8 @@
 """Dumper compatibility regressions: ryaml must write PyYAML's exact bytes."""
 
 import collections
+import subprocess
+import sys
 
 import pytest
 import yaml
@@ -597,3 +599,22 @@ def test_folding_long_text_like_pyyaml(reference, width, default_style):
     text = "lorem ipsum  dolor\tsit amet " * 12 + "end"
     docs = [[text, {"k": text}, "x" * 100 + " " + "y" * 100]]
     assert_same_dump(reference, docs, width=width, default_style=default_style)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="uses RLIMIT_AS")
+def test_dump_too_big_for_memory_raises_memoryerror():
+    # Aliased strings are written out at every reference, so a small document
+    # can dump to gigabytes. Like PyYAML, raise MemoryError instead of
+    # aborting when the output does not fit.
+    code = """
+import resource, ryaml
+s = "A" * 50000
+doc = [[s] * 1000 for _ in range(40)]
+resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
+try:
+    ryaml.dumps(doc)
+except MemoryError:
+    print("MemoryError")
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert (result.returncode, result.stdout.strip()) == (0, "MemoryError"), result.stderr
