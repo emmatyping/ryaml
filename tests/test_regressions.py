@@ -3,6 +3,8 @@
 import codecs
 import datetime as dt
 import io
+import subprocess
+import sys
 
 import pytest
 import yaml
@@ -1000,3 +1002,32 @@ def test_word_after_blanks_reads_next_chunk_first(load, reference, start, error,
         except Exception as e:  # noqa: BLE001
             return type(e).__name__
     assert outcome(load) == outcome(reference)
+
+
+def test_unencodable_str_raises_like_pyyaml():
+    # A lone surrogate cannot be converted to UTF-8; PyYAML's CSafeLoader
+    # raises the UnicodeEncodeError from converting it, not a TypeError.
+    source = "a: \ud800"
+    with pytest.raises(UnicodeEncodeError):
+        yaml.load(source, Loader=yaml.CSafeLoader)
+    with pytest.raises(UnicodeEncodeError):
+        ryaml.loads(source)
+    with pytest.raises(UnicodeEncodeError):
+        yaml.load(source, Loader=ryaml.RSafeLoader)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="uses RLIMIT_AS")
+def test_str_too_big_to_copy_raises_memoryerror():
+    # Copying the input out of the str must raise MemoryError, as PyYAML
+    # would, not abort or raise a TypeError about the argument.
+    code = """
+import resource, ryaml
+text = "a: " + "x" * (300 << 20)
+resource.setrlimit(resource.RLIMIT_AS, (500 << 20, 500 << 20))
+try:
+    ryaml.loads(text)
+except MemoryError:
+    print("MemoryError")
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert (result.returncode, result.stdout.strip()) == (0, "MemoryError"), result.stderr

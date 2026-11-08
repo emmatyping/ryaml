@@ -9,10 +9,37 @@ const BOM_UTF16LE: [u8; 2] = [0xff, 0xfe];
 const BOM_UTF16BE: [u8; 2] = [0xfe, 0xff];
 
 /// A YAML stream passed from Python.
-#[derive(FromPyObject)]
 pub enum Source {
     Text(String),
     Bytes(Vec<u8>),
+}
+
+/// The other types accepted, with pyo3's message for anything else.
+#[derive(FromPyObject)]
+enum OtherSource {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+impl<'py> FromPyObject<'py> for Source {
+    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+        // A str that cannot be converted raises what converting it raised,
+        // as PyYAML does: UnicodeEncodeError for a lone surrogate, or
+        // MemoryError, rather than a TypeError about the argument's type.
+        if let Ok(text) = ob.cast::<pyo3::types::PyString>() {
+            let text = text.to_str()?;
+            let mut owned = String::new();
+            owned
+                .try_reserve_exact(text.len())
+                .map_err(|_| pyo3::exceptions::PyMemoryError::new_err(()))?;
+            owned.push_str(text);
+            return Ok(Source::Text(owned));
+        }
+        Ok(match ob.extract::<OtherSource>()? {
+            OtherSource::Text(text) => Source::Text(text),
+            OtherSource::Bytes(bytes) => Source::Bytes(bytes),
+        })
+    }
 }
 
 impl Source {
