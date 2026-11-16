@@ -84,6 +84,21 @@ pub struct RSafeLoader {
     pending: VecDeque<(NodeId, Py<PyAny>)>,
 }
 
+thread_local! {
+    /// Strings made for short mapping keys, reused for keys with the same
+    /// text: mappings tend to repeat their keys (within a document and from
+    /// one load to the next), and a reused string skips decoding, allocation
+    /// and (in the dict) hashing. Each slot holds the last key whose text
+    /// hashes to it.
+    static KEY_CACHE: std::cell::RefCell<[Option<Py<PyString>>; KEY_CACHE_SLOTS]> =
+        const { std::cell::RefCell::new([const { None }; KEY_CACHE_SLOTS]) };
+}
+
+/// The longest key text `KEY_CACHE` holds.
+const MAX_CACHED_KEY: usize = 64;
+/// Slots in `KEY_CACHE`, chosen by a hash of the key's text.
+const KEY_CACHE_SLOTS: usize = 256;
+
 #[pymethods]
 impl RSafeLoader {
     #[new]
@@ -392,7 +407,7 @@ impl RSafeLoader {
                     ));
                 }
             },
-            _ => PyString::new(py, value).into_any().unbind(),
+            _ => new_str(py, value)?.into_any().unbind(),
         })
     }
 
@@ -487,7 +502,10 @@ impl RSafeLoader {
             && let Some(&(key_node, value_node)) = entries.get(index)
         {
             index += 1;
-            let key = self.construct_object(py, key_node)?;
+            let key = match self.cached_key(py, key_node) {
+                Some(key) => key,
+                None => self.construct_object(py, key_node)?,
+            };
             if key.is_instance_of::<PyList>()
                 || key.is_instance_of::<PyDict>()
                 || key.is_instance_of::<PySet>()
@@ -501,6 +519,41 @@ impl RSafeLoader {
             insert(&key, &value)?;
         }
         Ok(())
+    }
+
+    /// A str key's object from `KEY_CACHE`, for a short plain `str` scalar
+    /// that `construct_object` would not remember (so only its text matters).
+    fn cached_key<'py>(&mut self, py: Python<'py>, node: NodeId) -> Option<Bound<'py, PyAny>> {
+        if self.has_merge {
+            return None;
+        }
+        let Node {
+            tag: Tag::Str,
+            anchored: false,
+            data: NodeData::Scalar { value, .. },
+        } = &self.nodes[node]
+        else {
+            return None;
+        };
+        let text = &self.text[value.clone()];
+        if text.len() > MAX_CACHED_KEY {
+            return None;
+        }
+        let slot =
+            std::hash::BuildHasher::hash_one(&FxBuildHasher, text) as usize % KEY_CACHE_SLOTS;
+        let key = KEY_CACHE.with_borrow_mut(|cache| match &cache[slot] {
+            Some(key) if key.bind(py).to_str().is_ok_and(|cached| cached == text) => {
+                Some(key.bind(py).clone())
+            }
+            _ => {
+                // Out of memory: no cached key, so the caller makes the key
+                // itself and raises the MemoryError.
+                let key = new_str(py, text).ok()?;
+                cache[slot] = Some(key.clone().unbind());
+                Some(key)
+            }
+        })?;
+        Some(key.into_any())
     }
 
     /// PyYAML's `flatten_mapping`: replace `<<` entries with the entries of the
@@ -1098,4 +1151,20 @@ fn parse_sexagesimal_int(s: &str) -> Result<i64, ()> {
 pub fn register_loader(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     m.add_class::<RSafeLoader>()?;
     Ok(())
+}
+
+/// A new Python `str`, or the `MemoryError` from making it, where
+/// `PyString::new` would panic.
+fn new_str<'py>(py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyString>> {
+    // A Rust string is at most isize::MAX bytes.
+    let len = pyo3::ffi::Py_ssize_t::try_from(text.len()).expect("str length fits in isize");
+    // SAFETY: `text` is valid UTF-8 of `len` bytes; the result is a new
+    // reference to a str, or null with an exception set.
+    unsafe {
+        Ok(Bound::from_owned_ptr_or_err(
+            py,
+            pyo3::ffi::PyUnicode_FromStringAndSize(text.as_ptr().cast(), len),
+        )?
+        .cast_into_unchecked())
+    }
 }

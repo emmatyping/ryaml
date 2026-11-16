@@ -1,6 +1,8 @@
 """Dumper compatibility regressions: ryaml must write PyYAML's exact bytes."""
 
 import collections
+import subprocess
+import sys
 
 import pytest
 import yaml
@@ -77,6 +79,7 @@ def test_encodings_like_pyyaml(reference, encoding):
 @pytest.mark.parametrize("value", [
     1e16, 1e17, 123456789012345678.0, 1.5e300, 1e-4, 1e-5, 0.0001234, 5e-324,
     1.7976931348623157e308, -0.0, 0.1, 1.0, -2.5e-07, 1e22, 9999999999999998.0,
+    1.5e-05, -0.00012, 1e100, 1.25e-100, 123456.0,
     # Exactly halfway between two shortest strings: Python picks the even one.
     -1113178120592002.2, -233891771783429.62, 1125899906842624.5, 4503599627370495.5,
 ])
@@ -587,3 +590,34 @@ def test_failed_write_keeps_nodes_seen(explicit_end):
                 results.append(type(e).__name__)
         return results
     assert run(ryaml.RSafeDumper) == run(yaml.CSafeDumper)
+
+
+@pytest.mark.parametrize("width", [None, -1, 0, 1, 20, 2**31 - 2, 2**31 - 1])
+@pytest.mark.parametrize("default_style", [None, "'", '"'])
+def test_folding_long_text_like_pyyaml(reference, width, default_style):
+    # Runs of text are written at once up to where a space might fold the line.
+    text = "lorem ipsum  dolor\tsit amet " * 12 + "end"
+    docs = [[text, {"k": text}, "x" * 100 + " " + "y" * 100]]
+    assert_same_dump(reference, docs, width=width, default_style=default_style)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="uses RLIMIT_AS")
+def test_dump_too_big_for_memory_raises_memoryerror():
+    # Aliased strings are written out at every reference, so a small document
+    # can dump to gigabytes. Like PyYAML, raise MemoryError instead of
+    # aborting when the output does not fit.
+    code = """
+import resource, psutil, ryaml
+s = "A" * 50000
+doc = [[s] * 1000 for _ in range(40)]
+# The output is 2 GB. Allow 512 MiB more than is mapped now: the free-threaded
+# build reserves over 1 GiB of address space for its allocator at startup.
+limit = psutil.Process().memory_info().vms + (512 << 20)
+resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+try:
+    ryaml.dumps(doc)
+except MemoryError:
+    print("MemoryError")
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert (result.returncode, result.stdout.strip()) == (0, "MemoryError"), result.stderr

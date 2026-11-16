@@ -77,8 +77,8 @@ mod _ryaml {
     }
 
     #[pyfunction]
-    fn dumps(py: Python, obj: Py<PyAny>) -> PyResult<String> {
-        crate::dumper::dumps_to_string(py, obj.bind(py))
+    fn dumps(py: Python, obj: Py<PyAny>) -> PyResult<Py<pyo3::types::PyString>> {
+        crate::dumper::dumps_to_string(py, obj.bind(py)).map(Bound::unbind)
     }
 
     #[pymodule_init]

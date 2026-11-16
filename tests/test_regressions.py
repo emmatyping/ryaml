@@ -3,19 +3,25 @@
 import codecs
 import datetime as dt
 import io
+import subprocess
+import sys
 
 import pytest
 import yaml
 
 import ryaml
 
+CSafeLoader = getattr(yaml, "CSafeLoader", None)
+requires_libyaml = pytest.mark.skipif(
+    CSafeLoader is None, reason="PyYAML was built without LibYAML"
+)
+
 
 @pytest.fixture
 def reference():
-    loader = getattr(yaml, "CSafeLoader", None)
-    if loader is None:
+    if CSafeLoader is None:
         pytest.skip("PyYAML was built without LibYAML")
-    return lambda source: yaml.load(source, Loader=loader)
+    return lambda source: yaml.load(source, Loader=CSafeLoader)
 
 
 @pytest.fixture(params=["loads", "RSafeLoader", "loads_all"])
@@ -82,10 +88,13 @@ def test_original_examples(load, reference, source, expected):
     ("<<: [1]", yaml.constructor.ConstructorError),
 ])
 def test_constructor_validation(load, reference, source, error):
-    with pytest.raises(error):
+    with pytest.raises(error) as expected:
         reference(source)
-    with pytest.raises(error):
+    with pytest.raises(error) as actual:
         load(source)
+    if not issubclass(error, yaml.YAMLError):
+        # Raised by the same Python code paths, so with the same message.
+        assert str(actual.value) == str(expected.value)
 
 
 def test_recursive_merge(load, reference):
@@ -506,8 +515,7 @@ def test_compose_errors_win_over_construction_errors(load, reference, source, er
         assert type(info.value).__name__ == error.__name__
 
 
-@pytest.mark.skipif(not hasattr(yaml, "CSafeLoader"),
-                    reason="PyYAML was built without LibYAML")
+@requires_libyaml
 @pytest.mark.parametrize(("source", "single", "multi"), [
     ("[!!int x]\n---\n[*u]\n", yaml.composer.ComposerError, ValueError),
     ("[!!int x]\n--- [\n", yaml.composer.ComposerError, ValueError),
@@ -518,10 +526,10 @@ def test_construction_error_vs_stream_errors(source, single, multi):
     # Single-document loading checks for the end of the stream before
     # constructing; load_all constructs each document before reading the next.
     cases = [
-        (single, lambda s: yaml.load(s, Loader=yaml.CSafeLoader)),
+        (single, lambda s: yaml.load(s, Loader=CSafeLoader)),
         (single, lambda s: yaml.load(s, Loader=ryaml.RSafeLoader)),
         (single, ryaml.loads),
-        (multi, lambda s: list(yaml.load_all(s, Loader=yaml.CSafeLoader))),
+        (multi, lambda s: list(yaml.load_all(s, Loader=CSafeLoader))),
         (multi, lambda s: list(yaml.load_all(s, Loader=ryaml.RSafeLoader))),
         (multi, ryaml.loads_all),
     ]
@@ -629,8 +637,7 @@ BYTE_STREAMS = {
 }
 
 
-@pytest.mark.skipif(not hasattr(yaml, "CSafeLoader"),
-                    reason="PyYAML was built without LibYAML")
+@requires_libyaml
 @pytest.mark.parametrize("data", BYTE_STREAMS.values(), ids=BYTE_STREAMS.keys())
 def test_byte_streams(data):
     # YAML 1.1 5.2: a UTF-16 BOM selects UTF-16, otherwise UTF-8 (no UTF-32,
@@ -641,7 +648,7 @@ def test_byte_streams(data):
             return repr(load(data))
         except Exception as e:  # noqa: BLE001
             return type(e).__name__
-    expected = outcome(lambda d: list(yaml.load_all(d, Loader=yaml.CSafeLoader)))
+    expected = outcome(lambda d: list(yaml.load_all(d, Loader=CSafeLoader)))
     assert outcome(lambda d: list(yaml.load_all(d, Loader=ryaml.RSafeLoader))) == expected
     assert outcome(lambda d: ryaml.load_all(io.BytesIO(d))) == expected
     assert outcome(ryaml.loads_all) == expected
@@ -655,8 +662,7 @@ def test_rsafeloader_uses_native_methods():
         assert type(method).__name__ == "method_descriptor", (name, method)
 
 
-@pytest.mark.skipif(not hasattr(yaml, "CSafeLoader"),
-                    reason="PyYAML was built without LibYAML")
+@requires_libyaml
 @pytest.mark.parametrize("data", [
     pytest.param(b"*F*<\xf4", id="fuzz-alias"),
     pytest.param(b"|a#{\xd0", id="fuzz-block-scalar"),
@@ -673,7 +679,7 @@ def test_errors_before_bad_bytes_win(data):
             return repr(load(data))
         except Exception as e:  # noqa: BLE001
             return type(e).__name__
-    expected = outcome(lambda d: list(yaml.load_all(d, Loader=yaml.CSafeLoader)))
+    expected = outcome(lambda d: list(yaml.load_all(d, Loader=CSafeLoader)))
     assert outcome(lambda d: list(yaml.load_all(d, Loader=ryaml.RSafeLoader))) == expected
     assert outcome(ryaml.loads_all) == expected
 
@@ -692,8 +698,7 @@ _K = 16384  # libyaml's raw input chunk (INPUT_RAW_BUFFER_SIZE)
 _LE = codecs.BOM_UTF16_LE
 
 
-@pytest.mark.skipif(not hasattr(yaml, "CSafeLoader"),
-                    reason="PyYAML was built without LibYAML")
+@requires_libyaml
 @pytest.mark.parametrize("data", [
     pytest.param(b"*F*<\xff x", id="invalid-before-scanner-error"),
     pytest.param(b"*F*<" + b" " * 10000 + b"\xff", id="invalid-same-chunk"),
@@ -719,7 +724,7 @@ def test_decode_errors_follow_libyaml_chunks(data):
             return repr(load(data))
         except Exception as e:  # noqa: BLE001
             return type(e).__name__
-    expected = outcome(lambda d: list(yaml.load_all(d, Loader=yaml.CSafeLoader)))
+    expected = outcome(lambda d: list(yaml.load_all(d, Loader=CSafeLoader)))
     assert outcome(lambda d: list(yaml.load_all(d, Loader=ryaml.RSafeLoader))) == expected
     assert outcome(ryaml.loads_all) == expected
 
@@ -788,8 +793,7 @@ def test_deep_nesting_does_not_crash():
     assert value == []
 
 
-@pytest.mark.skipif(not hasattr(yaml, "CSafeLoader"),
-                    reason="PyYAML was built without LibYAML")
+@requires_libyaml
 @pytest.mark.parametrize("data", [
     pytest.param(b",*ff\xe1r", id="fuzz-lead-needs-more-than-left"),
     pytest.param(b",*ff\xe1rrr", id="lead-with-room-bad-continuation"),
@@ -811,7 +815,7 @@ def test_decode_errors_follow_libyaml_reader(data):
             return repr(load(data))
         except Exception as e:  # noqa: BLE001
             return type(e).__name__
-    expected = outcome(lambda d: list(yaml.load_all(d, Loader=yaml.CSafeLoader)))
+    expected = outcome(lambda d: list(yaml.load_all(d, Loader=CSafeLoader)))
     assert outcome(lambda d: list(yaml.load_all(d, Loader=ryaml.RSafeLoader))) == expected
     assert outcome(ryaml.loads_all) == expected
 
@@ -878,8 +882,7 @@ def test_tag_uri_escapes_that_are_not_utf8(load, reference, source, error):
     assert yaml.load("%TAG !e! tag:%c1%88\n--- x", Loader=ryaml.RSafeLoader) == "x"
 
 
-@pytest.mark.skipif(not hasattr(yaml, "CSafeLoader"),
-                    reason="PyYAML was built without LibYAML")
+@requires_libyaml
 @pytest.mark.parametrize("source", [
     pytest.param("! '!'", id="yaml-tag-bang"),
     pytest.param('! "&"', id="yaml-tag-ampersand"),
@@ -906,7 +909,7 @@ def test_non_specific_tag_resolves_like_pyyaml(source):
             return repr(load(source))
         except Exception as e:  # noqa: BLE001
             return type(e).__name__
-    expected = outcome(lambda s: list(yaml.load_all(s, Loader=yaml.CSafeLoader)))
+    expected = outcome(lambda s: list(yaml.load_all(s, Loader=CSafeLoader)))
     assert outcome(lambda s: list(yaml.load_all(s, Loader=ryaml.RSafeLoader))) == expected
     assert outcome(ryaml.loads_all) == expected
 
@@ -997,3 +1000,33 @@ def test_word_after_blanks_reads_next_chunk_first(load, reference, start, error,
         except Exception as e:  # noqa: BLE001
             return type(e).__name__
     assert outcome(load) == outcome(reference)
+
+
+@requires_libyaml
+def test_unencodable_str_raises_like_pyyaml():
+    # A lone surrogate cannot be converted to UTF-8; PyYAML's CSafeLoader
+    # raises the UnicodeEncodeError from converting it, not a TypeError.
+    source = "a: \ud800"
+    with pytest.raises(UnicodeEncodeError):
+        yaml.load(source, Loader=CSafeLoader)
+    with pytest.raises(UnicodeEncodeError):
+        ryaml.loads(source)
+    with pytest.raises(UnicodeEncodeError):
+        yaml.load(source, Loader=ryaml.RSafeLoader)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="uses RLIMIT_AS")
+def test_str_too_big_to_copy_raises_memoryerror():
+    # Copying the input out of the str must raise MemoryError, as PyYAML
+    # would, not abort or raise a TypeError about the argument.
+    code = """
+import resource, ryaml
+text = "a: " + "x" * (300 << 20)
+resource.setrlimit(resource.RLIMIT_AS, (500 << 20, 500 << 20))
+try:
+    ryaml.loads(text)
+except MemoryError:
+    print("MemoryError")
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert (result.returncode, result.stdout.strip()) == (0, "MemoryError"), result.stderr
