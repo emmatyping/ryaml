@@ -607,10 +607,13 @@ def test_dump_too_big_for_memory_raises_memoryerror():
     # can dump to gigabytes. Like PyYAML, raise MemoryError instead of
     # aborting when the output does not fit.
     code = """
-import resource, ryaml
+import resource, psutil, ryaml
 s = "A" * 50000
 doc = [[s] * 1000 for _ in range(40)]
-resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
+# The output is 2 GB. Allow 512 MiB more than is mapped now: the free-threaded
+# build reserves over 1 GiB of address space for its allocator at startup.
+limit = psutil.Process().memory_info().vms + (512 << 20)
+resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
 try:
     ryaml.dumps(doc)
 except MemoryError:
