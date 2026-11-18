@@ -72,6 +72,15 @@ build = "cp313-pyodide_wasm32"
 xbuild-tools = ["rustc", "cargo"]
 
 [[tool.cibuildwheel.overrides]]
+select = "*-musllinux_*"
+# Older CPython builds report a GNU SOABI inside the musl container.
+before-all = """
+curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/ryaml-rustup.sh &&
+sh /tmp/ryaml-rustup.sh -y --profile minimal
+"""
+environment.PATH = "$HOME/.cargo/bin:$PATH"
+
+[[tool.cibuildwheel.overrides]]
 select = "*-{android,ios,pyodide}_*"
 test-groups = []
 test-sources = ["tests/test_wheel.py"]
