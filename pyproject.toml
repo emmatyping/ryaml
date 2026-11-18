@@ -64,7 +64,8 @@ xbuild-tools = ["rustc", "cargo"]
 [tool.cibuildwheel.ios.environment]
 # Use the target Python version and framework from the cross-build venv.
 PYO3_CROSS_PYTHON_VERSION = '''$(python -c 'import sys; print("%d.%d" % sys.version_info[:2])')'''
-CARGO_ENCODED_RUSTFLAGS = '''$(python -c 'import sysconfig; print("-Lframework=" + sysconfig.get_config_var("PYTHONFRAMEWORKPREFIX") + "\x1f-lframework=Python")')'''
+CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS = '''$(python -c 'import sysconfig; print("-Lframework=" + sysconfig.get_config_var("PYTHONFRAMEWORKPREFIX") + " -lframework=Python")')'''
+CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUSTFLAGS = "$CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS"
 
 [tool.cibuildwheel.pyodide]
 build = "cp313-pyodide_wasm32"

@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   build_wheels:
-    name: Build wheels for ${{ matrix.os }} ${{ matrix.build }}
+    name: Build wheels for ${{ matrix.os }}
     runs-on: ${{ matrix.runs-on }}
     strategy:
       fail-fast: false
@@ -54,6 +54,7 @@ jobs:
           - os: pyodide
             runs-on: ubuntu-latest
             platform: pyodide
+            # Pyodide's Emscripten build passes nightly Rust flags.
             toolchain: nightly-2026-04-16
             targets: wasm32-unknown-emscripten
 
@@ -72,6 +73,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: wheel-build-${{ matrix.os }}
+
+      - name: Set up Java for the Android testbed
+        if: matrix.platform == 'android'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.3.0
