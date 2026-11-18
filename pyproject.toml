@@ -44,6 +44,33 @@ include = [
 ]
 
 [tool.cibuildwheel]
+skip = "*-win32"
+test-groups = ["test"]
+test-command = "python -m pytest {project}/tests"
+build-verbosity = 1
+
+[tool.cibuildwheel.macos.environment]
+MACOSX_DEPLOYMENT_TARGET = "10.12"
+
+[tool.cibuildwheel.ios]
+xbuild-tools = ["rustc", "cargo"]
+
+[tool.cibuildwheel.pyodide]
+xbuild-tools = ["rustc", "cargo"]
+
+[[tool.cibuildwheel.overrides]]
+select = "*-{android,ios,pyodide}_*"
+test-groups = []
+test-sources = ["tests/test_wheel.py"]
+test-command = "python -m unittest discover -s tests -p test_wheel.py"
+
+[[tool.cibuildwheel.overrides]]
+select = "*-android_x86_64"
+environment.CARGO_BUILD_TARGET = "x86_64-linux-android"
+
+[[tool.cibuildwheel.overrides]]
+select = "*-android_arm64_v8a"
+environment.CARGO_BUILD_TARGET = "aarch64-linux-android"
 
 [dependency-groups]
 test = [
