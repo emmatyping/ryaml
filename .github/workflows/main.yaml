@@ -46,11 +46,16 @@ jobs:
             platform: android
             archs: arm64_v8a
             targets: aarch64-linux-android
-          - os: ios
-            runs-on: macos-15
+          - os: ios-device
+            runs-on: macos-26
             platform: ios
-            archs: arm64_iphoneos arm64_iphonesimulator
-            targets: aarch64-apple-ios,aarch64-apple-ios-sim
+            archs: arm64_iphoneos
+            targets: aarch64-apple-ios
+          - os: ios-simulator
+            runs-on: macos-26
+            platform: ios
+            archs: arm64_iphonesimulator
+            targets: aarch64-apple-ios-sim
           - os: pyodide
             runs-on: ubuntu-latest
             platform: pyodide
@@ -80,6 +85,10 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+
+      - name: Initialize the iOS simulator service
+        if: matrix.os == 'ios-simulator'
+        run: xcrun simctl list devices available
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.3.0
