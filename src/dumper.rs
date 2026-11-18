@@ -602,7 +602,7 @@ impl RSafeDumper {
     }
 
     fn represent_binary(&mut self, _py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
-        let bytes: &[u8] = data.downcast::<PyBytes>()?.as_bytes();
+        let bytes: &[u8] = data.cast::<PyBytes>()?.as_bytes();
         let encoded = base64::prelude::BASE64_STANDARD.encode(bytes);
 
         // Python's base64.encodebytes: lines of at most 76 characters, each
@@ -1138,7 +1138,10 @@ fn tag_part(value: &Bound<'_, PyAny>, what: &str) -> PyResult<String> {
         return value.extract();
     }
     if value.is_exact_instance_of::<PyBytes>() {
-        return Ok(std::str::from_utf8(value.cast::<PyBytes>()?.as_bytes())?.to_owned());
+        let bytes = value.cast::<PyBytes>()?.as_bytes();
+        return std::str::from_utf8(bytes).map(str::to_owned).map_err(|e| {
+            pyo3::exceptions::PyUnicodeDecodeError::new_err_from_utf8(value.py(), bytes, e)
+        });
     }
     Err(pyo3::exceptions::PyTypeError::new_err(format!(
         "tag {what} must be a string"
@@ -1149,8 +1152,10 @@ fn tag_part(value: &Bound<'_, PyAny>, what: &str) -> PyResult<String> {
 /// numbers (floats and decimals truncate), but str and bytes are refused.
 struct CInt(i32);
 
-impl<'py> FromPyObject<'py> for CInt {
-    fn extract_bound(value: &Bound<'py, PyAny>) -> PyResult<Self> {
+impl<'py> FromPyObject<'_, 'py> for CInt {
+    type Error = PyErr;
+
+    fn extract(value: Borrowed<'_, 'py, PyAny>) -> PyResult<Self> {
         let ty = value.get_type();
         if !ty.hasattr("__index__")? && !ty.hasattr("__int__")? {
             return Err(pyo3::exceptions::PyTypeError::new_err(
@@ -1165,8 +1170,10 @@ impl<'py> FromPyObject<'py> for CInt {
 /// A PyYAML option used for its truthiness (`if canonical:`).
 struct Truthy(bool);
 
-impl<'py> FromPyObject<'py> for Truthy {
-    fn extract_bound(value: &Bound<'py, PyAny>) -> PyResult<Self> {
+impl<'py> FromPyObject<'_, 'py> for Truthy {
+    type Error = PyErr;
+
+    fn extract(value: Borrowed<'_, 'py, PyAny>) -> PyResult<Self> {
         Ok(Truthy(value.is_truthy()?))
     }
 }
