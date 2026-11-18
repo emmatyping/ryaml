@@ -10,7 +10,7 @@ pyo3::create_exception!(_ryaml, InvalidYamlError, pyo3::exceptions::PyValueError
 pub fn yaml_error(py: Python, class_name: &str, message: String) -> PyErr {
     if let Ok(module) = py.import("ryaml.error")
         && let Ok(attr) = module.getattr(class_name)
-        && let Ok(tp) = attr.downcast_into::<PyType>()
+        && let Ok(tp) = attr.cast_into::<PyType>()
     {
         return PyErr::from_type(tp, (message,));
     }

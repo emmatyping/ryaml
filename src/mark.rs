@@ -3,7 +3,7 @@
 use pyo3::prelude::*;
 
 #[derive(Debug, Clone)]
-#[pyclass(name = "Mark")]
+#[pyclass(name = "Mark", from_py_object)]
 pub struct PyMark {
     #[pyo3(get)]
     pub index: u64,

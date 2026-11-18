@@ -21,8 +21,10 @@ enum OtherSource {
     Bytes(Vec<u8>),
 }
 
-impl<'py> FromPyObject<'py> for Source {
-    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+impl<'py> FromPyObject<'_, 'py> for Source {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'_, 'py, PyAny>) -> PyResult<Self> {
         // A str that cannot be converted raises what converting it raised,
         // as PyYAML does: UnicodeEncodeError for a lone surrogate, or
         // MemoryError, rather than a TypeError about the argument's type.
