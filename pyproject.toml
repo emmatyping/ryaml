@@ -52,10 +52,22 @@ build-verbosity = 1
 [tool.cibuildwheel.macos.environment]
 MACOSX_DEPLOYMENT_TARGET = "10.12"
 
+[tool.cibuildwheel.android.environment]
+# The cross-build environment places target Python next to the build venv.
+PYO3_CROSS_LIB_DIR = "$VIRTUAL_ENV/../python/prefix/lib"
+CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER = "$(pwd)/.github/scripts/android-linker.sh"
+CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = "$(pwd)/.github/scripts/android-linker.sh"
+
 [tool.cibuildwheel.ios]
 xbuild-tools = ["rustc", "cargo"]
 
+[tool.cibuildwheel.ios.environment]
+# Use the target Python version and framework from the cross-build venv.
+PYO3_CROSS_PYTHON_VERSION = '''$(python -c 'import sys; print("%d.%d" % sys.version_info[:2])')'''
+CARGO_ENCODED_RUSTFLAGS = '''$(python -c 'import sysconfig; print("-Lframework=" + sysconfig.get_config_var("PYTHONFRAMEWORKPREFIX") + "\x1f-lframework=Python")')'''
+
 [tool.cibuildwheel.pyodide]
+build = "cp313-pyodide_wasm32"
 xbuild-tools = ["rustc", "cargo"]
 
 [[tool.cibuildwheel.overrides]]
@@ -66,10 +78,12 @@ test-command = "python -m unittest discover -s tests -p test_wheel.py"
 
 [[tool.cibuildwheel.overrides]]
 select = "*-android_x86_64"
+inherit.environment = "append"
 environment.CARGO_BUILD_TARGET = "x86_64-linux-android"
 
 [[tool.cibuildwheel.overrides]]
 select = "*-android_arm64_v8a"
+inherit.environment = "append"
 environment.CARGO_BUILD_TARGET = "aarch64-linux-android"
 
 [dependency-groups]

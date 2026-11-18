@@ -22,3 +22,11 @@ class TestWheel(unittest.TestCase):
     def test_invalid_yaml(self):
         with self.assertRaises(ryaml.InvalidYamlError):
             ryaml.loads("key: [")
+
+    def test_dumper_nesting_limit(self):
+        value = "leaf"
+        for _ in range(500):
+            value = {"child": value}
+        self.assertTrue(ryaml.dumps(value).endswith("child: leaf\n"))
+        with self.assertRaises(RecursionError):
+            ryaml.dumps({"child": value})

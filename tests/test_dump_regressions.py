@@ -225,7 +225,7 @@ def _dump_outcome(dumper, value):
         return type(e).__name__
 
 
-# ryaml's dumper recurses natively, up to a fixed depth on every Python
+# ryaml's dumper supports a fixed depth on every Python
 # version (PyYAML's limit depends on the recursion limit and the caller's stack).
 MAX_DEPTH = 500
 
@@ -259,7 +259,7 @@ def test_deep_nesting_like_pyyaml_within_both_limits(kind):
 @pytest.mark.parametrize("kind", ["list", "dict"])
 def test_deep_nesting_in_a_thread_with_a_small_stack(kind):
     # The limit holds whatever the thread's stack size (musl gives threads
-    # 128 KB): the dumper grows its stack instead of overflowing it.
+    # 128 KB): the dumper traverses nested values without native recursion.
     import threading
     results = []
 

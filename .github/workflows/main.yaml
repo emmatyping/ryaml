@@ -56,7 +56,6 @@ jobs:
             platform: pyodide
             toolchain: nightly-2026-04-16
             targets: wasm32-unknown-emscripten
-            components: rust-src
 
     steps:
       - uses: actions/checkout@v5
@@ -68,12 +67,11 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain || 'stable' }}
           targets: ${{ matrix.targets }}
-          components: ${{ matrix.components }}
 
       - name: cache rust
         uses: Swatinem/rust-cache@v2
         with:
-          key: wheel-build-${{ matrix.os }}-${{ matrix.toolchain || 'stable' }}-${{ matrix.targets }}
+          key: wheel-build-${{ matrix.os }}
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.3.0

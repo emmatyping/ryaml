@@ -4,9 +4,14 @@ from typing import Protocol, TypeAlias, TypeVar
 
 from ryaml._ryaml import _RSafeLoader, _RSafeDumper
 
-from yaml import BaseLoader
-from yaml.constructor import BaseConstructor
-from yaml.resolver import BaseResolver
+try:
+    from yaml import BaseLoader
+    from yaml.constructor import BaseConstructor
+    from yaml.resolver import BaseResolver
+except ModuleNotFoundError as exc:
+    if exc.name != "yaml":
+        raise
+    BaseLoader = object
 
 __all__ = ["RSafeLoader", "RSafeDumper"]
 
@@ -34,8 +39,9 @@ class RSafeLoader(_RSafeLoader, BaseLoader):
         # up the parts of BaseLoader that hold no input.
         self.stream = stream
         self.name = getattr(stream, "name", "<file>")
-        BaseConstructor.__init__(self)
-        BaseResolver.__init__(self)
+        if BaseLoader is not object:
+            BaseConstructor.__init__(self)
+            BaseResolver.__init__(self)
 
 class RSafeDumper(_RSafeDumper):
     """pyyaml-compatible safe YAML dumper backed by Rust."""
