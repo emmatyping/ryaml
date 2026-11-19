@@ -60,12 +60,10 @@ CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = "$(pwd)/.github/scripts/android-link
 
 [tool.cibuildwheel.ios]
 xbuild-tools = ["rustc", "cargo"]
+before-build = "python .github/scripts/ios-pyo3-config.py"
 
 [tool.cibuildwheel.ios.environment]
-# Use the target Python version and framework from the cross-build venv.
-PYO3_CROSS_PYTHON_VERSION = '''$(python -c 'import sys; print("%d.%d" % sys.version_info[:2])')'''
-CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS = '''$(python -c 'import sysconfig; print("-Lframework=" + sysconfig.get_config_var("PYTHONFRAMEWORKPREFIX") + " -lframework=Python")')'''
-CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUSTFLAGS = "$CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS"
+PYO3_CONFIG_FILE = "$VIRTUAL_ENV/ryaml-pyo3.cfg"
 
 [tool.cibuildwheel.pyodide]
 build = "cp313-pyodide_wasm32"
