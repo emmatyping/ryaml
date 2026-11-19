@@ -13,10 +13,11 @@ import math
 import os
 
 import pytest
-import yaml
-from hypothesis import given, settings, strategies as st
-
 import ryaml
+
+yaml = pytest.importorskip("yaml")
+
+from hypothesis import given, settings, strategies as st
 
 CSafeLoader = getattr(yaml, "CSafeLoader", None)
 pytestmark = pytest.mark.skipif(

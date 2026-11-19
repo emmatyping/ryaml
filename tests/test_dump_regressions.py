@@ -5,9 +5,9 @@ import subprocess
 import sys
 
 import pytest
-import yaml
-
 import ryaml
+
+yaml = pytest.importorskip("yaml")
 
 
 @pytest.fixture

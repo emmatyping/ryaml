@@ -83,8 +83,17 @@ environment.PATH = "$HOME/.cargo/bin:$PATH"
 [[tool.cibuildwheel.overrides]]
 select = "*-{android,ios,pyodide}_*"
 test-groups = []
-test-sources = ["tests/test_wheel.py"]
-test-command = "python -m unittest discover -s tests -p test_wheel.py"
+test-requires = ["pytest>=9.0"]
+test-sources = [
+    "tests/conftest.py",
+    "tests/test_dump.py",
+    "tests/test_dumps.py",
+    "tests/test_load.py",
+    "tests/test_load_all.py",
+    "tests/test_loads.py",
+    "tests/test_wheel.py",
+]
+test-command = "python -m pytest -p no:cacheprovider tests"
 
 [[tool.cibuildwheel.overrides]]
 select = "*-android_x86_64"
