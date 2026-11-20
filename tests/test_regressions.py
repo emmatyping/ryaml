@@ -7,9 +7,9 @@ import subprocess
 import sys
 
 import pytest
-import yaml
-
 import ryaml
+
+yaml = pytest.importorskip("yaml")
 
 CSafeLoader = getattr(yaml, "CSafeLoader", None)
 requires_libyaml = pytest.mark.skipif(

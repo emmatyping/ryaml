@@ -5,8 +5,10 @@ import textwrap
 import ryaml
 import sys
 from ryaml import RSafeLoader
-import yaml
 import pytest
+
+yaml = pytest.importorskip("yaml")
+
 from hypothesis import given, settings, HealthCheck
 from hypothesis import strategies as st
 

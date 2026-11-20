@@ -44,6 +44,64 @@ include = [
 ]
 
 [tool.cibuildwheel]
+skip = "*-win32"
+test-groups = ["test"]
+test-command = "python -m pytest {project}/tests"
+build-verbosity = 1
+
+[tool.cibuildwheel.macos.environment]
+MACOSX_DEPLOYMENT_TARGET = "10.12"
+
+[tool.cibuildwheel.android.environment]
+# The cross-build environment places target Python next to the build venv.
+PYO3_CROSS_LIB_DIR = "$VIRTUAL_ENV/../python/prefix/lib"
+CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER = "$(pwd)/.github/scripts/android-linker.sh"
+CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = "$(pwd)/.github/scripts/android-linker.sh"
+
+[tool.cibuildwheel.ios]
+xbuild-tools = ["rustc", "cargo"]
+before-build = "python .github/scripts/ios-pyo3-config.py"
+
+[tool.cibuildwheel.ios.environment]
+PYO3_CONFIG_FILE = "$VIRTUAL_ENV/ryaml-pyo3.cfg"
+
+[tool.cibuildwheel.pyodide]
+build = "cp313-pyodide_wasm32"
+xbuild-tools = ["rustc", "cargo"]
+
+[[tool.cibuildwheel.overrides]]
+select = "*-musllinux_*"
+# Older CPython builds report a GNU SOABI inside the musl container.
+before-all = """
+curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/ryaml-rustup.sh &&
+sh /tmp/ryaml-rustup.sh -y --profile minimal
+"""
+environment.PATH = "$HOME/.cargo/bin:$PATH"
+
+[[tool.cibuildwheel.overrides]]
+select = "*-{android,ios,pyodide}_*"
+test-groups = []
+test-requires = ["pytest>=9.0"]
+test-sources = [
+    "tests/conftest.py",
+    "tests/test_dump.py",
+    "tests/test_dumps.py",
+    "tests/test_load.py",
+    "tests/test_load_all.py",
+    "tests/test_loads.py",
+    "tests/test_wheel.py",
+]
+test-command = "python -m pytest -p no:cacheprovider tests"
+
+[[tool.cibuildwheel.overrides]]
+select = "*-android_x86_64"
+inherit.environment = "append"
+environment.CARGO_BUILD_TARGET = "x86_64-linux-android"
+
+[[tool.cibuildwheel.overrides]]
+select = "*-android_arm64_v8a"
+inherit.environment = "append"
+environment.CARGO_BUILD_TARGET = "aarch64-linux-android"
 
 [dependency-groups]
 test = [

@@ -13,7 +13,7 @@ use libyaml_safer::{
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
-    PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PySet, PyString, PyTuple, PyType,
+    PyBool, PyBytes, PyDict, PyFloat, PyInt, PyIterator, PyList, PySet, PyString, PyTuple, PyType,
 };
 
 use crate::exception;
@@ -43,6 +43,98 @@ enum RepNode {
 }
 
 type NodeId = usize;
+
+type MappingItem<'py> = (Bound<'py, PyAny>, Bound<'py, PyAny>);
+
+enum CollectionItems<'py> {
+    Sequence(Bound<'py, PyIterator>),
+    Mapping {
+        items: std::vec::IntoIter<MappingItem<'py>>,
+        pending_value: Option<Bound<'py, PyAny>>,
+        represented_key: Option<NodeId>,
+    },
+}
+
+struct CollectionFrame<'py> {
+    node: NodeId,
+    items: CollectionItems<'py>,
+    best_style: bool,
+}
+
+impl<'py> CollectionFrame<'py> {
+    fn new(node: NodeId, items: CollectionItems<'py>) -> Self {
+        Self {
+            node,
+            items,
+            best_style: true,
+        }
+    }
+
+    fn next(&mut self) -> PyResult<Option<Bound<'py, PyAny>>> {
+        match &mut self.items {
+            CollectionItems::Sequence(items) => items.next().transpose(),
+            CollectionItems::Mapping {
+                items,
+                pending_value,
+                ..
+            } => {
+                if let Some(value) = pending_value.take() {
+                    return Ok(Some(value));
+                }
+                Ok(items.next().map(|(key, value)| {
+                    *pending_value = Some(value);
+                    key
+                }))
+            }
+        }
+    }
+}
+
+enum NodeVisit {
+    Enter(NodeId, usize),
+    Leave(NodeId),
+}
+
+/// Walk one child at a time so traversal space depends on nesting depth.
+struct NodeWalk {
+    parents: Vec<(NodeId, usize)>,
+    next_node: Option<NodeId>,
+}
+
+impl NodeWalk {
+    fn new(root: NodeId) -> Self {
+        Self {
+            parents: Vec::new(),
+            next_node: Some(root),
+        }
+    }
+
+    fn next(&mut self, nodes: &[RepNode]) -> Option<NodeVisit> {
+        if let Some(node) = self.next_node.take() {
+            return Some(NodeVisit::Enter(node, self.parents.len()));
+        }
+        let (node, index) = self.parents.last_mut()?;
+        let child = match &nodes[*node] {
+            RepNode::Sequence { value, .. } => value.get(*index).copied(),
+            RepNode::Mapping { value, .. } => value
+                .get(*index / 2)
+                .map(|&(key, val)| if index.is_multiple_of(2) { key } else { val }),
+            RepNode::Scalar { .. } => unreachable!(),
+        };
+        if let Some(child) = child {
+            *index += 1;
+            Some(NodeVisit::Enter(child, self.parents.len()))
+        } else {
+            let node = *node;
+            self.parents.pop();
+            Some(NodeVisit::Leave(node))
+        }
+    }
+
+    fn descend(&mut self, node: NodeId) {
+        self.parents.push((node, 0));
+    }
+}
 
 /// A scalar's text.
 #[derive(Debug)]
@@ -298,38 +390,15 @@ pub struct RSafeDumper {
     /// Nodes of the document being represented.
     nodes: Vec<RepNode>,
     object_keeper: Vec<Py<PyAny>>,
-    /// Nesting depth of the value being represented (the root is 0).
-    level: usize,
     /// Representing the document found an object again, so some node may be
     /// reached twice and need an anchor. Without, the anchor pass is skipped.
     has_aliases: bool,
 }
 
 /// The deepest nesting ryaml represents and serializes; deeper data raises
-/// `RecursionError`. The recursion is native and grows its stack as needed
-/// (`with_stack`), so the limit is the same on every platform and Python
-/// version. It is deeper than PyYAML goes with the default recursion limit
-/// (about 330 levels, as its representer is recursive Python, three frames
-/// per level).
+/// `RecursionError`. Traversal uses explicit stacks so the limit is independent
+/// of the calling thread's native stack and Python's recursion limit.
 const MAX_DEPTH: usize = 500;
-
-/// Run one level of the dumper's recursion, on a new stack segment if the
-/// current one is nearly used up, so `MAX_DEPTH` holds whatever the thread's
-/// stack size (musl gives threads 128 KB, for example). A level needs about
-/// half a kilobyte, plus whatever Python calls it makes (comparing keys,
-/// formatting dates), well within the red zone even for the levels between
-/// checks: checking the stack costs about as much as a scalar's level, so it
-/// is checked only every `STACK_CHECK_LEVELS` levels.
-fn with_stack<T>(depth: usize, f: impl FnOnce() -> T) -> T {
-    const RED_ZONE: usize = 64 * 1024;
-    const SEGMENT: usize = 1024 * 1024;
-    const STACK_CHECK_LEVELS: usize = 8;
-    if depth.is_multiple_of(STACK_CHECK_LEVELS) {
-        stacker::maybe_grow(RED_ZONE, SEGMENT, f)
-    } else {
-        f()
-    }
-}
 
 fn check_depth(depth: usize) -> PyResult<()> {
     if depth > MAX_DEPTH {
@@ -440,7 +509,6 @@ impl RSafeDumper {
             represented_objects: HashMap::with_hasher(FxBuildHasher),
             nodes: Vec::new(),
             object_keeper: Vec::new(),
-            level: 0,
             has_aliases: false,
         })
     }
@@ -463,7 +531,6 @@ impl RSafeDumper {
     }
 
     fn represent(&mut self, py: Python, data: Py<PyAny>) -> PyResult<()> {
-        self.level = 0;
         self.has_aliases = false;
         let node = self.represent_data(py, data.bind(py))?;
         self.serialize(py, node)?;
@@ -509,11 +576,66 @@ impl RSafeDumper {
     }
 
     fn represent_data(&mut self, py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
-        with_stack(self.level, || self.represent_data_inner(py, data))
+        let (root, frame) = self.represent_node(py, data, 0)?;
+        let Some(frame) = frame else {
+            return Ok(root);
+        };
+        let mut stack = vec![frame];
+        while let Some(frame) = stack.last_mut() {
+            if let Some(data) = frame.next()? {
+                let (node, child) = self.represent_node(py, &data, stack.len())?;
+                if let Some(child) = child {
+                    stack.push(child);
+                } else {
+                    self.append_child(stack.last_mut().unwrap(), node);
+                }
+            } else {
+                let node = frame.node;
+                let flow = self.choose_flow_style(frame.best_style);
+                match &mut self.nodes[node] {
+                    RepNode::Sequence { flow_style, .. } | RepNode::Mapping { flow_style, .. } => {
+                        *flow_style = flow;
+                    }
+                    RepNode::Scalar { .. } => unreachable!(),
+                }
+                stack.pop();
+                if let Some(parent) = stack.last_mut() {
+                    self.append_child(parent, node);
+                }
+            }
+        }
+        Ok(root)
     }
 
-    fn represent_data_inner(&mut self, py: Python, data: &Bound<'_, PyAny>) -> PyResult<NodeId> {
-        check_depth(self.level)?;
+    fn append_child(&mut self, frame: &mut CollectionFrame<'_>, child: NodeId) {
+        frame.best_style &= self.is_plain_scalar(child);
+        // Add completed items immediately so a failed representation retains
+        // the parts of a registered collection that were already represented.
+        match (&mut self.nodes[frame.node], &mut frame.items) {
+            (RepNode::Sequence { value, .. }, CollectionItems::Sequence(_)) => value.push(child),
+            (
+                RepNode::Mapping { value, .. },
+                CollectionItems::Mapping {
+                    represented_key, ..
+                },
+            ) => {
+                if let Some(key) = represented_key.take() {
+                    value.push((key, child));
+                } else {
+                    *represented_key = Some(child);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn represent_node<'py>(
+        &mut self,
+        py: Python<'py>,
+        data: &Bound<'py, PyAny>,
+        depth: usize,
+    ) -> PyResult<(NodeId, Option<CollectionFrame<'py>>)> {
+        check_depth(depth)?;
         // Alias tracking. Collections register their node before representing
         // their items (see `register`), so recursive data finds it here.
         let alias_key = if self.ignore_aliases(py, data) {
@@ -522,7 +644,7 @@ impl RSafeDumper {
             let key = data.as_ptr() as usize;
             if let Some(&node) = self.represented_objects.get(&key) {
                 self.has_aliases = true;
-                return Ok(node);
+                return Ok((node, None));
             }
             self.object_keeper.push(data.clone().unbind());
             Some(key)
@@ -537,9 +659,9 @@ impl RSafeDumper {
         } else if data.is_exact_instance_of::<PyInt>() {
             self.represent_int(data)?
         } else if data.is_exact_instance_of::<PyDict>() {
-            self.represent_dict(py, data, alias_key)?
+            return self.represent_mapping(py, Tag::Map, data.cast::<PyDict>()?, alias_key);
         } else if data.is_exact_instance_of::<PyList>() || data.is_exact_instance_of::<PyTuple>() {
-            self.represent_list(py, data, alias_key)?
+            return self.represent_list(data, alias_key);
         } else if data.is_none() {
             self.represent_none()
         } else if data.is_exact_instance_of::<PyFloat>() {
@@ -553,7 +675,12 @@ impl RSafeDumper {
         } else if ty.is(datetime_type(py, "date")?) {
             self.represent_date(py, data)?
         } else if data.is_exact_instance_of::<PySet>() {
-            self.represent_set(py, data, alias_key)?
+            // PyYAML represents a set as a mapping of its members to None.
+            let mapping = PyDict::new(py);
+            for item in data.try_iter()? {
+                mapping.set_item(item?, py.None())?;
+            }
+            return self.represent_mapping(py, Tag::Set, &mapping, alias_key);
         } else {
             return Err(exception::representer_error(
                 py,
@@ -565,7 +692,7 @@ impl RSafeDumper {
             self.represented_objects.insert(key, node);
         }
 
-        Ok(node)
+        Ok((node, None))
     }
 
     fn represent_none(&mut self) -> NodeId {
@@ -626,12 +753,11 @@ impl RSafeDumper {
         Ok(self.make_scalar(Tag::Timestamp, value, None))
     }
 
-    fn represent_list(
+    fn represent_list<'py>(
         &mut self,
-        py: Python,
-        data: &Bound<'_, PyAny>,
+        data: &Bound<'py, PyAny>,
         alias_key: Option<usize>,
-    ) -> PyResult<NodeId> {
+    ) -> PyResult<(NodeId, Option<CollectionFrame<'py>>)> {
         let node = self.register(
             alias_key,
             RepNode::Sequence {
@@ -640,57 +766,18 @@ impl RSafeDumper {
                 flow_style: None,
             },
         );
-        let mut best_style = true;
-        self.level += 1;
-        for item in data.try_iter()? {
-            let item = self.represent_data(py, &item?)?;
-            best_style &= self.is_plain_scalar(item);
-            // Added at once, like PyYAML: if a later item fails, the node
-            // stays registered with the items so far, and a later `represent`
-            // of the same object reuses it.
-            if let RepNode::Sequence { value, .. } = &mut self.nodes[node] {
-                value.push(item);
-            }
-        }
-        self.level -= 1;
-        let flow = self.choose_flow_style(best_style);
-        if let RepNode::Sequence { flow_style, .. } = &mut self.nodes[node] {
-            *flow_style = flow;
-        }
-        Ok(node)
-    }
-
-    fn represent_dict(
-        &mut self,
-        py: Python,
-        data: &Bound<'_, PyAny>,
-        alias_key: Option<usize>,
-    ) -> PyResult<NodeId> {
-        self.represent_mapping(py, Tag::Map, data.cast::<PyDict>()?, alias_key)
-    }
-
-    /// PyYAML's `represent_set`: a mapping of the members to None.
-    fn represent_set(
-        &mut self,
-        py: Python,
-        data: &Bound<'_, PyAny>,
-        alias_key: Option<usize>,
-    ) -> PyResult<NodeId> {
-        let value = PyDict::new(py);
-        for item in data.try_iter()? {
-            value.set_item(item?, py.None())?;
-        }
-        self.represent_mapping(py, Tag::Set, &value, alias_key)
+        let items = CollectionItems::Sequence(data.try_iter()?);
+        Ok((node, Some(CollectionFrame::new(node, items))))
     }
 
     /// PyYAML's `represent_mapping`, for dicts and sets.
-    fn represent_mapping(
+    fn represent_mapping<'py>(
         &mut self,
-        py: Python,
+        py: Python<'py>,
         tag: Tag,
-        mapping: &Bound<'_, PyDict>,
+        mapping: &Bound<'py, PyDict>,
         alias_key: Option<usize>,
-    ) -> PyResult<NodeId> {
+    ) -> PyResult<(NodeId, Option<CollectionFrame<'py>>)> {
         let node = self.register(
             alias_key,
             RepNode::Mapping {
@@ -699,24 +786,12 @@ impl RSafeDumper {
                 flow_style: None,
             },
         );
-        let items = self.mapping_items(py, mapping)?;
-        let mut best_style = true;
-        self.level += 1;
-        for (k, v) in &items {
-            let key_node = self.represent_data(py, k)?;
-            let val_node = self.represent_data(py, v)?;
-            best_style &= self.is_plain_scalar(key_node) && self.is_plain_scalar(val_node);
-            // Added at once, like PyYAML (see `represent_list`).
-            if let RepNode::Mapping { value, .. } = &mut self.nodes[node] {
-                value.push((key_node, val_node));
-            }
-        }
-        self.level -= 1;
-        let flow = self.choose_flow_style(best_style);
-        if let RepNode::Mapping { flow_style, .. } = &mut self.nodes[node] {
-            *flow_style = flow;
-        }
-        Ok(node)
+        let items = CollectionItems::Mapping {
+            items: self.mapping_items(py, mapping)?.into_iter(),
+            pending_value: None,
+            represented_key: None,
+        };
+        Ok((node, Some(CollectionFrame::new(node, items))))
     }
 
     // ── Helpers ──
@@ -730,7 +805,7 @@ impl RSafeDumper {
         &self,
         py: Python<'py>,
         mapping: &Bound<'py, PyDict>,
-    ) -> PyResult<Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)>> {
+    ) -> PyResult<Vec<MappingItem<'py>>> {
         let items: Vec<_> = mapping.iter().collect();
         if !self.sort_keys || items.len() < 2 {
             return Ok(items);
@@ -761,8 +836,8 @@ impl RSafeDumper {
     fn sort_items_in_python<'py>(
         &self,
         py: Python<'py>,
-        items: Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)>,
-    ) -> PyResult<Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)>> {
+        items: Vec<MappingItem<'py>>,
+    ) -> PyResult<Vec<MappingItem<'py>>> {
         let list = PyList::new(py, items.iter().map(|(k, v)| (k, v)))?;
         match py.import("builtins")?.getattr("sorted")?.call1((&list,)) {
             Ok(sorted) => sorted
@@ -912,16 +987,16 @@ impl RSafeDumper {
             .resize(self.nodes.len(), NodeState::default());
         let anchored = self.has_aliases || carried_over;
         if anchored {
-            self.anchor_node(py, node, 0)?;
+            self.anchor_nodes(node)?;
         }
         let result = self
-            .serialize_node(py, node, 0)
+            .serialize_nodes(py, node)
             .and_then(|()| self.emit(py, Event::document_end(self.document_end_implicit)));
         if let Err(error) = result {
             if !anchored {
                 // The kept state must be what the skipped anchor pass would
                 // have left: every node seen (none twice, so no anchors).
-                self.anchor_node(py, node, 0)?;
+                self.anchor_nodes(node)?;
             }
             return Err(error);
         }
@@ -932,47 +1007,58 @@ impl RSafeDumper {
         Ok(())
     }
 
-    fn anchor_node(&mut self, py: Python, node: NodeId, depth: usize) -> PyResult<()> {
-        with_stack(depth, || self.anchor_node_inner(py, node, depth))
-    }
-
-    fn anchor_node_inner(&mut self, py: Python, node: NodeId, depth: usize) -> PyResult<()> {
-        // Nodes of a document are at most MAX_DEPTH deep, but nodes kept from
-        // a failed document can be reused deeper in a later one.
-        check_depth(depth)?;
-        match self.node_states[node].anchor {
-            Anchor::Unseen => self.node_states[node].anchor = Anchor::Seen,
-            Anchor::Seen => {
-                // Reached twice: it gets the next anchor (PyYAML's id001, ...).
-                self.last_alias_id += 1;
-                self.node_states[node].anchor = Anchor::Named(self.last_alias_id);
-                return Ok(());
-            }
-            Anchor::Named(_) => return Ok(()),
-        }
-        for index in 0.. {
-            match &self.nodes[node] {
-                RepNode::Sequence { value, .. } if index < value.len() => {
-                    let item = value[index];
-                    self.anchor_node(py, item, depth + 1)?;
+    fn anchor_nodes(&mut self, root: NodeId) -> PyResult<()> {
+        let mut walk = NodeWalk::new(root);
+        while let Some(visit) = walk.next(&self.nodes) {
+            let NodeVisit::Enter(node, depth) = visit else {
+                continue;
+            };
+            // Nodes kept from a failed document can be reused deeper in a later one.
+            check_depth(depth)?;
+            match self.node_states[node].anchor {
+                Anchor::Unseen => {
+                    self.node_states[node].anchor = Anchor::Seen;
+                    if !matches!(self.nodes[node], RepNode::Scalar { .. }) {
+                        walk.descend(node);
+                    }
                 }
-                RepNode::Mapping { value, .. } if index < value.len() => {
-                    let (k, v) = value[index];
-                    self.anchor_node(py, k, depth + 1)?;
-                    self.anchor_node(py, v, depth + 1)?;
+                Anchor::Seen => {
+                    // Reached twice: it gets the next anchor (PyYAML's id001, ...).
+                    self.last_alias_id += 1;
+                    self.node_states[node].anchor = Anchor::Named(self.last_alias_id);
                 }
-                _ => break,
+                Anchor::Named(_) => {}
             }
         }
         Ok(())
     }
 
-    fn serialize_node(&mut self, py: Python, node: NodeId, depth: usize) -> PyResult<()> {
-        with_stack(depth, || self.serialize_node_inner(py, node, depth))
+    fn serialize_nodes(&mut self, py: Python, root: NodeId) -> PyResult<()> {
+        let mut walk = NodeWalk::new(root);
+        while let Some(visit) = walk.next(&self.nodes) {
+            match visit {
+                NodeVisit::Enter(node, depth) => {
+                    check_depth(depth)?;
+                    let is_alias = self.node_states[node].serialized;
+                    self.emit_node(py, node)?;
+                    if !is_alias && !matches!(self.nodes[node], RepNode::Scalar { .. }) {
+                        walk.descend(node);
+                    }
+                }
+                NodeVisit::Leave(node) => {
+                    let event = match &self.nodes[node] {
+                        RepNode::Sequence { .. } => Event::sequence_end(),
+                        RepNode::Mapping { .. } => Event::mapping_end(),
+                        RepNode::Scalar { .. } => unreachable!(),
+                    };
+                    self.emit(py, event)?;
+                }
+            }
+        }
+        Ok(())
     }
 
-    fn serialize_node_inner(&mut self, py: Python, node: NodeId, depth: usize) -> PyResult<()> {
-        check_depth(depth)?;
+    fn emit_node(&mut self, py: Python, node: NodeId) -> PyResult<()> {
         let anchor = match self.node_states[node].anchor {
             Anchor::Named(id) => Some(format!("id{id:03}")),
             _ => None,
@@ -1027,16 +1113,6 @@ impl RSafeDumper {
                 let tag = (self.canonical || !implicit).then(|| tag.as_str());
                 let event = Event::sequence_start(anchor_ref, tag, implicit, style);
                 self.emit(py, event)?;
-                for index in 0.. {
-                    let RepNode::Sequence { value, .. } = &self.nodes[node] else {
-                        unreachable!()
-                    };
-                    let Some(&item) = value.get(index) else {
-                        break;
-                    };
-                    self.serialize_node(py, item, depth + 1)?;
-                }
-                self.emit(py, Event::sequence_end())?;
             }
             RepNode::Mapping {
                 tag, flow_style, ..
@@ -1050,17 +1126,6 @@ impl RSafeDumper {
                 let tag = (self.canonical || !implicit).then(|| tag.as_str());
                 let event = Event::mapping_start(anchor_ref, tag, implicit, style);
                 self.emit(py, event)?;
-                for index in 0.. {
-                    let RepNode::Mapping { value, .. } = &self.nodes[node] else {
-                        unreachable!()
-                    };
-                    let Some(&(k, v)) = value.get(index) else {
-                        break;
-                    };
-                    self.serialize_node(py, k, depth + 1)?;
-                    self.serialize_node(py, v, depth + 1)?;
-                }
-                self.emit(py, Event::mapping_end())?;
             }
         }
         Ok(())
@@ -1236,7 +1301,6 @@ pub fn dumps_to_string<'py>(
         represented_objects: HashMap::with_hasher(FxBuildHasher),
         nodes: Vec::new(),
         object_keeper: Vec::new(),
-        level: 0,
         has_aliases: false,
     };
 

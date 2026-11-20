@@ -2,10 +2,9 @@ import ryaml
 
 import pytest
 
-import yaml
-
-
 from ryaml.compat import RSafeLoader
+
+yaml = pytest.importorskip("yaml")
 
 from helpers import (
     VALID_YAMLS, INVALID_YAMLS, YamlTestSuite, _is_nan, load_reference,
