@@ -106,7 +106,7 @@ environment.CARGO_BUILD_TARGET = "aarch64-linux-android"
 [dependency-groups]
 test = [
     "hypothesis>=6.0",
-    "psutil>=7.0",
+    "psutil>=7.2.2",
     "pytest>=9.0",
     "pyyaml>=6.0.3",
 ]
