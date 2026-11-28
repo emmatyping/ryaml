@@ -95,6 +95,56 @@ assert docs[0]['a']['key'] is None
 
 `ryaml.load_all` will, as seen above, load multiple documents from a single file.
 
+### Custom representers
+
+With PyYAML installed, register callbacks on `ryaml.RSafeDumper` or on a subclass
+to control how Python objects become YAML nodes. `add_representer` matches an
+exact type. `add_multi_representer` matches a type and its subclasses using
+Python's method resolution order. An exact registration takes precedence.
+
+```python
+from datetime import timedelta
+from pathlib import PurePath
+
+import ryaml
+
+
+class ConfigDumper(ryaml.RSafeDumper):
+    pass
+
+
+def represent_path(dumper, path):
+    return dumper.represent_scalar("tag:yaml.org,2002:str", path.as_posix())
+
+
+def represent_duration(dumper, duration):
+    return dumper.represent_scalar("tag:yaml.org,2002:int", str(int(duration.total_seconds())))
+
+
+ConfigDumper.add_multi_representer(PurePath, represent_path)
+ConfigDumper.add_representer(timedelta, represent_duration)
+
+config = {"path": PurePath("config.yaml"), "timeout": timedelta(minutes=25)}
+print(ryaml.dumps(config, Dumper=ConfigDumper))
+```
+
+Pass the same class as `Dumper=` to `ryaml.dump` or `yaml.dump`. The module-level
+`ryaml.add_representer` and `ryaml.add_multi_representer` functions default to
+registering on `ryaml.RSafeDumper`.
+
+Representers work as in PyYAML: they can call `dumper.represent_scalar`,
+`represent_sequence`, `represent_mapping` and `represent_data`, change the nodes
+these return, or build `yaml.nodes` objects themselves. Registering a representer
+for a built-in type such as `str` or `dict` replaces ryaml's. Built-in types without
+one are still represented in Rust, so registering representers does not slow down
+dumping the rest of the data.
+
+The nodes a representer returns are written as PyYAML's `CSafeDumper` writes them,
+with three differences: ryaml raises `TypeError` for anything that is not a node,
+which `CSafeDumper` silently leaves out; it writes subclasses of the node classes,
+as PyYAML's pure-Python `SafeDumper` does; and for a `bytes` tag or value that is
+not UTF-8 it raises `UnicodeDecodeError`, where `CSafeDumper` raises `MemoryError`.
+
 
 ## Thanks
 

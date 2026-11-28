@@ -93,6 +93,32 @@ shrinks each distinct failure to a minimal example:
 python -m pytest fuzz/dump.py
 ```
 
+## Custom representers
+
+`fuzz/representers.py` uses Atheris to turn bytes into Python object graphs with
+shared and cyclic custom objects. It installs the same exact and multi-representers
+on subclasses of `RSafeDumper` and PyYAML's `CSafeDumper`. The callbacks exercise
+type and MRO dispatch, inherited registrations, fallback handlers, replaced
+representers for built-in types, custom tags and styles, and both delegated and
+failed representations. Delegating callbacks call back into the dumper
+(`represent_data`), change the node it returns, or move its `alias_key` on before
+recording a node, and the data mixes custom objects with built-in collections so
+that cycles cross between Rust and Python. Direct PyYAML nodes have `str`, `bytes`
+or missing tags, `str` or `bytes` values, and mapping items as tuples or lists.
+
+The target compares bytes and exception classes for `yaml.dump_all`, the dumper
+protocol (including retries), `ryaml.dump` and `ryaml.dumps`, and `yaml.serialize`.
+Use the instrumented build below with a LibYAML-enabled PyYAML installation.
+
+```sh
+mkdir -p target/fuzz/representer-corpus
+./fuzz/run.sh --representers target/fuzz/representer-corpus \
+  -fork=8 -max_total_time=3600 -max_len=1024 -use_value_profile=1 \
+  -ignore_crashes=0 -ignore_timeouts=0 -ignore_ooms=0
+```
+
+Replay an artifact by passing its path to `./fuzz/run.sh --representers`.
+
 ## Coverage
 
 To see which Rust code the corpus reaches, and so where new seeds would help:
