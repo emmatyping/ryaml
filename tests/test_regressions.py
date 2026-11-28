@@ -12,8 +12,12 @@ import ryaml
 yaml = pytest.importorskip("yaml")
 
 CSafeLoader = getattr(yaml, "CSafeLoader", None)
+CSafeDumper = getattr(yaml, "CSafeDumper", None)
 requires_libyaml = pytest.mark.skipif(
     CSafeLoader is None, reason="PyYAML was built without LibYAML"
+)
+requires_csafedumper = pytest.mark.skipif(
+    CSafeDumper is None, reason="PyYAML was built without LibYAML"
 )
 
 
@@ -914,9 +918,10 @@ def test_non_specific_tag_resolves_like_pyyaml(source):
     assert outcome(ryaml.loads_all) == expected
 
 
+@requires_csafedumper
 @pytest.mark.parametrize("value", ["!", "&", "*", "12\n", "true\n", "<<\n", "2001-12-14\n"])
 def test_dump_quotes_like_pyyaml_resolver(value):
-    assert ryaml.dumps(value) == yaml.safe_dump(value)
+    assert ryaml.dumps(value) == yaml.dump(value, Dumper=CSafeDumper)
 
 
 def _sexagesimal(*parts):

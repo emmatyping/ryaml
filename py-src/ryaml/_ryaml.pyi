@@ -1,5 +1,6 @@
 # pyright: strict
-from typing import Any
+from collections.abc import Mapping, MutableMapping
+from typing import IO, Any
 
 class InvalidYamlError(ValueError): ...
 
@@ -15,9 +16,9 @@ class _RSafeLoader:
 class _RSafeDumper:
     def __init__(
         self,
-        stream: str | bytes,
+        stream: IO[str] | IO[bytes],
         default_style: str | None = None,
-        default_flow_style: bool = False,
+        default_flow_style: bool | None = False,
         canonical: bool | None = None,
         indent: int | None = None,
         width: int | None = None,
@@ -30,3 +31,14 @@ class _RSafeDumper:
         tags: dict[str, str] | None = None,
         sort_keys: bool = True,
     ) -> None: ...
+    alias_key: int | None
+    @property
+    def represented_objects(self) -> MutableMapping[int, Any]: ...
+    @represented_objects.setter
+    def represented_objects(self, objects: Mapping[int, Any]) -> None: ...
+    def open(self) -> None: ...
+    def represent(self, data: Any) -> None: ...
+    def represent_data(self, data: Any) -> Any: ...
+    def serialize(self, node: Any) -> None: ...
+    def close(self) -> None: ...
+    def dispose(self) -> None: ...

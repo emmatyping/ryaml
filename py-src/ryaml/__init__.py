@@ -1,4 +1,4 @@
-from ._ryaml import InvalidYamlError, loads, loads_all, dumps
+from ._ryaml import InvalidYamlError, loads, loads_all, dumps as _dumps
 from .error import (
     ScannerError,
     ParserError,
@@ -9,7 +9,7 @@ from .error import (
     RepresenterError,
     ReaderError,
 )
-from .compat import RSafeDumper, RSafeLoader
+from .compat import RSafeDumper, RSafeLoader, Representer
 
 from typing import IO, AnyStr, Any
 import io
@@ -19,6 +19,8 @@ __all__ = [
     "loads",
     "loads_all",
     "dumps",
+    "add_representer",
+    "add_multi_representer",
     "ScannerError",
     "ParserError",
     "ComposerError",
@@ -52,8 +54,37 @@ def load_all(fp: IO[AnyStr]) -> list[Any]:
     return loads_all(_read_file(fp))
 
 
-def dump(fp: IO[AnyStr], obj: Any) -> None:
-    yaml = dumps(obj)
+def add_representer(
+    data_type: type | None, representer: Representer, Dumper: type[RSafeDumper] = RSafeDumper,
+) -> None:
+    """Register a representer for an exact type on the given dumper class."""
+    Dumper.add_representer(data_type, representer)
+
+
+def add_multi_representer(
+    data_type: type | None, multi_representer: Representer,
+    Dumper: type[RSafeDumper] = RSafeDumper,
+) -> None:
+    """Register a representer for a type and its subclasses on the given dumper class."""
+    Dumper.add_multi_representer(data_type, multi_representer)
+
+
+def dumps(obj: Any, *, Dumper: type[RSafeDumper] = RSafeDumper) -> str:
+    if Dumper is RSafeDumper and not Dumper._has_custom_representers():
+        return _dumps(obj)
+    stream = io.StringIO()
+    dumper = Dumper(stream, sort_keys=False)
+    try:
+        dumper.open()
+        dumper.represent(obj)
+        dumper.close()
+    finally:
+        dumper.dispose()
+    return stream.getvalue()
+
+
+def dump(fp: IO[AnyStr], obj: Any, *, Dumper: type[RSafeDumper] = RSafeDumper) -> None:
+    yaml = dumps(obj, Dumper=Dumper)
     if isinstance(fp, io.TextIOBase):
         fp.write(yaml)  # type: ignore
     else:

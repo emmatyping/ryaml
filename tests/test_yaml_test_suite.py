@@ -5,9 +5,11 @@ pytest.importorskip("yaml")
 
 from helpers import (
     VALID_YAMLS, INVALID_YAMLS, YamlTestSuite, _is_nan, load_reference,
+    requires_csafeloader,
 )
 
 
+@requires_csafeloader
 @pytest.mark.parametrize("ts", VALID_YAMLS, ids=lambda ts: ts.id)
 def test_valid_yamls_from_test_suite(ts: YamlTestSuite) -> None:
     source = ts.in_yaml.read_text("utf-8")

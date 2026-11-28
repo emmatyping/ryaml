@@ -40,6 +40,13 @@ if [[ "${1:-}" == "--dump" ]]; then
     if [[ $# -eq 0 ]]; then
         set -- fuzz/dump-corpus -fork=8 -max_len=1024 -use_value_profile=1
     fi
+elif [[ "${1:-}" == "--representers" ]]; then
+    shift
+    target=fuzz/representers.py
+    if [[ $# -eq 0 ]]; then
+        mkdir -p target/fuzz/representer-corpus
+        set -- target/fuzz/representer-corpus -fork=8 -max_len=1024 -use_value_profile=1
+    fi
 fi
 
 if [[ $# -eq 0 ]]; then

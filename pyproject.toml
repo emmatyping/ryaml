@@ -108,7 +108,8 @@ test = [
     "hypothesis>=6.0",
     "psutil>=7.0",
     "pytest>=9.0",
-    "pyyaml>=6.0.3",
+    # 6.0.4 merge-key regression: yaml/pyyaml#953, #1013
+    "pyyaml>=6.0.3,!=6.0.4",
 ]
 
 [tool.hatch.envs.default]

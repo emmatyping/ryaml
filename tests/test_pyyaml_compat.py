@@ -12,10 +12,8 @@ yaml = pytest.importorskip("yaml")
 from hypothesis import given, settings, HealthCheck
 from hypothesis import strategies as st
 
-try:
-    from yaml import CSafeLoader as SafeLoader
-except ImportError:
-    SafeLoader = None
+CSafeLoader = getattr(yaml, "CSafeLoader", None)
+CSafeDumper = getattr(yaml, "CSafeDumper", None)
 
 def test_nonspecific_tag():
     assert ryaml.loads("x: ! 4444") == {"x": 4444}
@@ -73,7 +71,7 @@ def compare(text):
     ryaml_val = ryaml_exc = None
 
     try:
-        pyyaml_val = list(yaml.load_all(text, Loader=SafeLoader))
+        pyyaml_val = list(yaml.load_all(text, Loader=CSafeLoader))
     except Exception as e:
         pyyaml_exc = type(e)
 
@@ -102,7 +100,7 @@ def compare(text):
 
 
 @pytest.mark.skipif(
-    sys.platform == "win32" or SafeLoader is None,
+    sys.platform == "win32" or CSafeLoader is None,
     reason="needs LibYAML-backed PyYAML; libyaml inconsistent on Windows",
 )
 @given(st.text())
@@ -111,7 +109,7 @@ def test_any_text(text):
     compare(text)
 
 @pytest.mark.skipif(
-    sys.platform == "win32" or SafeLoader is None,
+    sys.platform == "win32" or CSafeLoader is None,
     reason="needs LibYAML-backed PyYAML; libyaml inconsistent on Windows",
 )
 @given(st.binary())
@@ -136,7 +134,7 @@ yaml_scalars = st.one_of(
 )
 
 @pytest.mark.skipif(
-    sys.platform == "win32" or SafeLoader is None,
+    sys.platform == "win32" or CSafeLoader is None or CSafeDumper is None,
     reason="needs LibYAML-backed PyYAML; libyaml inconsistent on Windows",
 )
 @given(st.recursive(
@@ -149,9 +147,9 @@ yaml_scalars = st.one_of(
 ))
 @settings(max_examples=2000)
 def test_structured_values(value):
-    """Round-trip: serialize with pyyaml, then load with both."""
+    """Round-trip: serialize with CSafeDumper, then load with both."""
     try:
-        text = yaml.safe_dump(value)
+        text = yaml.dump(value, Dumper=CSafeDumper)
     except Exception:
         return  # pyyaml couldn't serialize it, skip
     compare(text)
