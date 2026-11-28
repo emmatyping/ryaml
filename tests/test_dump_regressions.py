@@ -534,7 +534,7 @@ def test_big_ints_like_pyyaml(reference, value):
     import io
     stream = io.StringIO()
     ryaml.dump(stream, {"t1": value})
-    assert stream.getvalue() == yaml.safe_dump({"t1": value})
+    assert stream.getvalue() == reference([{"t1": value}])
     assert ryaml.loads(stream.getvalue()) == {"t1": value}
 
 

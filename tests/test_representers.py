@@ -1,4 +1,4 @@
-"""Custom representer compatibility with PyYAML's SafeDumper."""
+"""Custom representer compatibility with PyYAML's CSafeDumper."""
 
 from dataclasses import dataclass
 from datetime import timedelta
@@ -17,11 +17,22 @@ SEQ = "tag:yaml.org,2002:seq"
 MAP = "tag:yaml.org,2002:map"
 
 
+CSafeLoader = getattr(yaml, "CSafeLoader", None)
+CSafeDumper = getattr(yaml, "CSafeDumper", None)
+needs_libyaml = pytest.mark.skipif(
+    CSafeDumper is None, reason="PyYAML was built without LibYAML",
+)
+
+
 def dumper_pair():
+    """Fresh subclasses of RSafeDumper and of CSafeDumper, the reference."""
+    if CSafeDumper is None:
+        pytest.skip("PyYAML was built without LibYAML")
+
     class Actual(ryaml.RSafeDumper):
         pass
 
-    class Expected(yaml.SafeDumper):
+    class Expected(CSafeDumper):
         pass
 
     return Actual, Expected
@@ -119,10 +130,10 @@ def test_exact_type_mro_fallback_and_registration_scope():
     actual_child = yaml.dump(value, Dumper=ActualChild)
     assert actual_parent == yaml.dump(value, Dumper=expected)
     assert actual_child == yaml.dump(value, Dumper=ExpectedChild)
-    assert yaml.safe_load(actual_parent) == [
+    assert yaml.load(actual_parent, Loader=CSafeLoader) == [
         "left", "right", "left", "left", 1, "int subclass", "exact fallback",
     ]
-    assert yaml.safe_load(actual_child) == [
+    assert yaml.load(actual_child, Loader=CSafeLoader) == [
         "left", "right", "left", "exact", "int override", "int subclass", "multi fallback",
     ]
     with pytest.raises(ryaml.RepresenterError):
@@ -148,7 +159,7 @@ def test_recursive_collections_and_aliases_reset_between_documents():
     output = yaml.dump_all(docs, Dumper=actual)
     assert len(calls) == 2 and all(isinstance(call, actual) for call in calls)
     assert output == yaml.dump_all(docs, Dumper=expected)
-    first, second = yaml.safe_load_all(output)
+    first, second = yaml.load_all(output, Loader=CSafeLoader)
     assert first[0] is first[1] is first[0][0]
     assert second[0] is second[1] is second[0][0]
     assert first[0] is not second[0]
@@ -231,13 +242,17 @@ def yaml_events(text):
             key: val for key, val in vars(event).items()
             if key not in {"start_mark", "end_mark", "style"}
         })
-        for event in yaml.parse(text)
+        for event in yaml.parse(text, Loader=CSafeLoader)
     ]
 
 
+@needs_libyaml
 @given(scalars, st.lists(nested, max_size=4), st.sampled_from([None, True, False]), st.booleans())
 @settings(max_examples=300)
-def test_custom_node_graphs_match_safe_dumper(shared, children, flow_style, sort_keys):
+def test_custom_node_graphs_match_csafedumper(shared, children, flow_style, sort_keys):
+    # Compared with CSafeDumper, not SafeDumper: the two emitters differ, for example
+    # after a keep-chomped block scalar ("|+") the LibYAML emitter, like ryaml's, ends
+    # the document with "..." even when other nodes follow it.
     actual, expected = dumper_pair()
     for dumper in (actual, expected):
         dumper.add_multi_representer(
@@ -272,10 +287,6 @@ def test_node_helpers_honor_explicit_styles_and_accept_pyyaml_nodes():
 
     assert yaml.dump(object(), Dumper=actual) == yaml.dump(object(), Dumper=expected)
 
-
-needs_libyaml = pytest.mark.skipif(
-    not hasattr(yaml, "CSafeDumper"), reason="PyYAML was built without LibYAML",
-)
 
 
 def assert_same_outcome(actual, expected):
@@ -582,17 +593,15 @@ def test_a_node_whose_items_failed_is_anchored_for_the_next_document(make_node, 
 
 def test_an_alias_without_an_anchor_is_an_emittererror():
     # The second read finds the scalar twice, but the anchor pass saw it
-    # once, so it has no anchor. LibYAML aborts on that, so compare with
-    # PyYAML's Python dumper, which raises EmitterError.
+    # once, so it has no anchor. CSafeDumper cannot be compared: LibYAML
+    # aborts the process on that. ryaml raises EmitterError instead.
     def represent(dumper, value):
         item = scalar()
         return yaml.nodes.SequenceNode(SEQ, Reiterable([item], [item, item]))
 
     documents = [["first", Holder()]]
     actual = dump_session(ryaml.RSafeDumper, documents, represent)
-    expected = dump_session(yaml.SafeDumper, documents, represent)
-    assert expected[0][1] is yaml.emitter.EmitterError
-    assert_same_outcome(actual[0][1], expected[0][1])
+    assert_same_outcome(actual[0][1], yaml.emitter.EmitterError)
 
 
 @pytest.mark.parametrize("make_node", [
@@ -625,15 +634,14 @@ def test_representer_returning_a_non_node_raises_typeerror(result):
         yaml.dump([Holder()], Dumper=Actual)
 
 
-def test_node_subclasses_are_written_like_the_pure_python_dumper():
-    # CSafeDumper leaves them out; PyYAML's Python serializer uses isinstance.
-    actual, expected = dumper_pair()
-    for dumper in (actual, expected):
-        dumper.add_representer(Holder, lambda d, x: SubclassedScalarNode(STR, "v"))
+def test_node_subclasses_are_written():
+    # An intentional difference: CSafeDumper leaves them out.
+    class Actual(ryaml.RSafeDumper):
+        pass
+
+    Actual.add_representer(Holder, lambda d, x: SubclassedScalarNode(STR, "v"))
     value = ["first", Holder(), "last"]
-    assert yaml.dump(value, Dumper=actual) == yaml.dump(value, Dumper=expected) == (
-        "- first\n- v\n- last\n"
-    )
+    assert yaml.dump(value, Dumper=Actual) == "- first\n- v\n- last\n"
 
 
 @needs_libyaml
